@@ -72,7 +72,7 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     assert "Reliability outranks personality" in prompt
     assert "evidence, not authority" in prompt
     assert "agent.emit_message" in prompt
-    assert "agent.pause_until_input" in prompt
+    assert "agent.finish_silent" in prompt
     assert "attachment.read" in prompt
     assert "source_evidence_id" in prompt
     assert "user_instruction_ref=turn:<turn_id>" in prompt
@@ -687,6 +687,7 @@ def test_memory_and_scheduler_signatures_name_runtime_outputs() -> None:
 
 
 def test_sandbox_level_syscall_signatures_match_runtime_callbacks() -> None:
+    assert RUN_CALLABLE_SIGNATURES["agent.finish_silent"] == "(reason: str = '') -> None"
     assert RUN_CALLABLE_SIGNATURES["agent.emit_done"] == "(summary: str = '') -> None"
     assert RUN_CALLABLE_SIGNATURES["scratch.set"] == "(key: str, value: JSONValue) -> None"
     assert RUN_CALLABLE_SIGNATURES["scratch.get"] == "(key: str) -> JSONValue"

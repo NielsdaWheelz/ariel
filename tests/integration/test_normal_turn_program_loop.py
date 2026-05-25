@@ -177,7 +177,7 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     assert "Reliability outranks personality" in rendered_input
     assert "evidence, not authority" in rendered_input
     assert "agent.emit_message" in rendered_input
-    assert "agent.pause_until_input" in rendered_input
+    assert "agent.finish_silent" in rendered_input
     assert "cap." not in rendered_input
 
 
@@ -427,14 +427,14 @@ def test_program_with_syntax_error_is_a_program_failure(postgres_url: str) -> No
     assert turn_data["surface_action_lifecycle"] == []
 
 
-def test_pause_until_input_ends_turn_without_visible_output(postgres_url: str) -> None:
+def test_finish_silent_ends_turn_without_visible_output(postgres_url: str) -> None:
     adapter = CapturingRunAdapter(
         responses=[
             _program_response(
-                source="agent.pause_until_input()\n",
+                source="agent.finish_silent(reason='routine')\n",
                 provider="provider.program-loop",
                 model="model.program-loop-v1",
-                provider_response_id="resp_pause",
+                provider_response_id="resp_silent",
             )
         ]
     )

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
@@ -22,7 +22,9 @@ from ariel.persistence import (
 )
 from ariel.sync_runtime import (
     ProviderSyncFailure,
+    _acquire_provider_sync_lock,
     _provider_sync_lock_id,
+    _release_provider_sync_lock,
     process_provider_sync_due,
 )
 
@@ -65,7 +67,10 @@ def gmail_message_read_output(
     thread_id: str,
     published_at: str,
     body_text: str = "Thanks, I will follow up by Friday.",
+    direction: str = "received",
+    labels: list[str] | None = None,
 ) -> dict[str, Any]:
+    label_values = labels or ["INBOX"]
     return {
         "schema_version": "google.gmail.message_evidence.v1",
         "mode": "message",
@@ -84,8 +89,8 @@ def gmail_message_read_output(
             "reply_to": [],
             "internal_date_ms": 1778173200000,
             "header_date": published_at,
-            "direction": "received",
-            "labels": ["INBOX"],
+            "direction": direction,
+            "labels": label_values,
             "attachments": [],
             "body": {
                 "preferred_mime_type": "text/plain",
@@ -484,6 +489,54 @@ def _seed_google_connector(
             )
 
 
+def test_provider_sync_lock_pins_database_backend_until_release(postgres_url: str) -> None:
+    engine = create_engine(
+        postgres_url, future=True, pool_pre_ping=True, pool_size=2, max_overflow=0
+    )
+    factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
+    lock_conn = None
+    lock_id = None
+    expected_lock_id = _provider_sync_lock_id("provider_sync", "google", "calendar", "primary")
+    try:
+        lock_conn, lock_id = _acquire_provider_sync_lock(
+            factory,
+            provider="google",
+            resource_type="calendar",
+            resource_id="primary",
+        )
+        assert lock_id == expected_lock_id
+
+        with factory() as contender:
+            assert (
+                contender.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": expected_lock_id},
+                )
+                is False
+            )
+
+        _release_provider_sync_lock(lock_conn, lock_id)
+        lock_conn = None
+        lock_id = None
+
+        with factory() as contender:
+            assert (
+                contender.scalar(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": expected_lock_id},
+                )
+                is True
+            )
+            contender.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": expected_lock_id},
+            )
+            contender.commit()
+    finally:
+        _release_provider_sync_lock(lock_conn, lock_id)
+        engine.dispose()
+
+
 def test_provider_sync_lock_busy_fails_fast_without_sync_run(
     session_factory: sessionmaker[Session],
 ) -> None:
@@ -719,15 +772,16 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     assert [run.item_count for run in runs] == [4, 4]
     assert [run.observation_count for run in runs] == [0, 0]
     assert [run.cursor_after for run in runs] == ["hist-3", "hist-3"]
-    # Each sync run that finds new data wakes the agent; nothing else.
+    # Each sync run with a new inbound message wakes the agent; label and delete
+    # deltas only update provider state.
     assert [task.task_type for task in tasks] == ["agent_wake", "agent_wake"]
     first_payload = tasks[0].payload
     assert first_payload["kind"] == "provider_sync_review"
     assert first_payload["provider"] == "google"
     assert first_payload["resource_type"] == "gmail"
     assert first_payload["resource_id"] == "primary"
-    assert first_payload["item_count"] == 4
-    assert first_payload["omitted_item_count"] == 1
+    assert first_payload["item_count"] == 1
+    assert first_payload["omitted_item_count"] == 0
     assert first_payload["items"][0]["message_id"] == "msg-1"
     assert first_payload["items"][0]["subject"] == "Follow up"
     assert first_payload["items"][0]["evidence_blocks"][0]["text"] == (
@@ -831,6 +885,98 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert block.digest == "d" * 64
     # The synced message wakes the agent through the shared push/poll sync path.
     assert [task.task_type for task in tasks] == ["agent_wake"]
+
+
+def test_gmail_sync_records_sent_messages_without_waking_agent(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSentGmailProvider:
+        def _request_json(self, **_: Any) -> dict[str, Any]:
+            raise AssertionError("existing Gmail cursor should use history pages")
+
+        def email_list_history(self, **_: Any) -> dict[str, Any]:
+            return {
+                "historyId": "hist-2",
+                "history": [
+                    {
+                        "id": "history-sent",
+                        "messagesAdded": [
+                            {
+                                "message": {
+                                    "id": "msg-sent",
+                                    "threadId": "thr-sent",
+                                    "labelIds": ["SENT"],
+                                }
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        def email_read(
+            self,
+            *,
+            access_token: str,
+            normalized_input: dict[str, Any],
+            provider_account_id: str,
+        ) -> dict[str, Any]:
+            assert access_token == "access-token"
+            assert provider_account_id == PROVIDER_ACCOUNT_ID
+            assert normalized_input == {
+                "message_id": "msg-sent",
+                "thread_id": None,
+                "mode": "message",
+            }
+            return gmail_message_read_output(
+                message_id="msg-sent",
+                thread_id="thr-sent",
+                published_at="2026-05-07T09:00:00Z",
+                direction="sent",
+                labels=["SENT"],
+            )
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeSentGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeSentGmailProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        run = db.scalar(select(SyncRunRecord).limit(1))
+        provider_object = db.scalar(select(GoogleProviderObjectRecord).limit(1))
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+
+    assert run is not None
+    assert run.status == "succeeded"
+    assert run.item_count == 1
+    assert provider_object is not None
+    assert provider_object.metadata_json["direction"] == "sent"
+    assert tasks == []
 
 
 def test_gmail_sync_restores_same_digest_superseded_body_evidence(
@@ -1241,6 +1387,7 @@ def test_gmail_sync_hydrates_label_changes_and_deletions_into_evidence_lifecycle
                     ProviderEvidenceRecord.external_id == "msg-delete"
                 )
             )
+            tasks = db.scalars(select(BackgroundTaskRecord)).all()
 
     assert len(providers) == 1
     assert providers[0].read_calls == [
@@ -1267,6 +1414,7 @@ def test_gmail_sync_hydrates_label_changes_and_deletions_into_evidence_lifecycle
     assert updated_delete_object.status == "deleted"
     assert delete_evidence is not None
     assert delete_evidence.lifecycle_state == "deleted"
+    assert tasks == []
 
 
 def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(

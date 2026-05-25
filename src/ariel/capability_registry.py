@@ -3970,7 +3970,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     "agent.emit_value": "(value: Any)",
     "agent.emit_finding": "(summary: str, claims: list, gaps: list, sources: list)",
     "agent.emit_done": "(summary: str = '') -> None",
-    "agent.pause_until_input": "()",
+    "agent.finish_silent": "(reason: str = '') -> None",
     "scratch.set": "(key: str, value: JSONValue) -> None",
     "scratch.get": "(key: str) -> JSONValue",
     # memory.*

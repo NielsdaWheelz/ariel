@@ -540,7 +540,7 @@ def run_research(
                 "evt.research.partial",
                 {"mode": mode, "finding": _research_finding_payload(finding)},
             )
-        case "message" | "approval" | "paused" | "operations":
+        case "message" | "approval" | "silent" | "operations":
             msg = f"unexpected research loop outcome: {loop_result.outcome}"
             raise AssertionError(msg)
 

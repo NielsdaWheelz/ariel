@@ -51,7 +51,7 @@ DOCS_ROUTES = {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
 NON_CAPABILITY_SYSCALLS = {
     "agent.emit_message",
     "agent.emit_value",
-    "agent.pause_until_input",
+    "agent.finish_silent",
     "agent.emit_finding",
     "agent.emit_done",
     "scratch.set",

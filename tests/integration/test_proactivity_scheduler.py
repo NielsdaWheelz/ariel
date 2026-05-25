@@ -36,6 +36,7 @@ from tests.integration.responses_helpers import (
     last_user_message,
     run_response,
     responses_run_message,
+    responses_with_run_calls,
     run_function_calls,
 )
 
@@ -414,6 +415,23 @@ class _WakeAdapter(FakeModelAdapter):
         )
 
 
+class _NonTerminalWakeAdapter(FakeModelAdapter):
+    provider = "provider.wake"
+    model = "model.wake-v1"
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, messages=request.messages
+            )
+        return responses_with_run_calls(
+            calls=[{"name": "agent.emit_value", "input": {"value": {"routine": True}}}],
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_nonterminal_wake",
+        )
+
+
 def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -537,8 +555,8 @@ def test_worker_provider_sync_agent_wake_invokes_normal_wake_with_tainted_contex
                             ],
                             "omitted_item_count": 0,
                             "note": (
-                                "A Google Gmail sync found 1 new or changed item. "
-                                "Review the new activity and decide whether anything matters."
+                                "A Google Gmail sync found 1 new inbound message. "
+                                "Review the new mail and decide whether anything matters."
                             ),
                         },
                         attempts=0,
@@ -608,6 +626,88 @@ def test_worker_provider_sync_agent_wake_invokes_normal_wake_with_tainted_contex
             "observation_count": 1,
         }
     ]
+
+
+def test_provider_sync_wake_budget_exhaustion_stays_silent(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_memory_retriever(monkeypatch)
+    monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "1")
+    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_DISCORD_BOT_TOKEN", "test-bot-token")
+    monkeypatch.setenv("ARIEL_DISCORD_CHANNEL_ID", "987654321")
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    discord_posts: list[dict[str, Any]] = []
+
+    class _DiscordResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    def fake_discord_post(
+        url: str, *, headers: dict[str, str], json: dict[str, Any], timeout: float
+    ) -> _DiscordResponse:
+        discord_posts.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return _DiscordResponse()
+
+    monkeypatch.setattr("ariel.worker.httpx.post", fake_discord_post)
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=_NonTerminalWakeAdapter(),
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    BackgroundTaskRecord(
+                        id="tsk_provider_sync_exhaustion",
+                        task_type="agent_wake",
+                        idempotency_key=None,
+                        provider_write_receipt_id=None,
+                        payload={
+                            "kind": "provider_sync_review",
+                            "provider": "google",
+                            "resource_type": "gmail",
+                            "resource_id": "primary",
+                            "sync_run_id": "syn_provider_sync_exhaustion",
+                            "provider_event_id": "pev_provider_sync_exhaustion",
+                            "item_count": 1,
+                            "observation_count": 1,
+                            "cursor_before": "hist-1",
+                            "cursor_after": "hist-2",
+                            "items": [{"change": "messagesAdded", "message_id": "msg_1"}],
+                            "omitted_item_count": 0,
+                            "note": "A Google Gmail sync found 1 new inbound message.",
+                        },
+                        attempts=0,
+                        recurrence_seconds=None,
+                        run_after=now - timedelta(minutes=1),
+                        created_at=now - timedelta(minutes=5),
+                        updated_at=now - timedelta(minutes=5),
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+    with session_factory() as db:
+        turn = db.scalar(
+            select(TurnRecord).where(
+                TurnRecord.source_background_task_id == "tsk_provider_sync_exhaustion"
+            )
+        )
+
+    assert turn is not None
+    assert turn.status == "completed"
+    assert turn.assistant_message == ""
+    assert discord_posts == []
 
 
 def test_schedule_run_program_worker_drains_due_wake_end_to_end(

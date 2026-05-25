@@ -230,7 +230,7 @@ def test_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) ->
     settings = AppSettings.model_validate({})
     assert settings.auto_rotate_max_turns == 120
     assert settings.auto_rotate_max_age_seconds == 172800
-    assert settings.max_response_tokens == 700
+    assert settings.max_response_tokens == 12000
     assert settings.main_turn_budget_seconds == 180.0
     assert settings.agent_loop_max_model_calls == 50
     assert settings.agent_loop_live_rounds == 8

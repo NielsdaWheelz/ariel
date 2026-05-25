@@ -34,8 +34,8 @@ _MAX_RUN_SOURCE_CHARS = 20000
 # are added per turn from the allowed capability ids.
 _AGENT_EMIT_MESSAGE = "agent.emit_message"
 _AGENT_EMIT_VALUE = "agent.emit_value"
-_AGENT_PAUSE_UNTIL_INPUT = "agent.pause_until_input"
-_AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_PAUSE_UNTIL_INPUT)
+_AGENT_FINISH_SILENT = "agent.finish_silent"
+_AGENT_SYSCALL_NAMES = (_AGENT_EMIT_MESSAGE, _AGENT_EMIT_VALUE, _AGENT_FINISH_SILENT)
 
 # Non-main-loop terminal output syscalls. Always bound into the sandbox so a
 # misuse in the main loop surfaces as a typed host-callback error rather than an
@@ -88,10 +88,11 @@ class RunProgramResult:
 
     ``program_ok`` is the sandbox ``ProgramResult.ok``: ``False`` means the
     program did not complete cleanly. Failed programs surface no proposals, so
-    ``emitted_message``/``emitted_values``/``emitted_finding``/``paused`` are
-    scrubbed here and the staged ``ApprovalRequestRecord`` rows the syscalls
-    wrote are left for the caller's transaction to roll back. ``action_attempts``
-    is still the syscall trace — the audit spine — and is returned regardless.
+    ``emitted_message``/``emitted_values``/``emitted_finding``/
+    ``finished_silent`` are scrubbed here and the staged
+    ``ApprovalRequestRecord`` rows the syscalls wrote are left for the caller's
+    transaction to roll back. ``action_attempts`` is still the syscall trace —
+    the audit spine — and is returned regardless.
 
     ``runtime_provenance`` is this program's taint delta: a tainted
     ``RuntimeProvenance`` carrying the evidence its syscalls produced, or
@@ -115,7 +116,8 @@ class RunProgramResult:
     emitted_values: list[Any]
     emitted_finding: dict[str, Any] | None
     emitted_done: str | None
-    paused: bool
+    finished_silent: bool
+    silent_reason: str
     action_attempts: list[ActionAttemptRecord]
     program_ok: bool
     program_error: str | None
@@ -133,7 +135,8 @@ def run_tool_definitions() -> list[ToolSpec]:
                 "handling, and the safe standard library (json, re, datetime, math). Every "
                 "effect is a typed syscall to a namespaced host callable -- "
                 "agent.emit_message for user-visible output, agent.emit_value for internal "
-                "data, and only the capability syscalls listed for this turn. A syscall "
+                "data, agent.finish_silent for no user-visible output, and only the "
+                "capability syscalls listed for this turn. A syscall "
                 "returns its result into the program; an "
                 "approval-gated syscall returns a pending value and is not executed inline. "
                 "Call exactly one run tool with the program as the source string."
@@ -299,7 +302,8 @@ def execute_run_program(
     emitted_values: list[Any] = []
     emitted_finding: dict[str, Any] | None = None
     emitted_done: str | None = None
-    paused = False
+    finished_silent = False
+    silent_reason = ""
     callback_errors: list[str] = []
     # Boxed so the callback closure can advance taint between syscalls.
     current_provenance: list[RuntimeProvenance | None] = [runtime_provenance]
@@ -312,7 +316,8 @@ def execute_run_program(
     call_index = 0
 
     def syscall_callback(name: str, syscall_input: dict[str, Any]) -> tuple[bool, Any]:
-        nonlocal emitted_message, emitted_values, emitted_finding, emitted_done, paused, call_index
+        nonlocal emitted_message, emitted_values, emitted_finding, emitted_done
+        nonlocal finished_silent, silent_reason, call_index
 
         if name == _AGENT_EMIT_MESSAGE:
             text = syscall_input.get("text")
@@ -326,6 +331,9 @@ def execute_run_program(
             if emitted_message:
                 callback_errors.append("agent_emit_message_must_be_unique")
                 return False, "agent_emit_message_must_be_unique"
+            if finished_silent:
+                callback_errors.append("agent_emit_message_after_finish_silent")
+                return False, "agent_emit_message_after_finish_silent"
             emitted_message = text.strip()
             return True, None
 
@@ -348,11 +356,19 @@ def execute_run_program(
             emitted_values.append(value)
             return True, None
 
-        if name == _AGENT_PAUSE_UNTIL_INPUT:
-            if syscall_input:
-                callback_errors.append("agent_pause_until_input_schema_invalid")
-                return False, "agent_pause_until_input_schema_invalid"
-            paused = True
+        if name == _AGENT_FINISH_SILENT:
+            if set(syscall_input.keys()) - {"reason"}:
+                callback_errors.append("agent_finish_silent_schema_invalid")
+                return False, "agent_finish_silent_schema_invalid"
+            reason = syscall_input.get("reason", "")
+            if not isinstance(reason, str):
+                callback_errors.append("agent_finish_silent_schema_invalid")
+                return False, "agent_finish_silent_schema_invalid"
+            if emitted_message:
+                callback_errors.append("agent_finish_silent_after_emit_message")
+                return False, "agent_finish_silent_after_emit_message"
+            finished_silent = True
+            silent_reason = reason.strip()
             return True, None
 
         if name == _SCRATCH_SET:
@@ -535,7 +551,8 @@ def execute_run_program(
             emitted_values=[],
             emitted_finding=None,
             emitted_done=None,
-            paused=False,
+            finished_silent=False,
+            silent_reason="",
             action_attempts=ctx.created_action_attempts,
             program_ok=False,
             program_error=program_result.error,
@@ -548,7 +565,8 @@ def execute_run_program(
         emitted_values=emitted_values,
         emitted_finding=emitted_finding,
         emitted_done=emitted_done,
-        paused=paused,
+        finished_silent=finished_silent,
+        silent_reason=silent_reason,
         action_attempts=ctx.created_action_attempts,
         program_ok=True,
         program_error=None,

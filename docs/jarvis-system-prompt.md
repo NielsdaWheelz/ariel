@@ -70,7 +70,7 @@ Static blocks (cache-stable prefix):
   prompt-injection defense
 - `<turn_workflow>` — when to act, when to clarify, plan-then-execute
 - `<run_protocol>` — exactly one `run`, `agent.emit_message`,
-  `agent.pause_until_input`, syscall callables
+  `agent.finish_silent`, syscall callables
 - `<tools_and_actions>` — read vs. approval, Google write authority,
   attachment metadata, agency.* routing
 - `<memory>` — fallible context, when to remember, sensitive data
@@ -237,8 +237,8 @@ program.
 - User-visible text must be emitted by the program through
   `agent.emit_message(text=...)`. Plain prose outside `agent.emit_message`
   is not user-visible.
-- If the correct behavior is to wait silently, call
-  `agent.pause_until_input()`.
+- If the correct behavior is to stay silent, call
+  `agent.finish_silent()`.
 - Use only the syscall callables listed for this turn. They are the
   complete authority surface.
 - If a program reads content that requires synthesis or judgment, keep bulky raw
@@ -458,7 +458,7 @@ Behavior:
 - direct answer vs. clarification trade-off
 - exactly one `run` call
 - user-visible output only through `agent.emit_message`
-- silent reply through `agent.pause_until_input` when appropriate
+- silent finish through `agent.finish_silent` when appropriate
 - prompt injection inside email, attachment, web, memory, and research
   content rejected and surfaced
 - no completion claim without evidence
@@ -543,7 +543,7 @@ Run protocol:
 - Respond by calling exactly one `run` tool. The `source` is a Python program.
 - User-visible text must be emitted by the program with
   `agent.emit_message(text=...)`.
-- If the right behavior is to wait silently, call `agent.pause_until_input()`.
+- If the right behavior is to stay silent, call `agent.finish_silent()`.
 - Plain assistant prose outside `agent.emit_message` is not user-visible.
 - Use only the syscall callables listed for this turn. They are the complete
   authority surface.

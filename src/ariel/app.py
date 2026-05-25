@@ -440,7 +440,8 @@ def _build_initial_messages(
                 "blocked/schema_invalid). The agent.* terminals "
                 "(agent.emit_message(text: str), "
                 "agent.emit_value(value: Any), "
-                "agent.pause_until_input()) are always available.\n" + "\n".join(callable_lines)
+                "agent.finish_silent(reason: str = '')) are always available.\n"
+                + "\n".join(callable_lines)
             )
 
     # 4. Tool surface facts
@@ -1543,7 +1544,7 @@ def _wake(
             "run program completed without user-visible output. Plain "
             "assistant text is audit-only and was not shown. Continue with "
             "exactly one run call whose program emits output through "
-            "agent.emit_message or pauses with agent.pause_until_input."
+            "agent.emit_message or finishes silently with agent.finish_silent."
         ),
     )
     loop_result = run_agent_loop(
@@ -1597,7 +1598,13 @@ def _wake(
                 "assistant_text": "approval required. review the pending action.",
                 "assistant_silent": False,
             }
-        case "paused":
+        case "silent":
+            assistant_response = {
+                **exhausted_response,
+                "assistant_text": "",
+                "assistant_silent": True,
+            }
+        case "budget_exhausted" if wake_context.trigger_kind != "user_message":
             assistant_response = {
                 **exhausted_response,
                 "assistant_text": "",

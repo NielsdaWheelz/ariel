@@ -428,8 +428,8 @@ and `shared_content`.
 | Discord application setup | Bot is installed with `bot` and `applications.commands`; privileged Message Content Intent is enabled in the Discord developer portal. | `/status` renders and an owner ambient message reaches Ariel with nonblank content. |
 | Bot or self message | Ignored. | No API turn is created. |
 | Blank owner message | Ignored. | No API turn is created. |
-| Owner DM | Accepted as ambient agent input. | Bot visibly replies in the DM or intentionally pauses silently; no default-guild notification is sent for the reply. |
-| Home-guild ambient message | Accepted from the configured owner in the configured guild. | Bot replies in the origin channel or thread, or intentionally pauses silently. |
+| Owner DM | Accepted as ambient agent input. | Bot visibly replies in the DM or intentionally finishes silently; no default-guild notification is sent for the reply. |
+| Home-guild ambient message | Accepted from the configured owner in the configured guild. | Bot replies in the origin channel or thread, or intentionally finishes silently. |
 | Non-owner message | Ignored in DM and guild contexts. | No API turn is created. |
 | Wrong-guild message | Ignored. | No API turn is created. |
 | Unsupported Discord message type | Ignored. | No API turn is created. |
@@ -505,7 +505,7 @@ message content into the smoke log.
 2. Send an owner DM with a harmless status request. Confirm one
    `discord_messages` row and one `user_message` background task or completed
    turn. Confirm the visible response stays in the DM unless the turn
-   intentionally pauses silently.
+   intentionally finishes silently.
 3. Send an owner message in the home guild, outside the default channel if
    available. Confirm it is accepted and routed back to the origin channel or
    thread.
@@ -826,7 +826,7 @@ These syscalls are always host-provided runtime controls, not capabilities.
 | --- | --- |
 | `agent.emit_message` | Main-agent run can complete with exactly one user-visible message. |
 | `agent.emit_value` | Multi-round run can emit bounded internal state. |
-| `agent.pause_until_input` | Run can pause without completing a turn. |
+| `agent.finish_silent` | Run can finish silently without visible assistant text. |
 | `agent.emit_finding` | Research or retriever run can emit a typed finding; main-agent misuse is rejected. |
 | `agent.emit_done` | Rememberer run can end without a user-visible message; main-agent misuse is rejected. |
 | `scratch.set` | Program stores a bounded JSON value for the current turn. |
@@ -842,7 +842,7 @@ against this host in the current smoke pass.
 | --- | --- | --- | --- |
 | `agent.emit_message` | `passed` | `partial` | Current targeted fixture tests prove host-side message emission through direct run-program and loop recovery paths: `tests/integration/test_run_program_runtime.py::test_program_reads_a_capability_then_composes_an_emit_message` and `tests/integration/test_main_loop_recovery.py::test_main_loop_pure_emit_message_round_one_is_not_dropped`; direct-message completion still needs a fresh smoke against the current OpenRouter `MAIN` ref. |
 | `agent.emit_value` | `passed` | `partial` | Current targeted fixture tests prove digest-only internal feedback and next-round fact carryover: `tests/integration/test_normal_turn_program_loop.py::test_emit_value_is_internal_feedback_with_digest_surface` and `tests/integration/test_main_loop_recovery.py::test_emit_value_carries_read_facts_to_next_round_context`. |
-| `agent.pause_until_input` | `passed` | `partial` | Current targeted fixture test proves pause without visible output: `tests/integration/test_normal_turn_program_loop.py::test_pause_until_input_ends_turn_without_visible_output`. |
+| `agent.finish_silent` | `passed` | `partial` | Current targeted fixture test proves silent finish without visible output: `tests/integration/test_normal_turn_program_loop.py::test_finish_silent_ends_turn_without_visible_output`. |
 | `agent.emit_finding` | `passed` | `partial` | Current targeted fixture tests prove research finding emission and main-agent misuse rejection: `tests/integration/test_run_runtime_research_finding.py::test_research_finding_happy_path_sets_emitted_finding` and `tests/integration/test_run_runtime_research_finding.py::test_emit_finding_rejected_in_main_agent_run`. |
 | `agent.emit_done` | `passed` | `partial` | Current targeted fixture tests prove rememberer completion and main-loop misuse recovery: `tests/integration/test_memory.py::test_memory_remember_enqueues_and_worker_records_encode_turn` and `tests/integration/test_main_loop_recovery.py::test_main_loop_emit_done_misuse_recovers_with_typed_nudge`. |
 | `scratch.set` | `passed` | `partial` | Current targeted fixture tests prove scratch round-trip and taint propagation: `tests/integration/test_run_runtime_scratch.py::test_scratch_set_and_get_round_trip` and `tests/integration/test_run_runtime_scratch.py::test_scratch_set_taint_propagates_on_get`. |
@@ -1690,7 +1690,7 @@ the current host.
 | Google sync cursors | passed | Calendar `primary` cursor is `ready`, has a cursor value, and has no last error. |
 | Pub/Sub | passed | Subscriber starts against `projects/ariel-prod-497019/subscriptions/ariel-gmail-watch-sub`; heartbeat remains fresh. |
 | Discord bot | passed | Bot token authenticates with Discord REST; configured guild and channel are readable; gateway connects after restart. This proves provider connectivity only; owner/non-owner UI behavior, slash rendering, approval buttons, and attachment-only messages still require Discord UI smokes. |
-| OpenRouter main/research models | passed | App-like direct adapter smokes returned `OK` from checked-in `MAIN` (`moonshotai/kimi-k2.6`) and `RESEARCH` (`deepseek/deepseek-v3.2`) through OpenRouter. |
+| OpenRouter main/research models | partial | App-like direct adapter smoke must be refreshed for checked-in `MAIN` (`openai/gpt-5.5`) and `RESEARCH` (`deepseek/deepseek-v3.2`) through OpenRouter. |
 | OpenAI embeddings | passed | Live embedding call returned the configured 1536-dimensional numeric vector. |
 | Google vision model | passed | Direct Gemini text smoke returned `OK` from checked-in `VISION` (`gemini-2.5-flash`), and a tiny binary-image smoke returned `Red` through the same direct Google ref. Fixture anchor: `tests/integration/test_attachment_content_runtime.py::test_attachment_read_image_and_pdf_use_vision_model_ref` proves image/PDF attachment reads call the checked-in `VISION` ref with binary content and persist provider metadata. |
 | Local runtime capabilities | partial | Real gVisor direct run-program smokes passed for `memory.recall`, `memory.remember` with worker-drained `memory_encode`, and memory search/read/note create-edit-delete. `proactive.schedule` and `research.investigate` have fixture-proven syscall-created task drainage through the worker, but worker-drained live completion remains pending. |

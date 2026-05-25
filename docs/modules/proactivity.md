@@ -30,8 +30,8 @@ thing that distinguishes a proactive wake from a user turn.
 
 A proactive wake is a normal turn. It receives the same `run` tool and the same
 memory faculties — the retriever and rememberer run as on any turn. A wake may
-end without emitting; "do nothing" is an empty turn, not a recorded decision.
-Every wake is recorded as a session turn.
+finish with `agent.finish_silent`, producing no delivery. Every wake is
+recorded as a session turn.
 
 ## Triggers
 
@@ -41,12 +41,12 @@ Wake sources reach `_wake` through the worker:
 - **A provider push event** — a Gmail or Calendar `watch` callback. The
   webhook or Pub/Sub sidecar verifies and normalizes the event, enqueues
   `provider_event_received`, and the worker may enqueue a wake after sync finds
-  new or changed data.
+  provider data that should be reviewed.
 - **An Agency job event** — the webhook verifies and normalizes the event,
   enqueues `agency_event_received`, and the worker enqueues a wake for job
   states the agent should review.
-- **A poll result** — the periodic provider reconcile sync finds new or changed
-  data and enqueues a wake.
+- **A poll result** — the periodic provider reconcile sync applies the same
+  wake rules as push ingestion.
 - **A due scheduled task** — an `agent_wake` row whose `run_after` has arrived.
 - **A research completion** — when a `research_run` task finishes, the worker
   enqueues an `agent_wake` carrying the typed `research_finding` payload. The
@@ -136,10 +136,13 @@ The worker performs two recurring maintenance tasks from connector state:
   independent of push.
 
 A stale delta cursor — a Gmail `404` or a Calendar `410` — clears the cursor
-and triggers a full resync. A provider push event enqueues ingestion work. A
-sync that finds new data enqueues an `agent_wake` carrying bounded, tainted
-review context. The worker still dispatches it to the shared `_wake` loop; there
-is no deterministic provider-notification decision or separate Discord path.
+and triggers a full resync. A provider push event enqueues ingestion work.
+Provider sync always updates cursors and local evidence for supported deltas.
+Gmail sync enqueues an `agent_wake` only for new inbound messages; label
+changes, deletions, sent-only changes, and draft/outbound changes do not wake
+the agent. Calendar sync may wake on new or changed event data. A wake carries
+bounded, tainted review context and still dispatches to the shared `_wake` loop;
+there is no separate Discord path.
 
 ## Delivery
 
@@ -170,7 +173,7 @@ denies; it cannot act irreversibly on its own.
 - One entrypoint, `_wake`, serves every trigger. There is no separate proactive
   cognition path, deliberation subagent, or proactive-decision record.
 - A proactive wake has the same `run` tool and memory as a user turn and may
-  end without emitting.
+  finish silently with `agent.finish_silent`.
 - `background_tasks` is the only queue, timer, and scheduler. Proactivity adds
   no table of its own beyond `provider_watch_channels`.
 - The worker takes the earliest due row and deletes it on success. There is no
@@ -180,8 +183,9 @@ denies; it cannot act irreversibly on its own.
   time for the same task row.
 - The agent's scheduling surface is `proactive.schedule`; it writes scheduled
   `agent_wake` rows through the capability runtime. System-owned wake writers
-  are provider syncs that find new data, Google connector-error handling,
-  Agency job event handling, and research-run completion.
+  are Gmail syncs that find new inbound messages, Calendar syncs that find new
+  or changed event data, Google connector-error handling, Agency job event
+  handling, and research-run completion.
 - Recurrence is the agent re-scheduling itself; the syscall takes a one-shot
   timestamp.
 - Delivery is one code path: the worker posts the emitted message to Discord

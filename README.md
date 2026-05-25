@@ -62,8 +62,8 @@ guild chat is not limited to one configured channel. attachments are passed as
 bounded references without raw Discord download URLs; content reads flow through
 `attachment.read` with typed failures, provenance, and citation artifacts.
 links still flow through normal URL extraction/search capabilities.
-when the model calls `agent.pause_until_input` inside `run`, Ariel records the
-audited pause and sends no visible assistant text.
+when the model calls `agent.finish_silent` inside `run`, Ariel records the
+audited silent finish and sends no visible assistant text.
 
 `/ariel` and `/ask` are gone. `/status`, `/jobs`, and `/capture` are
 deterministic operational commands only and do not route free-form prompts to the model.
@@ -609,7 +609,7 @@ turn and session settings are runtime-configurable:
 
 - `ARIEL_AUTO_ROTATE_MAX_TURNS` (default `120`) rotates on turn boundary when prior turn count meets/exceeds threshold.
 - `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` (default `172800`) rotates on turn boundary when session age meets/exceeds threshold.
-- `ARIEL_MAX_RESPONSE_TOKENS` (default `700`) bounds assistant completion tokens per turn.
+- `ARIEL_MAX_RESPONSE_TOKENS` (default `12000`) bounds assistant completion tokens per turn.
 - `ARIEL_MAIN_TURN_BUDGET_SECONDS` — wall-clock budget for a main-agent turn; the model is told its remaining budget each round.
 - `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` — wall-clock budget for a research subagent run.
 - `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` — paranoid backstop on model calls per loop; not the primary control.

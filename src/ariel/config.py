@@ -132,7 +132,7 @@ class AppSettings(BaseSettings):
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
     auto_rotate_max_turns: int = 120
     auto_rotate_max_age_seconds: int = 172800
-    max_response_tokens: int = 700
+    max_response_tokens: int = 12000
     main_turn_budget_seconds: float = 180.0
     research_run_budget_seconds: float = 300.0
     memory_recall_budget_seconds: float = 60.0

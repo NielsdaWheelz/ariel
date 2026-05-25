@@ -26,7 +26,7 @@ the model's context for the next round. The loop ends when the model emits its
 terminal output or a rail stops it.
 
 A syscall is one of three kinds. The main-loop `agent.*` output syscalls
-(`agent.emit_message`, `agent.emit_value`, `agent.pause_until_input`) and the
+(`agent.emit_message`, `agent.emit_value`, `agent.finish_silent`) and the
 two `scratch.*` store syscalls are handled inline in `run_runtime.py` — they are
 not capabilities. Every other syscall is a capability call routed through
 `process_one_call`, the unchanged per-call lifecycle: policy, taint, approval,
@@ -53,7 +53,8 @@ driver assembles its context and `LoopConfig`, calls the shared loop, then maps
 - **The main agent** — `_wake` in `app.py`. It owns the user-facing
   conversation and every write. It assembles memory and eligibility context,
   runs the loop on every eligible capability (writes gated by
-  `requires_approval`), and ends when the model calls `agent.emit_message`.
+  `requires_approval`), and ends when the model calls `agent.emit_message` or
+  `agent.finish_silent`.
 - **The research subagent** — `run_research` in `research_runtime.py`. The same
   loop structure, driven read-only on one research mode's capability whitelist,
   ending on `agent.emit_finding`.
@@ -105,9 +106,10 @@ fixed model-call cap. Three rails bound it:
 
 - **Wall-clock budget** — `main_turn_budget_seconds` for `_wake`,
   `research_run_budget_seconds` for `run_research`. Checked before each model
-  call; on exhaustion the loop ends gracefully — the main agent emits a plain
-  "I wasn't able to finish that within the time available" message and the turn
-  completes normally (not a `429`); a research run returns a `partial` finding.
+  call; on exhaustion the loop ends gracefully. User-message turns emit a plain
+  "I wasn't able to finish that within the time available" message and complete
+  normally (not a `429`). Proactive wakes complete silently. Research returns a
+  `partial` finding.
 - **Model-call backstop** — `agent_loop_max_model_calls`, a high paranoid cap,
   not the primary control. Exhausting it ends the loop on the same graceful
   path as budget exhaustion.
@@ -136,8 +138,8 @@ A failed program is **not rolled back**. Its syscall-trace audit — the
 commits regardless. What a failed program does not get to keep: its staged
 approvals are voided (`_void_approvals` moves the approval and
 its action attempt to `expired` so nothing surfaces as a live pending action),
-and the program's emitted outputs — message, values, finding/done, pause — are
-scrubbed from `RunProgramResult`. The model is fed the program error and
+and the program's emitted outputs — message, values, finding/done, silent
+finish — are scrubbed from `RunProgramResult`. The model is fed the program error and
 authors the next program.
 
 A turn is not program-journaled. If the worker crashes after committing any turn

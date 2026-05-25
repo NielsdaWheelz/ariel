@@ -197,7 +197,7 @@ def test_call_captures_thinking_parts_as_reasoning_summary() -> None:
     assert response.reasoning_summary == "reasoning"
 
 
-def test_call_passes_xhigh_reasoning_effort_as_thinking_setting() -> None:
+def test_call_passes_openrouter_reasoning_effort_as_extra_body() -> None:
     class CapturingModel(Model):
         def __init__(self) -> None:
             self.seen_settings: list[ModelSettings | None] = []
@@ -232,7 +232,9 @@ def test_call_passes_xhigh_reasoning_effort_as_thinking_setting() -> None:
         )
     )
 
-    assert substrate.seen_settings == [{"tool_choice": "auto", "thinking": "xhigh"}]
+    assert substrate.seen_settings == [
+        {"tool_choice": "auto", "extra_body": {"reasoning": {"effort": "xhigh"}}}
+    ]
 
 
 def test_call_lifts_provider_response_id_and_usage_details() -> None:

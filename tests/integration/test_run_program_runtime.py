@@ -201,7 +201,7 @@ def test_program_reads_a_capability_then_composes_an_emit_message(
     assert result.callback_errors == []
     assert result.emitted_message == "Found seeded memory."
     assert result.emitted_values == []
-    assert result.paused is False
+    assert result.finished_silent is False
     assert len(result.action_attempts) == 1
     assert result.action_attempts[0].capability_id == "cap.memory.search"
     assert result.action_attempts[0].status == "succeeded"
@@ -353,7 +353,7 @@ def test_raising_program_is_reported_as_a_program_failure(
     # Program Failure: no emitted output is surfaced as intended.
     assert result.emitted_message == ""
     assert result.emitted_values == []
-    assert result.paused is False
+    assert result.finished_silent is False
     # The inline search still ran — it is the syscall trace (audit spine).
     assert len(result.action_attempts) == 1
     assert result.action_attempts[0].capability_id == "cap.memory.search"

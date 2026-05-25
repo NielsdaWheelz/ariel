@@ -8,6 +8,7 @@ import json
 from typing import Any, cast
 
 from sqlalchemy import select, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
@@ -77,27 +78,43 @@ def _acquire_provider_sync_lock(
     provider: str,
     resource_type: str,
     resource_id: str,
-) -> tuple[Session | None, int | None]:
-    lock_db = session_factory()
-    bind = lock_db.get_bind()
+) -> tuple[Connection | None, int | None]:
+    probe = session_factory()
+    try:
+        bind = probe.get_bind()
+    finally:
+        probe.close()
     if bind is None or bind.dialect.name != "postgresql":
-        lock_db.close()
         return None, None
+    if not isinstance(bind, Engine):
+        raise RuntimeError("provider sync advisory lock requires an engine bind")
     lock_id = _provider_sync_lock_id("provider_sync", provider, resource_type, resource_id)
-    acquired = lock_db.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id})
-    lock_db.commit()
-    if acquired is not True:
-        lock_db.close()
+    lock_conn = bind.connect()
+    try:
+        acquired = lock_conn.scalar(
+            text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id}
+        )
+        lock_conn.commit()
+        if acquired is True:
+            return lock_conn, lock_id
         raise ProviderSyncFailure("provider_sync_lock_busy")
-    return lock_db, lock_id
+    except Exception:
+        lock_conn.close()
+        raise
 
 
-def _release_provider_sync_lock(lock_db: Session | None, lock_id: int | None) -> None:
-    if lock_db is None or lock_id is None:
+def _release_provider_sync_lock(lock_conn: Connection | None, lock_id: int | None) -> None:
+    if lock_conn is None or lock_id is None:
         return
-    lock_db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
-    lock_db.commit()
-    lock_db.close()
+    try:
+        unlocked = lock_conn.scalar(
+            text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id}
+        )
+        lock_conn.commit()
+        if unlocked is not True:
+            raise RuntimeError("provider sync advisory lock was not held")
+    finally:
+        lock_conn.close()
 
 
 def _provider_account_id_for_sync(db: Session) -> str:
@@ -171,7 +188,7 @@ def process_provider_sync_due(
 
     now = now_fn()
     sync_run_id = new_id_fn("syn")
-    lock_db: Session | None = None
+    lock_conn: Connection | None = None
     lock_id: int | None = None
     if provider_event_id is not None:
         with session_factory() as db:
@@ -191,7 +208,7 @@ def process_provider_sync_due(
                 raise RuntimeError("provider_sync_due task missing supported resource_type")
 
     try:
-        lock_db, lock_id = _acquire_provider_sync_lock(
+        lock_conn, lock_id = _acquire_provider_sync_lock(
             session_factory,
             provider=provider,
             resource_type=resource_type,
@@ -670,31 +687,28 @@ def process_provider_sync_due(
                 if event is not None:
                     event.status = "processed"
                     event.processed_at = now
-                # New or changed provider data wakes the agent: the single
-                # convergence point for both the push and poll paths. The
-                # payload carries bounded, tainted provider evidence so the
-                # normal agent turn can decide whether to speak, inspect more,
-                # act through tools, schedule, remember, or stay silent.
                 if item_count > 0:
-                    enqueue_background_task(
-                        db,
-                        task_type="agent_wake",
-                        payload=_provider_sync_wake_payload(
-                            resource_type=resource_type,
-                            resource_id=resource_id,
-                            sync_run_id=sync_run_id,
-                            provider_event_id=provider_event_id,
-                            item_count=item_count,
-                            observation_count=observation_count,
-                            cursor_before=cursor_before,
-                            cursor_after=cursor_after,
-                            outputs=outputs,
-                            gmail_read_outputs=gmail_read_outputs,
-                        ),
-                        now=now,
+                    wake_payload = _provider_sync_wake_payload(
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        sync_run_id=sync_run_id,
+                        provider_event_id=provider_event_id,
+                        item_count=item_count,
+                        observation_count=observation_count,
+                        cursor_before=cursor_before,
+                        cursor_after=cursor_after,
+                        outputs=outputs,
+                        gmail_read_outputs=gmail_read_outputs,
                     )
+                    if wake_payload is not None:
+                        enqueue_background_task(
+                            db,
+                            task_type="agent_wake",
+                            payload=wake_payload,
+                            now=now,
+                        )
     finally:
-        _release_provider_sync_lock(lock_db, lock_id)
+        _release_provider_sync_lock(lock_conn, lock_id)
 
 
 def _sync_calendar_item(
@@ -1244,6 +1258,12 @@ def _mark_sync_failed(
 
 
 def _provider_sync_wake_note(resource_type: str, item_count: int) -> str:
+    if resource_type == "gmail":
+        noun = "message" if item_count == 1 else "messages"
+        return (
+            f"A Google Gmail sync found {item_count} new inbound {noun}. "
+            "Review the new mail and decide whether anything matters."
+        )
     label = {"gmail": "Gmail", "calendar": "Calendar", "drive": "Drive"}.get(
         resource_type, resource_type
     )
@@ -1266,12 +1286,16 @@ def _provider_sync_wake_payload(
     cursor_after: str | None,
     outputs: list[dict[str, Any]],
     gmail_read_outputs: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     items = _provider_sync_wake_items(
         resource_type=resource_type,
         outputs=outputs,
         gmail_read_outputs=gmail_read_outputs,
     )
+    if resource_type == "gmail":
+        item_count = len(items)
+    if item_count <= 0:
+        return None
     return {
         "kind": "provider_sync_review",
         "provider": "google",
@@ -1318,31 +1342,36 @@ def _gmail_provider_sync_wake_items(
             if not isinstance(history, dict):
                 continue
             history_id = _payload_text(history, "id")
-            for change in ("messagesAdded", "labelsAdded", "labelsRemoved", "messagesDeleted"):
-                raw_entries = history.get(change)
-                entries = raw_entries if isinstance(raw_entries, list) else []
-                for entry in entries:
-                    message = entry.get("message") if isinstance(entry, dict) else None
-                    if not isinstance(message, dict):
-                        continue
-                    message_id = _payload_text(message, "id")
-                    if message_id is None:
-                        continue
-                    item = items_by_message_id.get(message_id)
-                    if item is None:
-                        item = _gmail_provider_sync_wake_item(
-                            message=message,
-                            read_output=gmail_read_outputs.get(message_id),
-                            history_id=history_id,
-                        )
-                        items_by_message_id[message_id] = item
-                    changes = item.setdefault("changes", [])
-                    if isinstance(changes, list) and change not in changes:
-                        changes.append(change)
-                    if "change" not in item:
-                        item["change"] = change
-                    if len(items_by_message_id) >= _PROVIDER_SYNC_WAKE_MAX_ITEMS:
-                        return list(items_by_message_id.values())
+            raw_entries = history.get("messagesAdded")
+            entries = raw_entries if isinstance(raw_entries, list) else []
+            for entry in entries:
+                message = entry.get("message") if isinstance(entry, dict) else None
+                if not isinstance(message, dict):
+                    continue
+                message_id = _payload_text(message, "id")
+                if message_id is None or message_id in items_by_message_id:
+                    continue
+                read_output = gmail_read_outputs.get(message_id)
+                read_message = read_output.get("message") if isinstance(read_output, dict) else None
+                if not isinstance(read_message, dict):
+                    continue
+                labels = _gmail_wake_labels(message=message, read_message=read_message)
+                if _payload_text(read_message, "direction") != "received":
+                    continue
+                if "INBOX" not in labels or any(
+                    label in labels for label in ("SENT", "DRAFT", "TRASH", "SPAM")
+                ):
+                    continue
+                item = _gmail_provider_sync_wake_item(
+                    message=message,
+                    read_output=read_output,
+                    history_id=history_id,
+                )
+                item["change"] = "messagesAdded"
+                item["changes"] = ["messagesAdded"]
+                items_by_message_id[message_id] = item
+                if len(items_by_message_id) >= _PROVIDER_SYNC_WAKE_MAX_ITEMS:
+                    return list(items_by_message_id.values())
     return list(items_by_message_id.values())
 
 

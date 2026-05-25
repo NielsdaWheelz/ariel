@@ -126,7 +126,7 @@ class LoopConfig:
     output_mode:
         Which terminal ``RunProgramResult`` field exits the loop.
         ``"message"`` exits on ``emitted_message``, an ``awaiting_approval``
-        action attempt, or ``paused``.  ``"finding"`` exits on
+        action attempt, or ``silent``.  ``"finding"`` exits on
         ``emitted_finding``.  ``"operations"`` exits on ``emitted_operations``
         (the summary string from ``agent.emit_done``).
     finding_mode:
@@ -209,7 +209,7 @@ class LoopResult:
     - ``"approval"`` — the program staged an approval proposal without
       emitting a message; the awaiting action attempt is in
       ``awaiting_approval``.
-    - ``"paused"`` — the program called ``agent.pause_until_input``.
+    - ``"silent"`` — the program called ``agent.finish_silent``.
     - ``"budget_exhausted"`` — the wall-clock budget, the model-call backstop,
       or stuck-detection ended the run without a terminal result.
     - ``"model_failed"`` — a model call raised an unretryable exception (or
@@ -221,7 +221,7 @@ class LoopResult:
         "finding",
         "operations",
         "approval",
-        "paused",
+        "silent",
         "budget_exhausted",
         "model_failed",
     ]
@@ -636,7 +636,8 @@ def run_agent_loop(
                 },
                 output={
                     "emitted_message": bool(run_program_result.emitted_message),
-                    "paused": run_program_result.paused,
+                    "finished_silent": run_program_result.finished_silent,
+                    "silent_reason": run_program_result.silent_reason,
                     "emitted_value_count": len(run_program_result.emitted_values),
                     "action_attempt_count": len(run_program_result.action_attempts),
                 },
@@ -663,7 +664,8 @@ def run_agent_loop(
                     "action_attempts": action_summary,
                     "emitted_message": bool(run_program_result.emitted_message),
                     "emitted_values": len(run_program_result.emitted_values),
-                    "paused": run_program_result.paused,
+                    "finished_silent": run_program_result.finished_silent,
+                    "silent_reason": run_program_result.silent_reason,
                 },
                 sort_keys=True,
             )
@@ -794,9 +796,9 @@ def run_agent_loop(
                         runtime_provenance=final_runtime_provenance,
                     )
 
-                if run_program_result.paused:
+                if run_program_result.finished_silent:
                     return LoopResult(
-                        outcome="paused",
+                        outcome="silent",
                         emitted_message=None,
                         emitted_finding=None,
                         emitted_operations=None,

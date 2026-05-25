@@ -158,7 +158,7 @@ class NoVisibleResponseAdapter(FakeModelAdapter):
                 provider=self.provider, model=self.model, messages=request.messages
             )
         self.messages_seen.append(list(request.messages))
-        calls = [{"name": "agent.pause_until_input", "input": {}}]
+        calls = [{"name": "agent.finish_silent", "input": {"reason": "routine"}}]
         return responses_with_run_calls(
             calls=calls,
             provider=self.provider,

@@ -547,8 +547,8 @@ Expected state:
 Functional health:
 
 - Ambient Discord owner DM and home-guild messages receive concise responses unless
-  the `run` program pauses with `agent.pause_until_input`.
-- A pause turn records the audited model output and sends no visible assistant
+  the `run` program finishes silently with `agent.finish_silent`.
+- A silent-finish turn records the audited model output and sends no visible assistant
   text.
 - Messages with attachments preserve bounded attachment references in context; raw
   Discord download URLs are not model-visible, and content extraction happens only

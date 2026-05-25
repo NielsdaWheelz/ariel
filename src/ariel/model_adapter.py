@@ -204,7 +204,10 @@ class ModelAdapter:
         if request.max_output_tokens is not None:
             model_settings["max_tokens"] = request.max_output_tokens
         if request.reasoning is not None and request.reasoning.effort is not None:
-            model_settings["thinking"] = request.reasoning.effort
+            if ref.provider == "openrouter":
+                model_settings["extra_body"] = {"reasoning": {"effort": request.reasoning.effort}}
+            else:
+                model_settings["thinking"] = request.reasoning.effort
 
         started_at = time.perf_counter()
         raw = await asyncio.wait_for(
