@@ -79,7 +79,6 @@ def _canonical_production_env() -> dict[str, str]:
         "ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION": "v1",
         "ARIEL_CONNECTOR_ENCRYPTION_KEYS": CONNECTOR_KEYRING,
         "ARIEL_PUBLIC_WEBHOOK_BASE_URL": "https://ariel.example.com",
-        "ARIEL_MODEL_REASONING_EFFORT": "medium",
         "ARIEL_MODEL_TIMEOUT_SECONDS": "30.0",
         "ARIEL_MEMORY_EMBEDDING_DIMENSIONS": "1536",
         "ARIEL_GOOGLE_OAUTH_CLIENT_ID": "google-client-id",
@@ -444,7 +443,6 @@ def test_validate_required_environment_values_reports_missing_and_placeholders()
 
 def test_required_production_env_vars_include_runbook_operational_defaults() -> None:
     assert {
-        "ARIEL_MODEL_REASONING_EFFORT",
         "ARIEL_MODEL_TIMEOUT_SECONDS",
         "ARIEL_MEMORY_EMBEDDING_DIMENSIONS",
         "ARIEL_GOOGLE_OAUTH_STATE_TTL_SECONDS",

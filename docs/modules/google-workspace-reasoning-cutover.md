@@ -228,7 +228,7 @@ final behavior:
   - Google read answer synthesis is generic and source-candidate based.
 - `src/ariel/sync_runtime.py`
   - Gmail and Calendar sync persist provider objects and provider evidence, then
-    wake the shared agent loop.
+    wake the shared agent loop with bounded, tainted changed-item review context.
 - `src/ariel/memory.py`
   - The live memory substrate is `memory_log` and `memory_notes`; there is no
     dedicated commitment store.

@@ -34,6 +34,7 @@ from tests.integration.responses_helpers import (
     empty_recall_response,
     is_memory_subsystem_call,
     last_user_message,
+    run_response,
     responses_run_message,
     run_function_calls,
 )
@@ -386,13 +387,21 @@ class _WakeAdapter(FakeModelAdapter):
     provider = "provider.wake"
     model = "model.wake-v1"
 
-    def __init__(self) -> None:
+    def __init__(self, *, retriever_source: str | None = None) -> None:
         super().__init__()
         self.user_messages_seen: list[str] = []
+        self.retriever_source = retriever_source
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         user_message = last_user_message(request.messages)
         if is_memory_subsystem_call(request.messages):
+            if self.retriever_source is not None:
+                return run_response(
+                    source=self.retriever_source,
+                    provider=self.provider,
+                    model=self.model,
+                    provider_response_id=f"resp_retriever_{len(self.user_messages_seen)}",
+                )
             return empty_recall_response(
                 provider=self.provider, model=self.model, messages=request.messages
             )
@@ -465,6 +474,140 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
             )
             assert wake_log is not None
             assert wake_log.taint == "clean"
+
+
+def test_worker_provider_sync_agent_wake_invokes_normal_wake_with_tainted_context(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    adapter = _WakeAdapter(
+        retriever_source=(
+            "memory.search(query='Launch checklist due today', limit=1)\n"
+            "agent.emit_finding(summary='', claims=[], gaps=[], sources=[])\n"
+        )
+    )
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    BackgroundTaskRecord(
+                        id="tsk_provider_sync_review",
+                        task_type="agent_wake",
+                        idempotency_key=None,
+                        provider_write_receipt_id=None,
+                        payload={
+                            "kind": "provider_sync_review",
+                            "provider": "google",
+                            "resource_type": "gmail",
+                            "resource_id": "primary",
+                            "sync_run_id": "syn_provider_sync_review",
+                            "provider_event_id": "pev_provider_sync_review",
+                            "item_count": 1,
+                            "observation_count": 1,
+                            "cursor_before": "hist-1",
+                            "cursor_after": "hist-2",
+                            "items": [
+                                {
+                                    "change": "messagesAdded",
+                                    "message_id": "msg_urgent",
+                                    "thread_id": "thr_urgent",
+                                    "subject": "Launch checklist due today",
+                                    "sender": {"email": "manager@example.com"},
+                                    "direction": "received",
+                                    "labels": ["INBOX", "IMPORTANT"],
+                                    "source_timestamp": "2026-06-01T11:55:00Z",
+                                    "read_outcome": "ok",
+                                    "evidence_blocks": [
+                                        {
+                                            "kind": "body",
+                                            "text": "Please send the launch checklist by 5pm.",
+                                        }
+                                    ],
+                                }
+                            ],
+                            "omitted_item_count": 0,
+                            "note": (
+                                "A Google Gmail sync found 1 new or changed item. "
+                                "Review the new activity and decide whether anything matters."
+                            ),
+                        },
+                        attempts=0,
+                        recurrence_seconds=None,
+                        run_after=now - timedelta(minutes=1),
+                        created_at=now - timedelta(minutes=5),
+                        updated_at=now - timedelta(minutes=5),
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+    assert len(adapter.user_messages_seen) == 1
+    user_message = adapter.user_messages_seen[0]
+    assert "Provider sync wake: Google Gmail" in user_message
+    assert "Launch checklist due today" in user_message
+    assert "Please send the launch checklist by 5pm." in user_message
+    with session_factory() as db:
+        task = db.get(BackgroundTaskRecord, "tsk_provider_sync_review")
+        turn = db.scalar(
+            select(TurnRecord).where(
+                TurnRecord.source_background_task_id == "tsk_provider_sync_review"
+            )
+        )
+        wake_log = db.scalar(
+            select(MemoryLogRecord).where(
+                MemoryLogRecord.kind == "proactive_trigger",
+                MemoryLogRecord.content.like("Provider sync wake:%"),
+            )
+        )
+
+    assert task is None
+    assert turn is not None
+    assert turn.status == "completed"
+    assert wake_log is not None
+    assert wake_log.taint == "tainted"
+    with session_factory() as db:
+        proposed_events = db.scalars(
+            select(EventRecord)
+            .where(EventRecord.turn_id == turn.id)
+            .where(EventRecord.event_type == "evt.action.proposed")
+            .order_by(EventRecord.sequence.asc())
+        ).all()
+
+    memory_search_events = [
+        event
+        for event in proposed_events
+        if event.payload.get("capability_id") == "cap.memory.search"
+    ]
+    assert len(memory_search_events) == 1
+    taint = memory_search_events[0].payload["taint"]
+    assert taint["provenance_status"] == "tainted"
+    assert taint["runtime_provenance"]["status"] == "tainted"
+    assert taint["runtime_provenance"]["evidence"] == [
+        {
+            "kind": "provider_sync_review",
+            "provider": "google",
+            "resource_type": "gmail",
+            "resource_id": "primary",
+            "sync_run_id": "syn_provider_sync_review",
+            "provider_event_id": "pev_provider_sync_review",
+            "item_count": 1,
+            "observation_count": 1,
+        }
+    ]
 
 
 def test_schedule_run_program_worker_drains_due_wake_end_to_end(

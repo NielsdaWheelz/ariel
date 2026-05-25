@@ -4033,10 +4033,11 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # is capped.
     "email.search": "(query: str) -> {'schema_version': 'google.gmail.message_refs.v1', 'messages': list[{'message_id': str, 'thread_id': str, 'subject': str | None, 'preview': str | None, 'direction': Literal['sent', 'received', 'draft'], ...}], 'retrieved_at': str, 'total_estimate': int | None, 'status': 'succeeded'}",
     # email.read: at least one of ``message_id`` or ``thread_id`` MUST be
-    # provided and non-null. Use a value from a prior ``email.search`` result;
-    # never invent ids and never pass both as None. ``mode`` defaults to
-    # ``"message"`` when ``message_id`` is given, else ``"thread"``.
-    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from a prior email.search result -> {'schema_version': 'google.gmail.message_evidence.v1', 'mode': Literal['message', 'thread', 'thread_context'], 'message': {'subject', 'sender', 'recipients', 'internal_date', ...} | None, 'thread': {'thread_id', 'message_count', ...} | None, 'messages': list[dict] | None, 'evidence': {'blocks': list[{'kind', 'text', ...}], 'source_kind': str, ...}, 'read_outcome': {'status': Literal['ok', 'body_too_large', 'decode_failed', 'no_body'], ...}, 'retrieved_at': str, 'status': 'succeeded'}",
+    # provided and non-null. Use a value from a prior ``email.search`` result
+    # or the current provider-sync wake context; never invent ids and never pass
+    # both as None. ``mode`` defaults to ``"message"`` when ``message_id`` is
+    # given, else ``"thread"``.
+    "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from prior email.search or provider-sync context -> {'schema_version': 'google.gmail.message_evidence.v1', 'mode': Literal['message', 'thread', 'thread_context'], 'message': {'subject', 'sender', 'recipients', 'internal_date', ...} | None, 'thread': {'thread_id', 'message_count', ...} | None, 'messages': list[dict] | None, 'evidence': {'blocks': list[{'kind', 'text', ...}], 'source_kind': str, ...}, 'read_outcome': {'status': Literal['ok', 'body_too_large', 'decode_failed', 'no_body'], ...}, 'retrieved_at': str, 'status': 'succeeded'}",
     # drive (read)
     "drive.search": "(query: str) -> {'schema_version': 'google.drive.search_results.v1', 'query': str, 'provider_account_id': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'retrieved_at': str, 'status': 'succeeded'}",
     "drive.read": "(file_id: str) -> {'schema_version': 'google.drive.read_result.v1', 'file_id': str, 'provider_account_id': str, 'title': str, 'source': str, 'published_at': str | None, 'content_excerpt': str, 'truncated': bool, 'read_outcome': {'status': Literal['ok', 'unsupported', 'too_large', 'unavailable'], 'reason_code': str | None, 'recovery': str | None}, 'retrieved_at': str, 'status': 'succeeded'}",

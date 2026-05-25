@@ -1407,6 +1407,84 @@ def test_gmail_404_clears_cursor_and_reenqueues_full_sync(
     assert len(resync_tasks) == 1
 
 
+def test_gmail_sync_without_cursor_uses_active_watch_seed(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SeededGmailProvider:
+        def __init__(self) -> None:
+            self.start_history_ids: list[str] = []
+
+        def email_list_history(self, *, start_history_id: str, **_: Any) -> dict[str, Any]:
+            self.start_history_ids.append(start_history_id)
+            return {"historyId": 8592451, "history": []}
+
+    provider = SeededGmailProvider()
+
+    class FakeRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = provider
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeRuntime)
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
+    new_id = IdFactory()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id=new_id("wch"),
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_watch",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="8592450",
+                    status="active",
+                    expires_at=now + timedelta(days=7),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={
+            "provider": "google",
+            "resource_type": "gmail",
+            "resource_id": "sub_watch",
+        },
+        settings=settings,
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        cursor = db.scalar(select(SyncCursorRecord).limit(1))
+        run = db.scalar(select(SyncRunRecord).limit(1))
+
+    assert provider.start_history_ids == ["8592450"]
+    assert cursor is not None
+    assert cursor.cursor_value == "8592451"
+    assert cursor.cursor_version == 2
+    assert run is not None
+    assert run.cursor_before == "8592450"
+    assert run.cursor_after == "8592451"
+    assert run.status == "succeeded"
+
+
 # --------------------------------------------------------------------------
 # A sync that finds new items enqueues an agent_wake.
 # --------------------------------------------------------------------------
@@ -1489,7 +1567,25 @@ def test_sync_with_new_items_enqueues_agent_wake(
     assert run is not None
     assert run.item_count == 1
     assert len(wake_tasks) == 1
-    note = wake_tasks[0].payload["note"]
+    payload = wake_tasks[0].payload
+    assert payload["kind"] == "provider_sync_review"
+    assert payload["provider"] == "google"
+    assert payload["resource_type"] == "calendar"
+    assert payload["resource_id"] == "primary"
+    assert payload["sync_run_id"] == run.id
+    assert payload["item_count"] == 1
+    assert payload["observation_count"] == 0
+    assert payload["items"] == [
+        {
+            "event_id": "evt-new-1",
+            "status": "confirmed",
+            "summary": "Quarterly review",
+            "start": "2026-05-20T10:00:00Z",
+            "end": "2026-05-20T11:00:00Z",
+            "source_timestamp": "2026-05-18T09:00:00Z",
+        }
+    ]
+    note = payload["note"]
     assert isinstance(note, str)
     assert "Calendar" in note
     assert "1 new or changed item" in note

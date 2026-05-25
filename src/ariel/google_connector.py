@@ -3014,10 +3014,12 @@ def _parse_google_expiration_millis(value: Any) -> datetime | None:
 
 def _payload_text_value(payload: dict[str, Any], key: str) -> str | None:
     value = payload.get(key)
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip()
-    return normalized or None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    return None
 
 
 def _gmail_string_list(raw_value: Any, *, require_non_empty: bool) -> list[str]:

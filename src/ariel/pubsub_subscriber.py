@@ -98,6 +98,15 @@ class GmailPubSubNotification:
     publish_time_iso: str | None
 
 
+def _normalize_gmail_history_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    return None
+
+
 def _parse_message_payload(message: Any) -> GmailPubSubNotification:
     message_id_raw = getattr(message, "message_id", None)
     if not isinstance(message_id_raw, str) or not message_id_raw.strip():
@@ -114,16 +123,17 @@ def _parse_message_payload(message: Any) -> GmailPubSubNotification:
         raise MalformedPubSubPayload("payload_not_object")
     email_address_raw = raw_payload.get("emailAddress")
     history_id_raw = raw_payload.get("historyId")
+    history_id = _normalize_gmail_history_id(history_id_raw)
     if not isinstance(email_address_raw, str) or not email_address_raw.strip():
         raise MalformedPubSubPayload("email_address_invalid")
-    if not isinstance(history_id_raw, str) or not history_id_raw.strip():
+    if history_id is None:
         raise MalformedPubSubPayload("history_id_invalid")
     publish_time = getattr(message, "publish_time", None)
     return GmailPubSubNotification(
         message_id=message_id,
         data=data,
         email_address=email_address_raw.strip(),
-        history_id=history_id_raw.strip(),
+        history_id=history_id,
         publish_time_iso=publish_time.isoformat() if isinstance(publish_time, datetime) else None,
     )
 

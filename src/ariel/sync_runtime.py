@@ -25,6 +25,7 @@ from ariel.persistence import (
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
     ProviderEventRecord,
+    ProviderWatchChannelRecord,
     SyncCursorRecord,
     SyncRunRecord,
     enqueue_background_task,
@@ -39,6 +40,19 @@ from ariel.provider_evidence_lifecycle import (
 )
 
 _CALENDAR_SYNC_PAGE_SIZE = 10
+_PROVIDER_SYNC_WAKE_MAX_ITEMS = 8
+_PROVIDER_SYNC_WAKE_MAX_BLOCKS_PER_ITEM = 2
+_PROVIDER_SYNC_WAKE_MAX_BLOCK_CHARS = 700
+_PROVIDER_SYNC_WAKE_MAX_LABELS = 12
+
+
+def _payload_scalar_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return str(value)
+    return None
 
 
 def _provider_sync_lock_id(*parts: str) -> int:
@@ -210,14 +224,34 @@ def process_provider_sync_due(
                     .with_for_update()
                     .limit(1)
                 )
+                gmail_watch_cursor_seed: str | None = None
+                if cursor is None and resource_type == "gmail":
+                    watch_channel = db.scalar(
+                        select(ProviderWatchChannelRecord)
+                        .where(
+                            ProviderWatchChannelRecord.provider == "google",
+                            ProviderWatchChannelRecord.resource_type == "gmail",
+                            ProviderWatchChannelRecord.resource_id == resource_id,
+                            ProviderWatchChannelRecord.status == "active",
+                        )
+                        .order_by(ProviderWatchChannelRecord.updated_at.desc())
+                        .limit(1)
+                    )
+                    gmail_watch_cursor_seed = (
+                        watch_channel.cursor_seed.strip()
+                        if watch_channel is not None
+                        and isinstance(watch_channel.cursor_seed, str)
+                        and watch_channel.cursor_seed.strip()
+                        else None
+                    )
                 if cursor is None:
                     cursor = SyncCursorRecord(
                         id=new_id_fn("cur"),
                         provider="google",
                         resource_type=resource_type,
                         resource_id=resource_id,
-                        cursor_value=None,
-                        cursor_version=0,
+                        cursor_value=gmail_watch_cursor_seed,
+                        cursor_version=1 if gmail_watch_cursor_seed is not None else 0,
                         status="ready",
                         last_successful_sync_at=None,
                         last_error_code=None,
@@ -637,12 +671,26 @@ def process_provider_sync_due(
                     event.status = "processed"
                     event.processed_at = now
                 # New or changed provider data wakes the agent: the single
-                # convergence point for both the push and poll paths.
+                # convergence point for both the push and poll paths. The
+                # payload carries bounded, tainted provider evidence so the
+                # normal agent turn can decide whether to speak, inspect more,
+                # act through tools, schedule, remember, or stay silent.
                 if item_count > 0:
                     enqueue_background_task(
                         db,
                         task_type="agent_wake",
-                        payload={"note": _provider_sync_wake_note(resource_type, item_count)},
+                        payload=_provider_sync_wake_payload(
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            sync_run_id=sync_run_id,
+                            provider_event_id=provider_event_id,
+                            item_count=item_count,
+                            observation_count=observation_count,
+                            cursor_before=cursor_before,
+                            cursor_after=cursor_after,
+                            outputs=outputs,
+                            gmail_read_outputs=gmail_read_outputs,
+                        ),
                         now=now,
                     )
     finally:
@@ -1206,9 +1254,239 @@ def _provider_sync_wake_note(resource_type: str, item_count: int) -> str:
     )
 
 
-def _payload_text(payload: dict[str, Any], key: str) -> str | None:
-    value = payload.get(key)
-    if not isinstance(value, str):
+def _provider_sync_wake_payload(
+    *,
+    resource_type: str,
+    resource_id: str,
+    sync_run_id: str,
+    provider_event_id: str | None,
+    item_count: int,
+    observation_count: int,
+    cursor_before: str | None,
+    cursor_after: str | None,
+    outputs: list[dict[str, Any]],
+    gmail_read_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    items = _provider_sync_wake_items(
+        resource_type=resource_type,
+        outputs=outputs,
+        gmail_read_outputs=gmail_read_outputs,
+    )
+    return {
+        "kind": "provider_sync_review",
+        "provider": "google",
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "sync_run_id": sync_run_id,
+        "provider_event_id": provider_event_id,
+        "item_count": item_count,
+        "observation_count": observation_count,
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "items": items,
+        "omitted_item_count": max(0, item_count - len(items)),
+        "note": _provider_sync_wake_note(resource_type, item_count),
+    }
+
+
+def _provider_sync_wake_items(
+    *,
+    resource_type: str,
+    outputs: list[dict[str, Any]],
+    gmail_read_outputs: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if resource_type == "gmail":
+        return _gmail_provider_sync_wake_items(
+            outputs=outputs,
+            gmail_read_outputs=gmail_read_outputs,
+        )
+    if resource_type == "calendar":
+        return _calendar_provider_sync_wake_items(outputs=outputs)
+    return []
+
+
+def _gmail_provider_sync_wake_items(
+    *,
+    outputs: list[dict[str, Any]],
+    gmail_read_outputs: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items_by_message_id: dict[str, dict[str, Any]] = {}
+    for output in outputs:
+        raw_histories = output.get("history")
+        histories = raw_histories if isinstance(raw_histories, list) else []
+        for history in histories:
+            if not isinstance(history, dict):
+                continue
+            history_id = _payload_text(history, "id")
+            for change in ("messagesAdded", "labelsAdded", "labelsRemoved", "messagesDeleted"):
+                raw_entries = history.get(change)
+                entries = raw_entries if isinstance(raw_entries, list) else []
+                for entry in entries:
+                    message = entry.get("message") if isinstance(entry, dict) else None
+                    if not isinstance(message, dict):
+                        continue
+                    message_id = _payload_text(message, "id")
+                    if message_id is None:
+                        continue
+                    item = items_by_message_id.get(message_id)
+                    if item is None:
+                        item = _gmail_provider_sync_wake_item(
+                            message=message,
+                            read_output=gmail_read_outputs.get(message_id),
+                            history_id=history_id,
+                        )
+                        items_by_message_id[message_id] = item
+                    changes = item.setdefault("changes", [])
+                    if isinstance(changes, list) and change not in changes:
+                        changes.append(change)
+                    if "change" not in item:
+                        item["change"] = change
+                    if len(items_by_message_id) >= _PROVIDER_SYNC_WAKE_MAX_ITEMS:
+                        return list(items_by_message_id.values())
+    return list(items_by_message_id.values())
+
+
+def _gmail_provider_sync_wake_item(
+    *,
+    message: dict[str, Any],
+    read_output: dict[str, Any] | None,
+    history_id: str | None,
+) -> dict[str, Any]:
+    read_message = read_output.get("message") if isinstance(read_output, dict) else None
+    read_evidence = read_output.get("evidence") if isinstance(read_output, dict) else None
+    read_outcome = read_output.get("read_outcome") if isinstance(read_output, dict) else None
+    message_id = _payload_text(message, "id")
+    thread_id = _payload_text(message, "threadId")
+    labels = _gmail_wake_labels(message=message, read_message=read_message)
+    item: dict[str, Any] = {
+        "message_id": message_id,
+        "thread_id": _payload_text(read_message, "thread_id")
+        if isinstance(read_message, dict)
+        else thread_id,
+        "history_id": history_id,
+        "labels": labels,
+        "source_timestamp": _payload_text(read_output, "published_at")
+        if isinstance(read_output, dict)
+        else None,
+        "read_outcome": _payload_text(read_outcome, "status")
+        if isinstance(read_outcome, dict)
+        else None,
+        "provider_url": _payload_text(read_message, "provider_url")
+        if isinstance(read_message, dict)
+        else (
+            f"https://mail.google.com/mail/u/0/#all/{message_id}"
+            if message_id is not None
+            else None
+        ),
+    }
+    if isinstance(read_message, dict):
+        item.update(
+            {
+                "subject": _payload_text(read_message, "subject"),
+                "sender": _gmail_wake_address(read_message.get("sender")),
+                "direction": _payload_text(read_message, "direction"),
+                "evidence_blocks": _gmail_wake_evidence_blocks(read_evidence),
+            }
+        )
+    return {key: value for key, value in item.items() if value not in (None, [], {})}
+
+
+def _gmail_wake_labels(
+    *,
+    message: dict[str, Any],
+    read_message: Any,
+) -> list[str]:
+    raw_labels = read_message.get("labels") if isinstance(read_message, dict) else None
+    if not isinstance(raw_labels, list):
+        raw_labels = message.get("labelIds")
+    if not isinstance(raw_labels, list):
+        return []
+    labels = [label for label in raw_labels if isinstance(label, str) and label.strip()]
+    return labels[:_PROVIDER_SYNC_WAKE_MAX_LABELS]
+
+
+def _gmail_wake_address(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, dict):
         return None
-    normalized = value.strip()
-    return normalized or None
+    address: dict[str, str] = {}
+    for key in ("name", "display_name", "email", "raw"):
+        text = _payload_text(value, key)
+        if text is not None:
+            address[key] = text
+    return address or None
+
+
+def _gmail_wake_evidence_blocks(read_evidence: Any) -> list[dict[str, Any]]:
+    if not isinstance(read_evidence, dict):
+        return []
+    raw_blocks = read_evidence.get("blocks")
+    blocks = raw_blocks if isinstance(raw_blocks, list) else []
+    result: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        text = _bounded_provider_text(_payload_text(block, "text"))
+        if text is None:
+            continue
+        result.append(
+            {
+                "kind": _payload_text(block, "kind") or "body",
+                "text": text,
+                "truncated": bool(block.get("truncated")),
+            }
+        )
+        if len(result) >= _PROVIDER_SYNC_WAKE_MAX_BLOCKS_PER_ITEM:
+            break
+    return result
+
+
+def _calendar_provider_sync_wake_items(
+    *,
+    outputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for output in outputs:
+        raw_items = output.get("items")
+        calendar_items = raw_items if isinstance(raw_items, list) else []
+        for item in calendar_items:
+            if not isinstance(item, dict):
+                continue
+            wake_item = _calendar_provider_sync_wake_item(cast(dict[str, Any], item))
+            if wake_item:
+                items.append(wake_item)
+            if len(items) >= _PROVIDER_SYNC_WAKE_MAX_ITEMS:
+                return items
+    return items
+
+
+def _calendar_provider_sync_wake_item(item: dict[str, Any]) -> dict[str, Any]:
+    start_raw = item.get("start")
+    end_raw = item.get("end")
+    start = cast(dict[str, Any], start_raw) if isinstance(start_raw, dict) else {}
+    end = cast(dict[str, Any], end_raw) if isinstance(end_raw, dict) else {}
+    event_id = _payload_text(item, "id")
+    result: dict[str, Any] = {
+        "event_id": event_id,
+        "status": _payload_text(item, "status"),
+        "summary": _payload_text(item, "summary"),
+        "start": _payload_text(start, "dateTime") or _payload_text(start, "date"),
+        "end": _payload_text(end, "dateTime") or _payload_text(end, "date"),
+        "source_timestamp": _payload_text(item, "updated"),
+        "provider_url": _payload_text(item, "htmlLink"),
+    }
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _bounded_provider_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    if len(normalized) <= _PROVIDER_SYNC_WAKE_MAX_BLOCK_CHARS:
+        return normalized
+    return normalized[: _PROVIDER_SYNC_WAKE_MAX_BLOCK_CHARS - 12].rstrip() + " [truncated]"
+
+
+def _payload_text(payload: dict[str, Any], key: str) -> str | None:
+    return _payload_scalar_text(payload.get(key))

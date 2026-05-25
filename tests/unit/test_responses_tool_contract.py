@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import re
 from typing import Any, cast
 
 import pytest
@@ -62,7 +63,7 @@ def test_run_tool_description_does_not_advertise_turn_scoped_capabilities() -> N
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
-    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v7"
+    assert MAIN_AGENT_PROMPT_VERSION == "main-agent-jarvis-v9"
     assert all(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
 
     prompt = "\n\n".join(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS)
@@ -75,7 +76,7 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     assert "attachment.read" in prompt
     assert "source_evidence_id" in prompt
     assert "user_instruction_ref=turn:<turn_id>" in prompt
-    assert "unknown" in prompt
+    assert "nothing important surfaced" in prompt
     # Honesty about own program errors: the model must not blame a connector
     # when its own run program failed to compile or execute.
     assert "is your error, not the connector's" in prompt
@@ -83,6 +84,12 @@ def test_main_agent_prompt_is_versioned_static_contract() -> None:
     # instead of fabricating an "unavailable" failure register.
     assert "Never report a successful call as a failure" in prompt
     assert "Ground every assistant message in the data" in prompt
+    assert "do not confuse retrieval with attention" in prompt
+    assert "Do not call an item top or important" in prompt
+    assert "compact facts" in prompt
+    assert re.search(r"candidate\s+judgments", prompt) is not None
+    assert "list them (sender, subject, snippet)" not in prompt
+    assert re.search(r"\bskills?\b|\bprocedur", prompt, flags=re.IGNORECASE) is None
     # Synthesis questions require deliberation across rounds.
     assert "For synthesis questions" in prompt
     # research.investigate is async: never re-call to poll, and never pass

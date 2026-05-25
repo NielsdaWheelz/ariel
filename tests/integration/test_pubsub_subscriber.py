@@ -128,6 +128,27 @@ def test_handle_message_happy_path(session_factory: sessionmaker[Session]) -> No
     assert heartbeat.last_message_at is not None
 
 
+def test_handle_message_accepts_numeric_gmail_history_id(
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed_connector(session_factory)
+    message = FakePubSubMessage(
+        message_id="pubsub-msg-numeric-history",
+        data=b'{"emailAddress": "user@example.com", "historyId": 8592450}',
+        publish_time=_NOW,
+    )
+
+    handle_message(session_factory, message)
+
+    with session_factory() as db:
+        event = db.scalar(select(ProviderEventRecord))
+
+    assert event is not None
+    assert event.payload["historyId"] == "8592450"
+    assert len(message.ack_calls) == 1
+    assert message.nack_calls == []
+
+
 def test_handle_message_duplicate_dedups(session_factory: sessionmaker[Session]) -> None:
     _seed_connector(session_factory)
     payload = b'{"emailAddress": "user@example.com", "historyId": "12345"}'
@@ -213,7 +234,9 @@ def test_handle_message_missing_email_field_acks_and_drops(
         b'{"emailAddress": ["user@example.com"], "historyId": "1"}',
         b'{"emailAddress": "user@example.com"}',
         b'{"emailAddress": "user@example.com", "historyId": ""}',
-        b'{"emailAddress": "user@example.com", "historyId": 1}',
+        b'{"emailAddress": "user@example.com", "historyId": -1}',
+        b'{"emailAddress": "user@example.com", "historyId": true}',
+        b'{"emailAddress": "user@example.com", "historyId": 1.5}',
     ],
 )
 def test_handle_message_invalid_payload_shape_acks_and_drops(

@@ -699,7 +699,12 @@ class TurnExecutionOutcome:
 
 @dataclass(slots=True, frozen=True)
 class WakeContext:
-    trigger_kind: Literal["user_message", "scheduled_task", "research_completion"]
+    trigger_kind: Literal[
+        "user_message",
+        "scheduled_task",
+        "provider_sync",
+        "research_completion",
+    ]
     prompt_text: str
     discord_context: dict[str, Any] | None
     attachment_sources: list[dict[str, Any]] | None
@@ -1401,7 +1406,7 @@ def _wake(
     match wake_context.trigger_kind:
         case "user_message":
             wake_log_kind: Literal["user_message", "proactive_trigger"] = "user_message"
-        case "scheduled_task" | "research_completion":
+        case "scheduled_task" | "provider_sync" | "research_completion":
             wake_log_kind = "proactive_trigger"
         case _:
             assert_never(wake_context.trigger_kind)
@@ -1437,6 +1442,7 @@ def _wake(
             attachment_runtime=runtime.attachment_runtime,
             query=user_message,
             allowed_capability_ids=RESEARCH_MEMORIES_CAPABILITY_IDS,
+            runtime_provenance=runtime_provenance,
             approval_ttl_seconds=int(runtime.settings.approval_ttl_seconds),
             approval_actor_id=str(runtime.settings.approval_actor_id),
             add_event=add_event,
@@ -1528,7 +1534,10 @@ def _wake(
         ),
         emit_value_nudge=(
             "run program emitted internal values. They are not "
-            "visible to the user. Continue with exactly one run call."
+            "visible to the user. Continue with exactly one run call; reason over "
+            "the emitted compact facts before answering, and for synthesis or "
+            "attention questions do not list items merely because they were "
+            "retrieved."
         ),
         no_terminal_output_nudge=(
             "run program completed without user-visible output. Plain "

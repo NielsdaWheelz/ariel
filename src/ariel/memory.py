@@ -50,6 +50,7 @@ from .persistence import (
 from .run_runtime import run_tool_definitions
 
 if TYPE_CHECKING:
+    from .action_runtime import RuntimeProvenance
     from .agency_daemon import AgencyRuntime
     from .attachment_content import AttachmentContentRuntime
     from .google_connector import GoogleConnectorRuntime
@@ -587,6 +588,7 @@ def run_retriever(
     attachment_runtime: AttachmentContentRuntime | None,
     query: str,
     allowed_capability_ids: frozenset[str],
+    runtime_provenance: RuntimeProvenance | None,
     approval_ttl_seconds: int,
     approval_actor_id: str,
     add_event: Callable[[str, dict[str, Any]], None],
@@ -678,7 +680,7 @@ def run_retriever(
         add_event=add_event,
         now_fn=now_fn,
         new_id_fn=new_id_fn,
-        runtime_provenance=None,
+        runtime_provenance=runtime_provenance,
         google_runtime=google_runtime,
         execute_google_reads_outside_transaction=False,
         agency_runtime=agency_runtime,

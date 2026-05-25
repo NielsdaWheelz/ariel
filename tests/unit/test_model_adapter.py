@@ -16,13 +16,14 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model
+from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
 from ariel.config import AppSettings
-from ariel.model_adapter import ModelAdapter, ModelCall, ToolSpec
+from ariel.model_adapter import ModelAdapter, ModelCall, ReasoningConfig, ToolSpec
 from ariel.models import MAIN, ModelRef
 from ariel.response_contracts import ResponseContractViolation
 
@@ -194,6 +195,44 @@ def test_call_captures_thinking_parts_as_reasoning_summary() -> None:
 
     assert response.text == "answer"
     assert response.reasoning_summary == "reasoning"
+
+
+def test_call_passes_xhigh_reasoning_effort_as_thinking_setting() -> None:
+    class CapturingModel(Model):
+        def __init__(self) -> None:
+            self.seen_settings: list[ModelSettings | None] = []
+
+        @property
+        def system(self) -> str:
+            return "test"
+
+        @property
+        def model_name(self) -> str:
+            return "capturing-model"
+
+        async def request(
+            self,
+            messages: list[ModelMessage],
+            model_settings: ModelSettings | None,
+            model_request_parameters: ModelRequestParameters,
+        ) -> PydAIModelResponse:
+            del messages, model_request_parameters
+            self.seen_settings.append(model_settings)
+            return PydAIModelResponse(parts=[TextPart(content="answer")])
+
+    substrate = CapturingModel()
+    adapter = _adapter_with(substrate)
+    asyncio.run(
+        adapter.call(
+            ModelCall(
+                model=MAIN,
+                messages=_msgs(),
+                reasoning=ReasoningConfig(effort="xhigh"),
+            )
+        )
+    )
+
+    assert substrate.seen_settings == [{"tool_choice": "auto", "thinking": "xhigh"}]
 
 
 def test_call_lifts_provider_response_id_and_usage_details() -> None:

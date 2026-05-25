@@ -100,7 +100,6 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
             [
                 "ARIEL_DATABASE_URL=postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
                 "ARIEL_BIND_PORT=8123",
-                "ARIEL_MODEL_REASONING_EFFORT=low",
             ]
         ),
         encoding="utf-8",
@@ -119,7 +118,6 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
                 "print(json.dumps({\n"
                 "    'database_url': settings.database_url,\n"
                 "    'bind_port': settings.bind_port,\n"
-                "    'model_reasoning_effort': settings.model_reasoning_effort,\n"
                 "}))\n"
             ),
         ],
@@ -133,7 +131,6 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
     assert json.loads(result.stdout) == {
         "database_url": "postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
         "bind_port": 8123,
-        "model_reasoning_effort": "low",
     }
 
 

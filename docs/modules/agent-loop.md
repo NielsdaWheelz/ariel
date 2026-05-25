@@ -81,10 +81,11 @@ dispatches on `task_type`, and runs the turn:
 
 - `user_message` and `agent_wake` — the worker builds a `WakeContext` and calls
   `_wake`. `WakeContext` carries `trigger_kind`
-  (`user_message`, `scheduled_task`, or `research_completion`), `prompt_text`,
-  `discord_context`, `attachment_sources`, and `ingress_provenance`. The
-  trigger kind is the only thing distinguishing a proactive wake from a user
-  turn ([proactivity.md](proactivity.md)).
+  (`user_message`, `scheduled_task`, `provider_sync`, or
+  `research_completion`), `prompt_text`, `discord_context`,
+  `attachment_sources`, and `ingress_provenance`. The trigger kind is the only
+  thing distinguishing a proactive wake from a user turn
+  ([proactivity.md](proactivity.md)).
 - `research_run` — the worker calls `run_research`, then enqueues an
   `agent_wake` carrying the finding (see below).
 

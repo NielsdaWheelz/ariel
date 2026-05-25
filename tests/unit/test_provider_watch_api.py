@@ -55,6 +55,36 @@ def test_gmail_register_watch_posts_topic_and_parses_epoch_millis_expiration(
     assert result["expiration"] == datetime(2026, 5, 8, 16, 0, tzinfo=UTC)
 
 
+def test_gmail_register_watch_accepts_numeric_history_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_request(
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        del method, headers, params, json, timeout
+        return _json_response(
+            status_code=200,
+            payload={"historyId": 987654, "expiration": "1778256000000"},
+            url=url,
+        )
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    provider = DefaultGoogleWorkspaceProvider(timeout_seconds=5.0, max_attempts=1)
+
+    result = provider.gmail_register_watch(
+        access_token="tok_live",
+        topic_name="projects/ariel/topics/gmail-watch",
+    )
+
+    assert result["historyId"] == "987654"
+
+
 def test_gmail_stop_watch_posts_stop_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 

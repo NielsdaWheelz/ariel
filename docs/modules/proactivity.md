@@ -23,10 +23,10 @@ There is one agent-loop entrypoint, `_wake`, a module-level function in
 assembles memory and eligibility context, runs the answer model with the `run`
 tool, executes the program, and emits any output.
 
-A `WakeContext` carries `trigger_kind` (`user_message`, `scheduled_task`, or
-`research_completion`), `prompt_text`, `discord_context`, `attachment_sources`,
-and `ingress_provenance`. The trigger kind is the only thing that distinguishes
-a proactive wake from a user turn.
+A `WakeContext` carries `trigger_kind` (`user_message`, `scheduled_task`,
+`provider_sync`, or `research_completion`), `prompt_text`, `discord_context`,
+`attachment_sources`, and `ingress_provenance`. The trigger kind is the only
+thing that distinguishes a proactive wake from a user turn.
 
 A proactive wake is a normal turn. It receives the same `run` tool and the same
 memory faculties — the retriever and rememberer run as on any turn. A wake may
@@ -69,8 +69,10 @@ semantics.
 A row is `id`, `task_type`, `idempotency_key`, `provider_write_receipt_id`,
 `payload`, `attempts`, `recurrence_seconds`, `run_after`, `created_at`, and
 `updated_at`. Plain note wakes carry an `agent_wake` payload with `note`.
-Research-completion wakes carry `session_id` and a typed `research_finding`.
-The worker rejects any `agent_wake` payload that is neither shape.
+Provider-sync wakes carry `kind='provider_sync_review'`, sync metadata, and
+bounded changed-item evidence from normalized provider reads. Research-completion
+wakes carry `session_id` and a typed `research_finding`. The worker rejects any
+`agent_wake` payload that is none of these shapes.
 
 The single-threaded worker takes the earliest due row, dispatches by
 `task_type`, and on success deletes the row, or — when `recurrence_seconds` is
@@ -135,7 +137,9 @@ The worker performs two recurring maintenance tasks from connector state:
 
 A stale delta cursor — a Gmail `404` or a Calendar `410` — clears the cursor
 and triggers a full resync. A provider push event enqueues ingestion work. A
-sync that finds new data enqueues an `agent_wake`.
+sync that finds new data enqueues an `agent_wake` carrying bounded, tainted
+review context. The worker still dispatches it to the shared `_wake` loop; there
+is no deterministic provider-notification decision or separate Discord path.
 
 ## Delivery
 

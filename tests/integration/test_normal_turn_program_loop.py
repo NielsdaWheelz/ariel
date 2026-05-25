@@ -477,8 +477,9 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
     assert "value" not in value_events[0]["payload"]
     assert len(value_events[0]["payload"]["value_digest"]) == 64
     assert value_events[0]["payload"]["value_bytes"] > 0
-    from pydantic_ai.messages import ModelRequest, ToolReturnPart
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart, ToolReturnPart
 
+    nudge_texts: list[str] = []
     value_feedback: list[dict[str, Any]] = []
     for message in adapter.input_items_seen[-1]:
         if not isinstance(message, ModelRequest):
@@ -486,7 +487,53 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
         for part in message.parts:
             if isinstance(part, ToolReturnPart) and isinstance(part.content, str):
                 value_feedback.append(json.loads(part.content))
+            elif isinstance(part, SystemPromptPart):
+                nudge_texts.append(part.content)
     assert value_feedback[0]["emitted_values"] == [{"answer": 42}]
+    assert any("reason over the emitted compact facts" in text for text in nudge_texts)
+    assert any(
+        "do not list items merely because they were retrieved" in text for text in nudge_texts
+    )
+
+
+def test_oversized_emit_value_gets_compact_fact_recovery_nudge(postgres_url: str) -> None:
+    raw_dump = "x" * 13000
+    adapter = CapturingRunAdapter(
+        responses=[
+            _program_response(
+                source=f"agent.emit_value(value={{'raw_mail_dump': {raw_dump!r}}})\n",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_value_too_large",
+            ),
+            _program_response(
+                source="agent.emit_message(text='No important mail surfaced.')\n",
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_value_too_large_final",
+            ),
+        ]
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        turn = post_message_and_drain(client, session_id, message="any important email today?")
+
+    assert turn.assistant_message == "No important mail surfaced."
+
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    nudge_texts: list[str] = []
+    for message in adapter.input_items_seen[-1]:
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, SystemPromptPart):
+                nudge_texts.append(part.content)
+    assert any(
+        "agent.emit_value rejected oversized internal values" in text for text in nudge_texts
+    )
+    assert any("carry only compact facts and candidate judgments" in text for text in nudge_texts)
+    assert any("do not answer by listing retrieved items" in text for text in nudge_texts)
 
 
 def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:

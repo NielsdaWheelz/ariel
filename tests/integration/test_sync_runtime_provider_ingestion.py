@@ -721,6 +721,18 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     assert [run.cursor_after for run in runs] == ["hist-3", "hist-3"]
     # Each sync run that finds new data wakes the agent; nothing else.
     assert [task.task_type for task in tasks] == ["agent_wake", "agent_wake"]
+    first_payload = tasks[0].payload
+    assert first_payload["kind"] == "provider_sync_review"
+    assert first_payload["provider"] == "google"
+    assert first_payload["resource_type"] == "gmail"
+    assert first_payload["resource_id"] == "primary"
+    assert first_payload["item_count"] == 4
+    assert first_payload["omitted_item_count"] == 1
+    assert first_payload["items"][0]["message_id"] == "msg-1"
+    assert first_payload["items"][0]["subject"] == "Follow up"
+    assert first_payload["items"][0]["evidence_blocks"][0]["text"] == (
+        "Thanks, I will follow up by Friday."
+    )
 
 
 def test_gmail_sync_hydrates_added_messages_into_body_evidence(

@@ -685,6 +685,7 @@ def _execute_memory_capability(
     approval_ttl_seconds: int = 0,
     approval_actor_id: str = "",
     add_event: Callable[[str, dict[str, Any]], None] | None = None,
+    runtime_provenance: RuntimeProvenance | None = None,
 ) -> dict[str, Any]:
     """Run one memory syscall.
 
@@ -738,6 +739,7 @@ def _execute_memory_capability(
             attachment_runtime=attachment_runtime,
             query=str(normalized_input["query"]),
             allowed_capability_ids=RESEARCH_MEMORIES_CAPABILITY_IDS,
+            runtime_provenance=runtime_provenance,
             approval_ttl_seconds=approval_ttl_seconds,
             approval_actor_id=approval_actor_id,
             add_event=_add_event,
@@ -3871,6 +3873,7 @@ def process_one_call(
                 approval_ttl_seconds=approval_ttl_seconds,
                 approval_actor_id=approval_actor_id,
                 add_event=add_event,
+                runtime_provenance=runtime_provenance,
             )
         except MemoryExecutionError as exc:
             execution_result = ExecutionResult(

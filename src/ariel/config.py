@@ -13,7 +13,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
 from ariel.secret_cipher import SecretCipher
 
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _LOCAL_AUTH_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _PUBSUB_SUBSCRIPTION_PATTERN = re.compile(
@@ -128,7 +127,6 @@ class AppSettings(BaseSettings):
     cloudflare_api_token: str | None = None
     cloudflare_account_id: str | None = None
     model_timeout_seconds: float = 30.0
-    model_reasoning_effort: Literal["minimal", "low", "medium", "high"] = "medium"
     # ``memory_embedding_dimensions`` is the DB column width invariant; the
     # actual provider/model are resolved by the EMBEDDING tier in the adapter.
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
@@ -410,20 +408,6 @@ class AppSettings(BaseSettings):
                 "(all for Gmail push on, none for off)"
             )
         return self
-
-    @field_validator("model_reasoning_effort", mode="before")
-    @classmethod
-    def _model_reasoning_effort_normalized(
-        cls, value: Any
-    ) -> Literal["minimal", "low", "medium", "high"]:
-        # Pydantic validates the Literal after this hook returns; we just
-        # normalize whitespace + case so common env-var typos still resolve.
-        if not isinstance(value, str):
-            raise ValueError("model_reasoning_effort must be a string")
-        normalized = value.strip().lower()
-        if normalized not in {"minimal", "low", "medium", "high"}:
-            raise ValueError("model_reasoning_effort must be one of: minimal, low, medium, high")
-        return normalized  # type: ignore[return-value]  # justify-narrowed-by-set-check
 
     @field_validator("memory_embedding_dimensions")
     @classmethod

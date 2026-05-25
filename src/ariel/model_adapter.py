@@ -39,10 +39,13 @@ class ToolSpec(BaseModel):
     parameters: dict[str, Any]
 
 
+ReasoningEffort = Literal["minimal", "low", "medium", "high", "xhigh"]
+
+
 class ReasoningConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    effort: Literal["minimal", "low", "medium", "high"] | None = None
+    effort: ReasoningEffort | None = None
     max_thinking_tokens: int | None = None
 
 

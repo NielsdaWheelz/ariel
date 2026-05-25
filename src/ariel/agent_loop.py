@@ -352,7 +352,7 @@ def run_agent_loop(
                         messages=messages,
                         tools=tools,
                         tool_choice="required",
-                        reasoning=ReasoningConfig(effort=settings.model_reasoning_effort),
+                        reasoning=ReasoningConfig(effort="xhigh"),
                         max_output_tokens=settings.max_response_tokens,
                     )
                 )
@@ -553,6 +553,16 @@ def run_agent_loop(
                         "agent.emit_done is not available in this loop. "
                         "Continue with one run call that ends by calling "
                         "agent.emit_message(text=...) to reply to the user."
+                    )
+                    break
+                if err in {"agent_emit_value_too_large", "agent_emit_value_too_many"}:
+                    nudge = (
+                        "agent.emit_value rejected oversized internal values. "
+                        "Do not dump raw tool payloads into agent.emit_value and do "
+                        "not answer by listing retrieved items. Keep bulky raw data "
+                        "in scratch when needed, carry only compact facts and "
+                        "candidate judgments with agent.emit_value, then deliberate "
+                        "before answering."
                     )
                     break
             # A failed program may still have succeeded syscalls before it

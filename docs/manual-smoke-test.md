@@ -76,7 +76,6 @@ directly; do not put it in `/etc/ariel/ariel.env`.
 | `ARIEL_CLOUDFLARE_API_TOKEN` | yes | Cloudflare Workers AI provider | Required when any ref in `src/ariel/models.py` uses `provider="cloudflare"`. |
 | `ARIEL_CLOUDFLARE_ACCOUNT_ID` | no | Cloudflare Workers AI provider | Account id encoded into the Workers AI base URL; required when using the Cloudflare provider. |
 | `ARIEL_MODEL_TIMEOUT_SECONDS` | no | Model/audio calls | Model adapter calls and direct audio transcription time out within this bound; normal smoke turn completes. |
-| `ARIEL_MODEL_REASONING_EFFORT` | no | Model adapter | Validated as `minimal`, `low`, `medium`, or `high`. |
 | `ARIEL_MAX_RESPONSE_TOKENS` | no | Agent loop | Overlong output is rejected with bounded failure. |
 | `ARIEL_MAIN_TURN_BUDGET_SECONDS` | no | Agent loop | Budget exhaustion test completes gracefully. |
 | `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` | no | Research runtime | Research run timeout test or bounded manual research check. |
@@ -253,7 +252,6 @@ the owning feature still needs its own live smoke row.
 | `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present; schema dimension must match `EMBEDDING`. |
 | `ARIEL_MEMORY_ENCODE_BUDGET_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
 | `ARIEL_MEMORY_RECALL_BUDGET_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
-| `ARIEL_MODEL_REASONING_EFFORT` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |
 | `ARIEL_MODEL_TIMEOUT_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |
 | `ARIEL_OPENAI_API_KEY` | `passed` | `partial` | Validator/inventory guards track this current `EMBEDDING` provider key; redacted current env load: present. |
 | `ARIEL_OPENAI_BASE_URL` | `passed` | `not_enabled` | Validator/inventory guards track this key; redacted current env load: unset, so the default OpenAI endpoint is used. |

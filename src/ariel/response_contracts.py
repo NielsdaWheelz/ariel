@@ -102,6 +102,10 @@ class SurfaceTaintEvidenceContract(BaseModel):
     # ``failed``) mirror the producer in ``worker._agent_wake_context`` so the
     # surface can show *which* research run motivated the proposal. See
     # ``docs/modules/agent-loop.md`` (The completion wake).
+    # ``provider_sync_review`` is the equivalent ingress marker for Google
+    # Workspace provider-sync wakes: the worker renders bounded provider
+    # evidence into the turn, so later proposals must surface that the action
+    # was influenced by untrusted provider content.
     kind: Literal[
         "prior_tool_output_in_context",
         "runtime_provenance_missing",
@@ -109,6 +113,7 @@ class SurfaceTaintEvidenceContract(BaseModel):
         "capture_shared_content_ingress",
         "attachment_content_read",
         "research_finding_in_context",
+        "provider_sync_review",
     ]
     turn_id: str | None = None
     action_attempt_id: str | None = None
@@ -119,6 +124,13 @@ class SurfaceTaintEvidenceContract(BaseModel):
     modality: str | None = None
     research_mode: ResearchMode | None = None
     research_status: Literal["complete", "partial", "failed"] | None = None
+    provider: Literal["google"] | None = None
+    resource_type: Literal["gmail", "calendar", "drive"] | None = None
+    resource_id: str | None = None
+    sync_run_id: str | None = None
+    provider_event_id: str | None = None
+    item_count: int | None = None
+    observation_count: int | None = None
 
 
 class SurfaceRuntimeProvenanceContract(BaseModel):

@@ -103,6 +103,71 @@ def test_action_proposed_accepts_research_finding_evidence() -> None:
             "modality": None,
             "research_mode": "web",
             "research_status": "partial",
+            "provider": None,
+            "resource_type": None,
+            "resource_id": None,
+            "sync_run_id": None,
+            "provider_event_id": None,
+            "item_count": None,
+            "observation_count": None,
+        }
+    ]
+
+
+def test_action_proposed_accepts_provider_sync_review_evidence() -> None:
+    """Provider-sync wakes carry bounded Gmail/Calendar evidence into a normal
+    turn. If that tainted context influences a tool call, the surface event
+    contract must accept the provider-sync provenance instead of crashing the
+    background worker after the turn completes."""
+
+    projected = _project_surface_event_payload(
+        "evt.action.proposed",
+        {
+            "action_attempt_id": "aat_1",
+            "capability_id": "cap.memory.search",
+            "input": {"query": "Launch checklist due today", "limit": 1},
+            "taint": {
+                "influenced_by_untrusted_content": True,
+                "provenance_status": "tainted",
+                "runtime_provenance": {
+                    "status": "tainted",
+                    "evidence": [
+                        {
+                            "kind": "provider_sync_review",
+                            "provider": "google",
+                            "resource_type": "gmail",
+                            "resource_id": "primary",
+                            "sync_run_id": "syn_provider_sync_review",
+                            "provider_event_id": "pev_provider_sync_review",
+                            "item_count": 1,
+                            "observation_count": 1,
+                        }
+                    ],
+                },
+                "model_declared_taint": {"status": "missing"},
+            },
+        },
+    )
+    evidence = projected["taint"]["runtime_provenance"]["evidence"]
+    assert evidence == [
+        {
+            "kind": "provider_sync_review",
+            "turn_id": None,
+            "action_attempt_id": None,
+            "capability_id": None,
+            "impact_level": None,
+            "attachment_ref": None,
+            "filename": None,
+            "modality": None,
+            "research_mode": None,
+            "research_status": None,
+            "provider": "google",
+            "resource_type": "gmail",
+            "resource_id": "primary",
+            "sync_run_id": "syn_provider_sync_review",
+            "provider_event_id": "pev_provider_sync_review",
+            "item_count": 1,
+            "observation_count": 1,
         }
     ]
 

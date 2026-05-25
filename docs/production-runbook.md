@@ -163,7 +163,6 @@ ARIEL_CONNECTOR_ENCRYPTION_KEYS='{"v1":"<base64url-16-24-or-32-byte-key>"}'
 ARIEL_OPENAI_API_KEY=<openai-api-key>
 ARIEL_GOOGLE_API_KEY=<google-api-key>
 ARIEL_OPENROUTER_API_KEY=<openrouter-api-key>
-ARIEL_MODEL_REASONING_EFFORT=medium
 ARIEL_MODEL_TIMEOUT_SECONDS=<seconds>
 ARIEL_ATTACHMENT_BLOB_STORE_PATH=/var/lib/ariel/attachment-blobs
 ```

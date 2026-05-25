@@ -84,8 +84,9 @@ run completion. A Google connector error also enqueues a wake.
 the earliest due row, dispatches by `task_type`, and deletes the row on success
 or re-arms it when it recurs; there is no claim protocol, dead-letter state, or
 reaper. A scheduled wake is a `task_type='agent_wake'` row carrying the
-AI-authored note. The agent's whole scheduling surface is one syscall,
-`proactive.schedule(when, note)`, which writes one `agent_wake` row.
+AI-authored note; a provider-sync wake carries bounded, tainted changed-item
+evidence for the same shared agent loop. The agent's whole scheduling surface is
+one syscall, `proactive.schedule(when, note)`, which writes one `agent_wake` row.
 
 A proactive wake delivers to Discord through `agent.emit_message`, exactly like
 a user turn — there is no `notifications` table. Autonomous action is gated by
