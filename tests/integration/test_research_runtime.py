@@ -125,7 +125,7 @@ def test_run_research_completed_returns_finding(session_factory: Any) -> None:
     _seed_session(session_factory, "ses_research_ok")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
-    settings = _settings()
+    settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
     adapter = SnapshotAdapter(
         responses=[_program_response(source=_FINDING_PROGRAM, provider_response_id="r1")]
     )
@@ -166,7 +166,7 @@ def test_run_research_persists_research_kind_turn(session_factory: Any) -> None:
     _seed_session(session_factory, "ses_research_turn")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
-    settings = _settings()
+    settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
     adapter = SnapshotAdapter(
         responses=[_program_response(source=_FINDING_PROGRAM, provider_response_id="rt1")]
     )
@@ -309,7 +309,7 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
     _seed_session(session_factory, "ses_research_web")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
-    settings = _settings()
+    settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
     adapter = SnapshotAdapter(
         responses=[_program_response(source=_FINDING_PROGRAM, provider_response_id="rw1")]
     )
@@ -330,7 +330,6 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
     rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
     # The web whitelist's run callables are advertised to the model.
     assert "- search.web(query: str)" in rendered
-    assert "- search.news(query: str)" in rendered
     assert "- web.extract(url: str)" in rendered
     assert "max_results" not in rendered
     assert "topn" not in rendered
@@ -339,6 +338,33 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
     assert "email.read" not in rendered
     assert "drive.search" not in rendered
     assert "calendar.list" not in rendered
+
+
+def test_run_research_web_mode_omits_unconfigured_web_capabilities(session_factory: Any) -> None:
+    _seed_session(session_factory, "ses_research_web_unconfigured")
+    sandbox = FakeSandboxRuntime()
+    sandbox.start()
+    settings = _settings(search_web_api_key=None, jina_api_key=None)
+    adapter = SnapshotAdapter(
+        responses=[_program_response(source=_FINDING_PROGRAM, provider_response_id="rw0")]
+    )
+    with session_factory() as db:
+        run_research(
+            sandbox=sandbox,
+            db=db,
+            session_factory=session_factory,
+            settings=settings,
+            model_adapter=adapter,
+            google_runtime=build_google_runtime(settings),
+            session_id="ses_research_web_unconfigured",
+            question="A web-mode question without providers.",
+            mode="web",
+        )
+    sandbox.close()
+
+    rendered = json.dumps(jsonable_encoder(adapter.snapshots[0]))
+    assert "- search.web(" not in rendered
+    assert "- web.extract(" not in rendered
 
 
 def test_run_research_personal_mode_exposes_only_personal_capabilities(

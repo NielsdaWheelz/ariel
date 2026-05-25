@@ -72,7 +72,7 @@ def test_action_proposed_accepts_research_finding_evidence() -> None:
         {
             "action_attempt_id": "aat_1",
             "capability_id": "cap.web.extract",
-            "input": {"url": "https://www.anthropic.com/news"},
+            "input": {"url": "https://www.anthropic.com/research"},
             "taint": {
                 "influenced_by_untrusted_content": True,
                 "provenance_status": "tainted",

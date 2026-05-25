@@ -30,6 +30,7 @@ from tests.fake_sandbox import FakeSandboxRuntime
 from ariel.model_adapter import ModelCall, ModelResponse
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
+    drain_task,
     empty_recall_response,
     is_memory_subsystem_call,
     last_user_message,
@@ -464,6 +465,94 @@ def test_worker_agent_wake_arm_invokes_wake_for_a_due_task(
             )
             assert wake_log is not None
             assert wake_log.taint == "clean"
+
+
+def test_schedule_run_program_worker_drains_due_wake_end_to_end(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual task row created by ``cap.proactive.schedule`` is consumed by
+    the worker's ``agent_wake`` arm and recorded as a completed scheduled turn."""
+
+    _stub_memory_retriever(monkeypatch)
+    current_now = {"value": NOW}
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: current_now["value"])
+    monkeypatch.setattr("ariel.app.utcnow", lambda: current_now["value"])
+    adapter = _WakeAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+        with session_factory() as db:
+            with db.begin():
+                turn = TurnRecord(
+                    id="trn_sched_e2e",
+                    session_id=session_id,
+                    user_message="schedule this follow-up",
+                    assistant_message=None,
+                    status="in_progress",
+                    created_at=NOW - timedelta(minutes=5),
+                    updated_at=NOW - timedelta(minutes=5),
+                )
+                db.add(turn)
+                ctx = run_function_calls(
+                    db=db,
+                    session_id=session_id,
+                    turn=turn,
+                    function_calls_raw=[
+                        {
+                            "call_id": "call_sched_e2e",
+                            "capability_id": "cap.proactive.schedule",
+                            "input": {
+                                "when": "2026-06-01T11:59:00Z",
+                                "note": "follow up on the e2e schedule",
+                            },
+                            "influenced_by_untrusted_content": False,
+                        }
+                    ],
+                    approval_ttl_seconds=300,
+                    approval_actor_id="usr_sched_e2e",
+                    add_event=lambda _event_type, _payload: None,
+                    now_fn=lambda: NOW,
+                    new_id_fn=lambda prefix: f"{prefix}_sched_e2e",
+                    allowed_capability_ids=["cap.proactive.schedule"],
+                    runtime_provenance=RuntimeProvenance(status="clean"),
+                )
+                turn.status = "completed"
+                turn.assistant_message = "scheduled"
+                turn.updated_at = NOW - timedelta(minutes=4)
+
+        assert ctx.blocked_reasons == []
+        assert len(ctx.inline_results) == 1
+        output = ctx.inline_results[0]["output"]
+        assert output["status"] == "scheduled"
+        scheduled_task_id = output["task_id"]
+        drain_task(client, scheduled_task_id)
+
+    assert adapter.user_messages_seen == ["follow up on the e2e schedule"]
+    with session_factory() as db:
+        assert db.get(BackgroundTaskRecord, scheduled_task_id) is None
+        wake_turn = db.scalar(
+            select(TurnRecord).where(TurnRecord.user_message == "follow up on the e2e schedule")
+        )
+        assert wake_turn is not None
+        assert wake_turn.status == "completed"
+        wake_log = db.scalar(
+            select(MemoryLogRecord).where(
+                MemoryLogRecord.kind == "proactive_trigger",
+                MemoryLogRecord.content == "follow up on the e2e schedule",
+                MemoryLogRecord.turn_id == wake_turn.id,
+            )
+        )
+        assert wake_log is not None
+        assert wake_log.taint == "clean"
 
 
 def test_worker_user_message_arm_invokes_wake_for_target_session(

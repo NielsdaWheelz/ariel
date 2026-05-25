@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from ariel.config import ENV_FILE_SELECTOR_ENV_VAR
 from ariel.dev_db import (
     load_local_env,
     parse_dotenv_file,
@@ -22,7 +23,7 @@ def test_parse_dotenv_file_reads_key_values_and_ignores_comments(tmp_path: Path)
                 "ARIEL_DATABASE_URL=postgresql+psycopg://u:p@localhost:5432/db",
                 "export ARIEL_OPENAI_API_KEY=test-key",
                 "IGNORED_LINE_WITHOUT_EQUALS",
-                "ARIEL_MODEL_NAME='gpt-5.5'",
+                "ARIEL_MODEL_REASONING_EFFORT='high'",
             ]
         ),
         encoding="utf-8",
@@ -32,21 +33,23 @@ def test_parse_dotenv_file_reads_key_values_and_ignores_comments(tmp_path: Path)
 
     assert values["ARIEL_DATABASE_URL"] == "postgresql+psycopg://u:p@localhost:5432/db"
     assert values["ARIEL_OPENAI_API_KEY"] == "test-key"
-    assert values["ARIEL_MODEL_NAME"] == "gpt-5.5"
+    assert values["ARIEL_MODEL_REASONING_EFFORT"] == "high"
     assert "IGNORED_LINE_WITHOUT_EQUALS" not in values
 
 
 def test_load_local_env_prefers_env_file_then_os_env(tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text("ARIEL_MODEL_NAME=gpt-5.5\nARIEL_OPENAI_API_KEY=base\n")
+    (tmp_path / ".env").write_text(
+        "ARIEL_MODEL_REASONING_EFFORT=medium\nARIEL_OPENAI_API_KEY=base\n"
+    )
     (tmp_path / ".env.local").write_text("ARIEL_OPENAI_API_KEY=local\n")
 
     merged = load_local_env(
         tmp_path,
-        environ={"ARIEL_MODEL_NAME": "echo-v2"},
+        environ={"ARIEL_MODEL_REASONING_EFFORT": "low"},
     )
 
     assert merged["ARIEL_OPENAI_API_KEY"] == "local"
-    assert merged["ARIEL_MODEL_NAME"] == "echo-v2"
+    assert merged["ARIEL_MODEL_REASONING_EFFORT"] == "low"
 
 
 def test_load_local_env_honors_ariel_env_file_override(tmp_path: Path) -> None:
@@ -56,11 +59,11 @@ def test_load_local_env_honors_ariel_env_file_override(tmp_path: Path) -> None:
 
     merged = load_local_env(
         tmp_path,
-        environ={"ARIEL_ENV_FILE": ".env.dev"},
+        environ={ENV_FILE_SELECTOR_ENV_VAR: ".env.dev"},
     )
 
     assert merged["ARIEL_DATABASE_URL"] == "dev-url"
-    assert merged["ARIEL_ENV_FILE"] == ".env.dev"
+    assert merged[ENV_FILE_SELECTOR_ENV_VAR] == ".env.dev"
 
 
 def test_load_local_env_ariel_env_file_override_accepts_absolute_path(tmp_path: Path) -> None:
@@ -71,10 +74,20 @@ def test_load_local_env_ariel_env_file_override_accepts_absolute_path(tmp_path: 
 
     merged = load_local_env(
         tmp_path,
-        environ={"ARIEL_ENV_FILE": str(env_file)},
+        environ={ENV_FILE_SELECTOR_ENV_VAR: str(env_file)},
     )
 
     assert merged["ARIEL_DATABASE_URL"] == "custom-url"
+
+
+def test_load_local_env_rejects_missing_ariel_env_file_override(tmp_path: Path) -> None:
+    missing_env_file = tmp_path / "missing.env"
+
+    with pytest.raises(FileNotFoundError, match="ARIEL_ENV_FILE points to missing env file"):
+        load_local_env(
+            tmp_path,
+            environ={ENV_FILE_SELECTOR_ENV_VAR: str(missing_env_file)},
+        )
 
 
 def test_load_local_env_ignores_blank_ariel_env_file(tmp_path: Path) -> None:
@@ -82,7 +95,7 @@ def test_load_local_env_ignores_blank_ariel_env_file(tmp_path: Path) -> None:
 
     merged = load_local_env(
         tmp_path,
-        environ={"ARIEL_ENV_FILE": "   "},
+        environ={ENV_FILE_SELECTOR_ENV_VAR: "   "},
     )
 
     assert merged["ARIEL_DATABASE_URL"] == "prod-url"

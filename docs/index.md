@@ -40,6 +40,8 @@ This directory is the canonical home for repository documentation.
   OpenClaw-class parity, Claw-variant lessons, and personal-agent SOTA roadmap
 - [north-star-cutover.md](north-star-cutover.md): single-`run`,
   Agency-centered product architecture
+- [cleanliness.md](cleanliness.md): remove dead code, compatibility paths,
+  duplicate owners, and unearned abstractions
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface
 - [function-parameters.md](function-parameters.md): parameter conventions
 - [control-flow.md](control-flow.md): exhaustive branching and race-safety
@@ -62,6 +64,13 @@ This directory is the canonical home for repository documentation.
   systemd services
 - [google-reconnect.md](google-reconnect.md): how to (re)connect Google and grant
   identity + write scopes (Gmail send/modify, Calendar write, Drive share)
+
+### Research
+
+- [memory-cognition-research.md](memory-cognition-research.md): memory and
+  cognition research synthesis for Ariel memory architecture
+- [memory-cognition-research-appendix.md](memory-cognition-research-appendix.md):
+  expanded research notes and source appendix
 
 ### Modules
 

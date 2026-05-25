@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +123,7 @@ def _seed_agency_run_approval(
     action_id: str,
     approval_id: str,
     actor_id: str = "user:agency",
+    expires_at: datetime | None = None,
 ) -> None:
     capability = get_capability("cap.agency.run")
     assert capability is not None
@@ -201,7 +202,7 @@ def _seed_agency_run_approval(
                     actor_id=actor_id,
                     status="pending",
                     payload_hash=action_hash,
-                    expires_at=NOW.replace(year=2030),
+                    expires_at=expires_at or NOW.replace(year=2030),
                     decision_reason=None,
                     decided_at=None,
                     created_at=NOW,
@@ -401,6 +402,152 @@ def test_approval_decision_api_uses_default_actor_when_actor_id_is_omitted(
     assert action.status == "executing"
     assert task is not None
     assert task.task_type == "execute_action_attempt"
+
+
+def test_approval_decision_api_replay_rejects_without_duplicate_execution(
+    postgres_url: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed_agency_run_approval(
+        session_factory,
+        action_id="aat_replay_actor",
+        approval_id="apr_replay_actor",
+        actor_id="user.local",
+    )
+
+    with TestClient(create_test_app(database_url=postgres_url)) as client:
+        approved = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": "apr_replay_actor",
+                "decision": "approve",
+                "reason": "discord button approval",
+            },
+        )
+        replay = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": "apr_replay_actor",
+                "decision": "approve",
+                "reason": "duplicate discord button approval",
+            },
+        )
+
+    assert approved.status_code == 200
+    assert approved.json()["approval"]["status"] == "approved"
+    assert approved.json()["execution_task_id"] is not None
+    assert replay.status_code == 409
+    assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
+
+    with session_factory() as db:
+        approval = db.get(ApprovalRequestRecord, "apr_replay_actor")
+        action = db.get(ActionAttemptRecord, "aat_replay_actor")
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+        events = db.scalars(select(EventRecord).order_by(EventRecord.sequence.asc())).all()
+
+    assert approval is not None
+    assert approval.status == "approved"
+    assert approval.decision_reason == "discord button approval"
+    assert action is not None
+    assert action.status == "executing"
+    assert len(tasks) == 1
+    assert tasks[0].task_type == "execute_action_attempt"
+    assert tasks[0].id == approved.json()["execution_task_id"]
+    assert [event.event_type for event in events] == [
+        "evt.action.approval.approved",
+        "evt.action.execution.started",
+    ]
+
+
+def test_approval_decision_api_expired_approval_rejects_without_execution(
+    postgres_url: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed_agency_run_approval(
+        session_factory,
+        action_id="aat_expired_route",
+        approval_id="apr_expired_route",
+        actor_id="user.local",
+        expires_at=NOW - timedelta(minutes=5),
+    )
+
+    with TestClient(create_test_app(database_url=postgres_url)) as client:
+        response = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": "apr_expired_route",
+                "decision": "approve",
+                "reason": "late discord button approval",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "E_APPROVAL_EXPIRED"
+
+    with session_factory() as db:
+        approval = db.get(ApprovalRequestRecord, "apr_expired_route")
+        action = db.get(ActionAttemptRecord, "aat_expired_route")
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+        events = db.scalars(select(EventRecord).order_by(EventRecord.sequence.asc())).all()
+
+    assert approval is not None
+    assert approval.status == "expired"
+    assert approval.decision_reason == "approval_expired"
+    assert action is not None
+    assert action.status == "expired"
+    assert action.policy_reason == "approval_expired"
+    assert tasks == []
+    assert [event.event_type for event in events] == ["evt.action.approval.expired"]
+
+
+def test_approval_decision_api_denies_without_enqueuing_execution(
+    postgres_url: str,
+    session_factory: sessionmaker[Session],
+) -> None:
+    _seed_agency_run_approval(
+        session_factory,
+        action_id="aat_denied_actor",
+        approval_id="apr_denied_actor",
+        actor_id="user.local",
+    )
+
+    with TestClient(create_test_app(database_url=postgres_url)) as client:
+        response = client.post(
+            "/v1/approvals",
+            json={
+                "approval_ref": "apr_denied_actor",
+                "decision": "deny",
+                "reason": "manual smoke denial",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approval"]["status"] == "denied"
+    assert payload["approval"]["reason"] == "manual smoke denial"
+    assert payload["assistant"]["message"] == "approval denied. action was not executed."
+    assert payload["execution_task_id"] is None
+
+    with session_factory() as db:
+        approval = db.get(ApprovalRequestRecord, "apr_denied_actor")
+        action = db.get(ActionAttemptRecord, "aat_denied_actor")
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+        events = db.scalars(select(EventRecord).order_by(EventRecord.sequence.asc())).all()
+
+    assert approval is not None
+    assert approval.actor_id == "user.local"
+    assert approval.status == "denied"
+    assert approval.decision_reason == "manual smoke denial"
+    assert approval.decided_at is not None
+    assert action is not None
+    assert action.status == "denied"
+    assert action.policy_reason == "approval_denied"
+    assert action.execution_output is None
+    assert action.execution_error is None
+    assert tasks == []
+    assert [event.event_type for event in events] == ["evt.action.approval.denied"]
+    assert events[0].payload["approval_ref"] == "apr_denied_actor"
+    assert events[0].payload["reason"] == "manual smoke denial"
 
 
 def _seed_request_pr_action(session_factory: sessionmaker[Session], *, action_id: str) -> None:

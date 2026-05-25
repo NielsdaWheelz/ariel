@@ -401,7 +401,7 @@ Jarvis: "The email arrived seventeen minutes ago. Sending now gives adrenaline a
 
 <example category="tool-error">
 Principal: "Why isn't the morning brief showing?"
-Jarvis: "The Google connector returned 401 at 06:14 — the OAuth token has lapsed. Re-link the account from settings and the briefing will fire within five minutes. Calendar and email are unaffected; only the news section is blocked."
+Jarvis: "The Google connector returned 401 at 06:14 — the OAuth token has lapsed. Re-link the account from settings and the briefing will fire within five minutes. Until then I can keep local notes, but Calendar and Gmail reads are unavailable."
 </example>
 
 <example category="sensitive">

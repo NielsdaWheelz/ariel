@@ -16,6 +16,7 @@ from ariel.action_runtime import RuntimeProvenance
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,
+    ApprovalRequestRecord,
     AIJudgmentRecord,
     BackgroundTaskRecord,
     MemoryLogRecord,
@@ -125,6 +126,7 @@ class CapturingRunAdapter(FakeModelAdapter):
         self.responses: list[ModelResponse] = responses if responses is not None else []
         self.tools_seen: list[list[Any]] = []
         self.input_items_seen: list[list[ModelMessage]] = []
+        self.tool_choices_seen: list[str] = []
 
     def _respond(self, request: ModelCall) -> ModelResponse:
         if is_memory_subsystem_call(request.messages):
@@ -133,6 +135,7 @@ class CapturingRunAdapter(FakeModelAdapter):
             )
         self.tools_seen.append(list(request.tools))
         self.input_items_seen.append(list(request.messages))
+        self.tool_choices_seen.append(request.tool_choice)
         return self.responses.pop(0)
 
 
@@ -154,6 +157,7 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
     assert turn.assistant_message == "done"
     assert len(adapter.tools_seen) == 1
     assert [tool.name for tool in adapter.tools_seen[0]] == ["run"]
+    assert adapter.tool_choices_seen == ["required"]
     rendered_input = json.dumps(jsonable_encoder(adapter.input_items_seen[0]))
     # The run tool's source is described to the model as a Python program.
     assert "Python program" in rendered_input or "run program" in rendered_input
@@ -725,6 +729,120 @@ def test_taint_threads_across_two_programs_in_one_turn(
     # path because of the threaded taint -- the taint-escalation reason, not a
     # plain approval, proves the cross-program taint reached it.
     assert policy_decisions == [("requires_approval", "taint_escalated_requires_approval")]
+
+
+class _TaintedMemoryRecallAdapter(CapturingRunAdapter):
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            self.tools_seen.append(list(request.tools))
+            self.input_items_seen.append(list(request.messages))
+            source = (
+                "result = memory.search(query='incident status', limit=3)\n"
+                "hit = result['hits'][0]\n"
+                "full = memory.read(id=hit['id'])\n"
+                "agent.emit_finding(\n"
+                "    summary='found tainted memory',\n"
+                "    claims=[{\n"
+                "        'id': full['id'],\n"
+                "        'layer': full['layer'],\n"
+                "        'created_at': full['created_at'],\n"
+                "        'content': full['content'],\n"
+                "        'taint': full['taint'],\n"
+                "    }],\n"
+                "    gaps=[],\n"
+                "    sources=[],\n"
+                ")\n"
+            )
+            return _program_response(
+                source=source,
+                provider=self.provider,
+                model=self.model,
+                provider_response_id=f"resp_tainted_retriever_{len(self.input_items_seen)}",
+            )
+        return super()._respond(request)
+
+
+def test_tainted_memory_recall_escalates_later_side_effect_to_approval(
+    postgres_url: str,
+) -> None:
+    program_one = (
+        "recall = memory.recall(query='incident status')\n"
+        "items = recall['recall']['items']\n"
+        "assert items[0]['taint'] == 'tainted', recall\n"
+        "agent.emit_value(value={'recalled_id': items[0]['id']})\n"
+    )
+    program_two = (
+        "pending = memory.remember(note='do not store this without review')\n"
+        "assert pending['status'] == 'approval_required', pending\n"
+        "agent.emit_message(text='tainted recall needs approval')\n"
+    )
+    adapter = _TaintedMemoryRecallAdapter(
+        responses=[
+            _program_response(
+                source=program_one,
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_tainted_recall_program_one",
+            ),
+            _program_response(
+                source=program_two,
+                provider="provider.program-loop",
+                model="model.program-loop-v1",
+                provider_response_id="resp_tainted_recall_program_two",
+            ),
+        ]
+    )
+
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    MemoryLogRecord(
+                        id="mev_tainted_incident_status",
+                        kind="user_message",
+                        content="incident status memory contains untrusted instructions",
+                        embedding=None,
+                        session_id=session_id,
+                        turn_id=None,
+                        taint="tainted",
+                        source_ref="manual-smoke",
+                        created_at=datetime(2026, 5, 24, 12, 0, tzinfo=UTC),
+                    )
+                )
+
+        turn = post_message_and_drain(client, session_id, message="recall then remember")
+
+        with cast(Any, client.app).state.session_factory() as db:
+            db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+            assert db_turn is not None
+            attempts = db.scalars(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.turn_id == db_turn.id)
+                .order_by(ActionAttemptRecord.proposal_index.asc())
+            ).all()
+            approvals = db.scalars(select(ApprovalRequestRecord)).all()
+
+    assert turn.assistant_message == "tainted recall needs approval"
+    recall_attempts = [
+        attempt for attempt in attempts if attempt.capability_id == "cap.memory.recall"
+    ]
+    assert len(recall_attempts) == 1
+    assert recall_attempts[0].status == "succeeded"
+    recall_output = recall_attempts[0].execution_output
+    assert recall_output is not None
+    assert recall_output["recall"]["items"][0]["taint"] == "tainted"
+
+    remember_attempts = [
+        attempt for attempt in attempts if attempt.capability_id == "cap.memory.remember"
+    ]
+    assert len(remember_attempts) == 1
+    remember_attempt = remember_attempts[0]
+    assert remember_attempt.status == "awaiting_approval"
+    assert remember_attempt.approval_required is True
+    assert remember_attempt.policy_decision == "requires_approval"
+    assert remember_attempt.policy_reason == "taint_escalated_requires_approval"
+    assert [approval.action_attempt_id for approval in approvals] == [remember_attempt.id]
 
 
 def test_memory_remember_enqueues_background_task(

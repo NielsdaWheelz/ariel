@@ -71,9 +71,7 @@ MEMORY_CAPABILITY_IDS: frozenset[str] = frozenset(
 PROACTIVE_CAPABILITY_IDS = {"cap.proactive.schedule"}
 MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 RESEARCH_CAPABILITY_IDS = {"cap.research.investigate"}
-RESEARCH_WEB_CAPABILITY_IDS: frozenset[str] = frozenset(
-    {"cap.search.web", "cap.search.news", "cap.web.extract"}
-)
+RESEARCH_WEB_CAPABILITY_IDS: frozenset[str] = frozenset({"cap.search.web", "cap.web.extract"})
 RESEARCH_PERSONAL_CAPABILITY_IDS: frozenset[str] = frozenset(
     {
         "cap.email.search",
@@ -98,6 +96,15 @@ REMEMBERER_CAPABILITY_IDS: frozenset[str] = frozenset(
         "cap.memory.note.delete",
     }
 )
+
+
+def configured_research_web_capability_ids(settings: AppSettings) -> frozenset[str]:
+    capability_ids: set[str] = set()
+    if settings.search_web_api_key is not None:
+        capability_ids.add("cap.search.web")
+    if settings.jina_api_key is not None:
+        capability_ids.add("cap.web.extract")
+    return frozenset(capability_ids)
 
 
 class CapabilityExecutionError(Exception):
@@ -169,7 +176,17 @@ def _validate_search_query_input(
 def _validate_web_extract_input(
     raw_input: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    return _validate_exact_text_input(raw_input, field_name="url", max_length=2048)
+    normalized_input, input_error = _validate_exact_text_input(
+        raw_input,
+        field_name="url",
+        max_length=2048,
+    )
+    if input_error is not None or normalized_input is None:
+        return None, input_error or "schema_invalid"
+    normalized_url, url_error = _normalize_web_extract_url(normalized_input["url"])
+    if url_error is not None or normalized_url is None:
+        return None, url_error or "url_invalid"
+    return {"url": normalized_url}, None
 
 
 def _normalize_rfc3339_like(value: Any) -> str | None:
@@ -1052,12 +1069,14 @@ def _validate_weather_forecast_input(
 
     location_raw = raw_input.get("location")
     if location_raw is None:
-        location: str | None = None
+        return None, "weather_location_required"
     elif isinstance(location_raw, str):
         normalized_location = location_raw.strip()
         if len(normalized_location) > 200:
             return None, "schema_invalid"
-        location = normalized_location or None
+        if not normalized_location:
+            return None, "weather_location_required"
+        location = normalized_location
     else:
         return None, "schema_invalid"
 
@@ -1504,86 +1523,51 @@ async def _run_brave_search(
         )
 
 
-def _search_endpoint(result_type: WebSearchResultType) -> str:
-    path = "news/search" if result_type == WebSearchResultType.NEWS else "web/search"
-    return f"{_search_brave_base_url()}/{path}"
+def _search_endpoint() -> str:
+    return f"{_search_brave_base_url()}/web/search"
 
 
-def _search_timeout_seconds(result_type: WebSearchResultType) -> float:
-    settings = AppSettings()
-    if result_type == WebSearchResultType.NEWS:
-        return settings.search_news_timeout_seconds
-    return settings.search_web_timeout_seconds
+def _search_timeout_seconds() -> float:
+    return AppSettings().search_web_timeout_seconds
 
 
 def _brave_api_key() -> str | None:
     return AppSettings().search_web_api_key
 
 
-def _search_error_prefix(result_type: WebSearchResultType) -> str:
-    return "news" if result_type == WebSearchResultType.NEWS else "search"
-
-
-def _execute_search(
-    input_payload: dict[str, Any],
-    *,
-    result_type: WebSearchResultType,
-) -> dict[str, Any]:
+def _execute_search_web(input_payload: dict[str, Any]) -> dict[str, Any]:
     api_key = _brave_api_key()
-    error_prefix = _search_error_prefix(result_type)
     if api_key is None:
-        if result_type == WebSearchResultType.NEWS:
-            raise CapabilityExecutionError("news search credentials are not configured")
         raise CapabilityExecutionError("search credentials are not configured")
-    endpoint_parsed = urlparse(_search_endpoint(result_type))
+    endpoint_parsed = urlparse(_search_endpoint())
     if endpoint_parsed.hostname is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise CapabilityExecutionError(f"{error_prefix} endpoint invalid")
+        raise CapabilityExecutionError("search endpoint invalid")
     try:
         response = asyncio.run(
             _run_brave_search(
                 api_key=api_key,
                 query=input_payload["query"],
-                result_type=result_type,
-                timeout_seconds=_search_timeout_seconds(result_type),
+                result_type=WebSearchResultType.WEB,
+                timeout_seconds=_search_timeout_seconds(),
             )
         )
     except WebSearchError as exc:
-        _raise_web_search_execution_error(exc, prefix=error_prefix)
+        _raise_web_search_execution_error(exc, prefix="search")
 
     return _normalize_web_search_response(response, query=input_payload["query"])
 
 
-def _execute_search_web(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return _execute_search(input_payload, result_type=WebSearchResultType.WEB)
-
-
-def _execute_search_news(input_payload: dict[str, Any]) -> dict[str, Any]:
-    return _execute_search(input_payload, result_type=WebSearchResultType.NEWS)
-
-
-def _declare_search_egress_intent(
-    input_payload: dict[str, Any],
-    *,
-    result_type: WebSearchResultType,
-) -> list[dict[str, Any]]:
+def _declare_search_web_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
-            "destination": _search_endpoint(result_type),
+            "destination": _search_endpoint(),
             "payload": {"query": input_payload["query"]},
         }
     ]
 
 
-def _declare_search_web_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return _declare_search_egress_intent(input_payload, result_type=WebSearchResultType.WEB)
-
-
-def _declare_search_news_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
-    return _declare_search_egress_intent(input_payload, result_type=WebSearchResultType.NEWS)
-
-
-def _search_allowed_destinations(result_type: WebSearchResultType) -> tuple[str, ...]:
-    endpoint = _search_endpoint(result_type)
+def _search_allowed_destinations() -> tuple[str, ...]:
+    endpoint = _search_endpoint()
     host = _endpoint_host(endpoint)
     if host is not None:
         return (host,)
@@ -1616,27 +1600,12 @@ _WEB_EXTRACT_MAX_BLOCK_CHARS = 1200
 _WEB_EXTRACT_MAX_TOTAL_CHARS = 4000
 
 
-_BRAVE_WEB_EXTRACT_ENDPOINT = "https://api.search.brave.com/res/v1/web/extract"
-_BRAVE_WEB_EXTRACT_HOST = "api.search.brave.com"
+_JINA_READER_ENDPOINT_BASE = "https://r.jina.ai/"
+_JINA_READER_HOST = "r.jina.ai"
 
 
-def _web_extract_provider_endpoint() -> str:
-    configured_endpoint = AppSettings().web_extract_provider_endpoint
-    if configured_endpoint is None:
-        return _BRAVE_WEB_EXTRACT_ENDPOINT
-    normalized = configured_endpoint.strip()
-    if not normalized:
-        return _BRAVE_WEB_EXTRACT_ENDPOINT
-    parsed = urlparse(normalized)
-    if parsed.scheme:
-        return normalized
-    if "://" in normalized:
-        return _BRAVE_WEB_EXTRACT_ENDPOINT
-    return f"https://{normalized.lstrip('/')}"
-
-
-def _web_extract_uses_brave_auth(endpoint: str) -> bool:
-    return _endpoint_host(endpoint) == _BRAVE_WEB_EXTRACT_HOST
+def _jina_api_key() -> str | None:
+    return AppSettings().jina_api_key
 
 
 def _web_extract_timeout_seconds() -> float:
@@ -1645,6 +1614,10 @@ def _web_extract_timeout_seconds() -> float:
 
 def _web_extract_max_retries() -> int:
     return AppSettings().web_extract_max_retries
+
+
+def _jina_reader_url_for(target_url: str) -> str:
+    return f"{_JINA_READER_ENDPOINT_BASE}{target_url}"
 
 
 def _is_unsafe_web_extract_host(host: str) -> bool:
@@ -1845,19 +1818,15 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     if url_error is not None or normalized_url is None:
         raise CapabilityExecutionError(url_error or "url_invalid")
 
-    endpoint = _web_extract_provider_endpoint()
-    endpoint_host = _endpoint_host(endpoint)
-    endpoint_parsed = urlparse(endpoint)
-    if endpoint_host is None or endpoint_parsed.scheme.lower() not in {"http", "https"}:
-        raise CapabilityExecutionError("provider_unreachable")
+    api_key = _jina_api_key()
+    if api_key is None:
+        raise CapabilityExecutionError("provider_credentials_missing")
 
+    request_url = _jina_reader_url_for(normalized_url)
     headers: dict[str, str] = {
         "accept": "application/json",
-        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
     }
-    api_key = _brave_api_key()
-    if api_key is not None and _web_extract_uses_brave_auth(endpoint):
-        headers["x-subscription-token"] = api_key
 
     response: Any = None
     max_retries = _web_extract_max_retries()
@@ -1868,9 +1837,8 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         # bounded linear backoff: 1.0x, 1.5x, 2.0x, ... up to retry ceiling.
         timeout_seconds = base_timeout_seconds * (1.0 + (attempt_index * 0.5))
         try:
-            response = httpx.post(
-                endpoint,
-                json={"url": normalized_url},
+            response = httpx.get(
+                request_url,
                 headers=headers,
                 timeout=timeout_seconds,
             )
@@ -1909,13 +1877,18 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise CapabilityExecutionError("provider_invalid_payload")
 
-    document_payload_raw = payload.get("document")
-    document_payload = document_payload_raw if isinstance(document_payload_raw, dict) else payload
-    final_url_raw = (
-        document_payload.get("final_url")
-        or document_payload.get("canonical_url")
-        or document_payload.get("url")
-    )
+    # Jina envelope: ``{code, status, data: {title, description, url, content,
+    # publishedTime, metadata, ...}, meta}``. The Reader has already fetched
+    # and parsed the page; we only validate the URL it resolved and slice the
+    # markdown into bounded blocks via the shared normalizers.
+    code_raw = payload.get("code")
+    if isinstance(code_raw, int) and code_raw >= 400:
+        raise CapabilityExecutionError("provider_request_rejected")
+    document_payload = payload.get("data")
+    if not isinstance(document_payload, dict):
+        raise CapabilityExecutionError("provider_invalid_payload")
+
+    final_url_raw = document_payload.get("url")
     resolved_url = normalized_url
     if isinstance(final_url_raw, str) and final_url_raw.strip():
         normalized_final_url, final_url_error = _normalize_web_extract_url(final_url_raw)
@@ -1933,10 +1906,8 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     if canonical_host is None or _is_unsafe_web_extract_host(canonical_host):
         raise CapabilityExecutionError("url_destination_unsafe")
 
-    retrieved_at = _normalize_optional_timestamp(
-        document_payload.get("retrieved_at")
-    ) or utcnow().isoformat().replace("+00:00", "Z")
-    published_at = _normalize_optional_timestamp(document_payload.get("published_at"))
+    retrieved_at = utcnow().isoformat().replace("+00:00", "Z")
+    published_at = _normalize_optional_timestamp(document_payload.get("publishedTime"))
 
     title_raw = document_payload.get("title")
     title = (
@@ -1944,30 +1915,14 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     raw_blocks = _web_extract_content_blocks(document_payload)
-    if not raw_blocks and document_payload is not payload:
-        raw_blocks = _web_extract_content_blocks(payload)
     normalized_blocks, content_truncated, content_chars = _normalize_web_extract_blocks(raw_blocks)
     if not normalized_blocks:
         raise CapabilityExecutionError("unsupported_format")
 
-    status_raw = document_payload.get("status")
-    provider_marked_partial = (
-        (isinstance(status_raw, str) and status_raw.strip().lower() == "partial")
-        or document_payload.get("partial") is True
-        or document_payload.get("truncated") is True
-    )
-    is_partial = content_truncated or provider_marked_partial
-    reason_code = "content_truncated" if is_partial else None
+    reason_code = "content_truncated" if content_truncated else None
     recovery = (
         "content was truncated. narrow scope to a specific section or shorter page and retry."
-        if is_partial
-        else None
-    )
-
-    language_raw = document_payload.get("language")
-    language = (
-        language_raw.strip().lower()
-        if isinstance(language_raw, str) and language_raw.strip()
+        if content_truncated
         else None
     )
 
@@ -1975,7 +1930,7 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
         "url": normalized_url,
         "status": "succeeded",
         "extract_outcome": {
-            "status": "partial" if is_partial else "ok",
+            "status": "partial" if content_truncated else "ok",
             "reason_code": reason_code,
             "recovery": recovery,
         },
@@ -1985,12 +1940,12 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
             "resolved_url": resolved_url,
             "retrieved_at": retrieved_at,
             "published_at": published_at,
-            "language": language,
+            "language": None,
             "content_chars": content_chars,
             "content_blocks": normalized_blocks,
         },
         "provider": {
-            "endpoint": endpoint,
+            "endpoint": _JINA_READER_ENDPOINT_BASE,
             "attempt_count": attempt_count,
         },
     }
@@ -1999,18 +1954,14 @@ def _execute_web_extract(input_payload: dict[str, Any]) -> dict[str, Any]:
 def _declare_web_extract_egress_intent(input_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
-            "destination": _web_extract_provider_endpoint(),
-            "payload": {"url": input_payload["url"]},
+            "destination": _jina_reader_url_for(input_payload["url"]),
+            "payload": {},
         }
     ]
 
 
 def _web_extract_allowed_destinations() -> tuple[str, ...]:
-    endpoint = _web_extract_provider_endpoint()
-    host = _endpoint_host(endpoint)
-    if host is not None:
-        return (host,)
-    return ("api.search.brave.com",)
+    return (_JINA_READER_HOST,)
 
 
 _MAPS_ROUTES_ENDPOINT = "https://routes.googleapis.com/directions/v2:computeRoutes"
@@ -3569,7 +3520,7 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
             "bounded_output": "structured_blocks_with_partial_disclosure",
             "safety_preflight": "strict_fail_closed",
         },
-        allowed_egress_destinations=("api.search.brave.com",),
+        allowed_egress_destinations=(_JINA_READER_HOST,),
         validate_input=_validate_web_extract_input,
         execute=_execute_web_extract,
         declare_egress_intent=_declare_web_extract_egress_intent,
@@ -3588,21 +3539,6 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         validate_input=_validate_search_query_input,
         execute=_execute_search_web,
         declare_egress_intent=_declare_search_web_egress_intent,
-    ),
-    "cap.search.news": CapabilityDefinition(
-        capability_id="cap.search.news",
-        version="1.0",
-        impact_level="read",
-        policy_decision="allow_inline",
-        contract_metadata={
-            "input_schema": "search_query_v1",
-            "output_schema": "search_results_v1",
-            "idempotency": "deterministic_read",
-        },
-        allowed_egress_destinations=("api.search.brave.com",),
-        validate_input=_validate_search_query_input,
-        execute=_execute_search_news,
-        declare_egress_intent=_declare_search_news_egress_intent,
     ),
     "cap.weather.forecast": CapabilityDefinition(
         capability_id="cap.weather.forecast",
@@ -3846,12 +3782,7 @@ def get_capability(capability_id: str) -> CapabilityDefinition | None:
     if capability_id == "cap.search.web":
         return replace(
             capability,
-            allowed_egress_destinations=_search_allowed_destinations(WebSearchResultType.WEB),
-        )
-    if capability_id == "cap.search.news":
-        return replace(
-            capability,
-            allowed_egress_destinations=_search_allowed_destinations(WebSearchResultType.NEWS),
+            allowed_egress_destinations=_search_allowed_destinations(),
         )
     if capability_id == "cap.weather.forecast":
         return replace(capability, allowed_egress_destinations=_weather_allowed_destinations())
@@ -3921,10 +3852,6 @@ def eligible_internal_callable_capability_ids(
             continue
         if capability_id == "cap.search.web":
             if bindings.get("search_web") is True:
-                capability_ids.append(capability_id)
-            continue
-        if capability_id == "cap.search.news":
-            if bindings.get("search_news") is True:
                 capability_ids.append(capability_id)
             continue
         if capability_id in MAPS_CAPABILITY_IDS:
@@ -4015,7 +3942,6 @@ _RUN_CALLABLE_ALIASES = {
     "memory.search": "cap.memory.search",
     "proactive.schedule": "cap.proactive.schedule",
     "research.investigate": "cap.research.investigate",
-    "search.news": "cap.search.news",
     "search.web": "cap.search.web",
     "weather.forecast": "cap.weather.forecast",
     "web.extract": "cap.web.extract",
@@ -4063,7 +3989,6 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # search.web: the only accepted key is ``query``. Other names (``q``,
     # ``topn``, ``count``, ``limit``) are rejected as schema_invalid.
     "search.web": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
-    "search.news": "(query: str) -> {'query': str, 'retrieved_at': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'status': 'succeeded'}",
     "web.extract": "(url: str) -> {'url': str, 'status': 'succeeded', 'extract_outcome': {'status': Literal['ok', 'partial'], 'reason_code': str | None, 'recovery': str | None}, 'document': {'title': str, 'canonical_source': str, 'resolved_url': str, 'retrieved_at': str, 'published_at': str | None, 'language': str | None, 'content_chars': int, 'content_blocks': list[{'index': int, 'text': str}]}, 'provider': {'endpoint': str, 'attempt_count': int}}",
     # research
     "research.investigate": "(question: str, mode: Literal['web', 'personal', 'memories']) -> {'status': 'queued', 'research_id': str}",

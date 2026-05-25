@@ -374,6 +374,14 @@ class GoogleWorkspaceProvider(Protocol):
         max_results: int | None = None,
     ) -> dict[str, Any]: ...
 
+    def calendar_get_event(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        event_id: str,
+    ) -> dict[str, Any]: ...
+
     def calendar_propose_slots(
         self,
         *,
@@ -928,6 +936,23 @@ class DefaultGoogleWorkspaceProvider:
             "window_end": window_end,
             "status": "succeeded",
         }
+
+    def calendar_get_event(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        return self._request_json(
+            method="GET",
+            url=(
+                f"{self.calendar_api_base_url}/calendars/{quote(calendar_id, safe='')}"
+                f"/events/{quote(event_id, safe='')}"
+            ),
+            access_token=access_token,
+            max_response_bytes=_MAX_CALENDAR_RESPONSE_BYTES,
+        )
 
     def calendar_list_calendars(
         self,
@@ -3575,34 +3600,42 @@ def _normalize_scope_list(raw_scopes: Any) -> list[str]:
     return normalized
 
 
-def _normalize_capability_intent(capability_intent: str | None) -> str | None:
+def _normalize_capability_intents(capability_intent: str | None) -> list[str]:
+    # Accepts a single intent, a comma-separated list, or None. Trims, drops
+    # empties, dedupes while preserving order so callers requesting many
+    # capabilities in one reconnect get a stable identity surface.
     if capability_intent is None:
-        return None
-    normalized = capability_intent.strip()
-    if not normalized:
-        return None
-    return normalized
+        return []
+    seen: list[str] = []
+    for chunk in capability_intent.split(","):
+        normalized = chunk.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.append(normalized)
+    return seen
 
 
 def _resolve_reconnect_scopes(
     *,
     granted_scopes: list[str],
     capability_intent: str | None,
-) -> tuple[list[str], str | None]:
+) -> tuple[list[str], list[str]]:
     # Reconnect preserves existing grants while always requesting the current
-    # baseline read and identity scopes.
+    # baseline read and identity scopes. Multiple intents may be supplied
+    # comma-separated; their scope sets union together so one consent screen
+    # can cover the entire set.
     requested_scopes = set(_normalize_scope_list(granted_scopes)) | set(
         _GOOGLE_DEFAULT_REQUESTED_SCOPES
     )
-    normalized_intent = _normalize_capability_intent(capability_intent)
-    if normalized_intent is not None:
+    normalized_intents = _normalize_capability_intents(capability_intent)
+    for normalized_intent in normalized_intents:
         required_scopes = GOOGLE_CAPABILITY_SCOPES.get(normalized_intent)
         if required_scopes is None:
-            msg = "unsupported capability intent"
+            msg = f"unsupported capability intent: {normalized_intent}"
             raise RuntimeError(msg)
         requested_scopes.update(required_scopes)
         requested_scopes.update(GOOGLE_RECONNECT_INTENT_EXTRA_SCOPES.get(normalized_intent, set()))
-    return sorted(requested_scopes), normalized_intent
+    return sorted(requested_scopes), normalized_intents
 
 
 def _classify_google_provider_failure(error_reason: str) -> str | None:
@@ -3911,6 +3944,26 @@ def _is_google_calendar_write_result_output(
     schema_version: str,
     status: str,
 ) -> bool:
+    allowed_keys = {
+        "schema_version",
+        "status",
+        "event_id",
+        "calendar_id",
+        "provider_event_ref",
+        "executed_at",
+        "etag",
+        "updated",
+        "provider_status",
+        "ical_uid",
+    }
+    if schema_version == "google.calendar.create_result.v1":
+        allowed_keys |= {"title", "start_time", "end_time"}
+    if status == "responded":
+        allowed_keys.add("response_status")
+    if not _has_only_keys(payload, allowed_keys):
+        return False
+    if _has_forbidden_text_key(payload, allowed=allowed_keys):
+        return False
     if payload.get("schema_version") != schema_version or payload.get("status") != status:
         return False
     for key in ("event_id", "calendar_id", "provider_event_ref", "executed_at"):
@@ -4762,7 +4815,7 @@ class GoogleConnectorRuntime:
         connector = self._ensure_connector(db=db, now_fn=now_fn)
         if reconnect:
             try:
-                requested_scopes, normalized_capability_intent = _resolve_reconnect_scopes(
+                requested_scopes, normalized_capability_intents = _resolve_reconnect_scopes(
                     granted_scopes=_normalize_scope_list(connector.granted_scopes),
                     capability_intent=capability_intent,
                 )
@@ -4780,7 +4833,10 @@ class GoogleConnectorRuntime:
                 ) from exc
         else:
             requested_scopes = sorted(_GOOGLE_DEFAULT_REQUESTED_SCOPES)
-            normalized_capability_intent = None
+            normalized_capability_intents = []
+        normalized_capability_intent_joined: str | None = (
+            ",".join(normalized_capability_intents) if normalized_capability_intents else None
+        )
         state_handle = f"st_{secrets.token_urlsafe(24)}"
         verifier = _pkce_verifier()
         challenge = _pkce_challenge(verifier)
@@ -4817,8 +4873,9 @@ class GoogleConnectorRuntime:
             "requested_scopes": requested_scopes,
             "state_expires_at": to_rfc3339(expires_at),
         }
-        if normalized_capability_intent is not None:
-            started_event_payload["capability_intent"] = normalized_capability_intent
+        if normalized_capability_intent_joined is not None:
+            started_event_payload["capability_intent"] = normalized_capability_intent_joined
+            started_event_payload["capability_intents"] = list(normalized_capability_intents)
         _append_connector_event(
             db=db,
             connector_id=connector.id,
@@ -4854,8 +4911,9 @@ class GoogleConnectorRuntime:
                 "requested_scopes": requested_scopes,
                 "failure_reason": reason,
             }
-            if normalized_capability_intent is not None:
-                failed_payload["capability_intent"] = normalized_capability_intent
+            if normalized_capability_intent_joined is not None:
+                failed_payload["capability_intent"] = normalized_capability_intent_joined
+                failed_payload["capability_intents"] = list(normalized_capability_intents)
             _append_connector_event(
                 db=db,
                 connector_id=connector.id,
@@ -4879,7 +4937,8 @@ class GoogleConnectorRuntime:
                 "state": state_handle,
                 "expires_at": to_rfc3339(expires_at),
                 "requested_scopes": requested_scopes,
-                "capability_intent": normalized_capability_intent,
+                "capability_intent": normalized_capability_intent_joined,
+                "capability_intents": list(normalized_capability_intents),
             },
         }
 

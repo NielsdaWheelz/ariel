@@ -303,7 +303,8 @@ then if you still want it sent."
 Principal: "Why isn't the morning brief showing?"
 Ariel: "The Google connector returned 401 at 06:14. The OAuth token has lapsed.
 Re-link the account from settings and the briefing will fire within five
-minutes. Calendar and email are unaffected; only the news section is blocked."
+minutes. Until then I can keep local notes, but Calendar and Gmail reads are
+unavailable."
 
 Principal: "My dad just went into hospice. I can't think."
 Ariel: "I found today's calls and prepared deferrals. Confirm and I will send

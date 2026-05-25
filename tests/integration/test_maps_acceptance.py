@@ -681,6 +681,72 @@ def test_maps_provider_failures_are_typed_and_recoverable(
         assert expected_hint in rendered_message
 
 
+def test_maps_directions_retries_transient_status_before_success(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient Maps HTTP failures consume a bounded retry before succeeding."""
+    responses = [
+        _FakeHTTPResponse(status_code=503, payload={"error": {"status": "UNAVAILABLE"}}),
+        _FakeHTTPResponse(
+            status_code=200,
+            payload={
+                "routes": [
+                    {
+                        "distanceMeters": 17200,
+                        "duration": "1320s",
+                        "staticDuration": "1080s",
+                        "description": "I-5 N",
+                        "legs": [
+                            {
+                                "distanceMeters": 17200,
+                                "duration": "1320s",
+                                "staticDuration": "1080s",
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+    ]
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setenv("ARIEL_MAPS_TIMEOUT_SECONDS", "4")
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+        calls.append({"method": method, "url": url, **kwargs})
+        assert "routes.googleapis.com" in url
+        return responses.pop(0)
+
+    monkeypatch.setattr(capability_registry_module.httpx, "request", fake_request)
+
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "retry route": [
+                {
+                    "name": "maps.directions",
+                    "input": {
+                        "origin": "Pike Place Market, Seattle, WA",
+                        "destination": "SEA Airport, Seattle, WA",
+                        "travel_mode": "driving",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"retry route": "The route is available after retry [1]."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="retry route")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+
+    assert attempt["execution"]["status"] == "succeeded"
+    assert attempt["execution"]["output"]["routes"][0]["distance_meters"] == 17200
+    assert [call["timeout"] for call in calls] == [4.0, 6.0]
+    assert len(calls) == 2
+    assert responses == []
+
+
 def test_maps_egress_preflight_remains_fail_closed_before_execution(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,

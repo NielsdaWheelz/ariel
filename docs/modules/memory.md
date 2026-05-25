@@ -169,8 +169,9 @@ There is no write HTTP route for memory.
 - The raw log is written only by rails capturing events. The curated layer is
   written only by the rememberer. The main agent never writes either directly.
 - Every note mutation appends a `note_*` event to the raw log.
-- The retriever fires as a pre-turn step on every wake — user message, proactive
-  trigger, capture, research completion — with no exception. Its `recall_v1`
+- The retriever fires as a pre-turn step on every agent wake — user message,
+  proactive trigger, or research completion — with no exception. Capture ingress
+  stores durable data without waking the agent. Its `recall_v1`
   finding is the working-context reconstruction consumed by the main-agent
   prompt.
 - Recall is bounded by `memory_recall_budget_seconds`, the

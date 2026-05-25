@@ -405,15 +405,16 @@ Attachment behavior is owned by these surfaces:
 - Integration coverage proves the text attachment read path invokes
   `attachment.read`, fetches Discord bytes, returns bounded text blocks,
   persists durable output without raw URLs, and produces a cited answer.
+- Integration coverage proves typed recovery for too-large, expired,
+  unavailable, unsupported, unsafe, scan-failed, extraction-failed,
+  provider-timeout, and provider-unavailable read failures.
 
 ### Target Coverage
 
-- Image, PDF/document, and audio success paths are covered end to end.
+- Image, PDF/document, and audio success paths are covered end to end against
+  real providers, not only fixture adapters.
 - Prompt-injection text embedded inside an attachment stays untrusted.
 - Side-effect proposals influenced by attachment content remain tainted.
-- Attachment read failures cover unsupported, too-large, expired, unavailable,
-  unsafe, scan-failed, extraction-failed, timeout, and provider-unavailable
-  outcomes.
 
 ### Target Behavior
 

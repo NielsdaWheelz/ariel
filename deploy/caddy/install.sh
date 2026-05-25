@@ -17,11 +17,17 @@ ok "running as root"
 if [ ! -f "$SRC_CADDYFILE" ]; then fail "Missing $SRC_CADDYFILE"; exit 1; fi
 ok "source Caddyfile present"
 
-port80_owner="$(ss -lntp 2>/dev/null | awk '$4 ~ /:80$/' | grep -oE 'users:\(\("[^"]+"' | head -n1 | sed 's/.*"//' || true)"
-if [ -n "$port80_owner" ] && [ "$port80_owner" != "caddy" ]; then
-  fail "Port 80 is held by '$port80_owner' (expected unused or 'caddy')."; exit 1
-fi
-ok "port 80 free or owned by caddy"
+check_port_owner() {
+  local port="$1"
+  local owner
+  owner="$(ss -lntp 2>/dev/null | awk -v pattern=":${port}$" '$4 ~ pattern' | grep -oE 'users:\(\("[^"]+"' | head -n1 | sed 's/.*"//' || true)"
+  if [ -n "$owner" ] && [ "$owner" != "caddy" ]; then
+    fail "Port ${port} is held by '$owner' (expected unused or 'caddy')."; exit 1
+  fi
+  ok "port ${port} free or owned by caddy"
+}
+check_port_owner 80
+check_port_owner 443
 
 # ── 2. Install Caddy from Cloudsmith apt repo ──────────────────────────
 info "Installing Caddy from official apt repo"
@@ -34,19 +40,7 @@ apt-get update
 apt-get install -y caddy
 ok "caddy installed: $(caddy version | awk '{print $1}')"
 
-# ── 3. Deploy Caddyfile ────────────────────────────────────────────────
-info "Deploying Caddyfile to $DST_CADDYFILE"
-mkdir -p /etc/caddy
-if [ -f "$DST_CADDYFILE" ] && ! cmp -s "$SRC_CADDYFILE" "$DST_CADDYFILE"; then
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  cp "$DST_CADDYFILE" "/etc/caddy/Caddyfile.bak-${ts}"
-  ok "backed up existing Caddyfile to /etc/caddy/Caddyfile.bak-${ts}"
-fi
-cp "$SRC_CADDYFILE" "$DST_CADDYFILE"
-caddy validate --config "$DST_CADDYFILE"
-ok "Caddyfile validated"
-
-# ── 4. Bootstrap log directory & files ─────────────────────────────────
+# ── 3. Bootstrap log directory & files ─────────────────────────────────
 # Caddy's shipped unit runs as user 'caddy' but does NOT declare
 # LogsDirectory=, so on a fresh box the first writer can race and leave
 # /var/log/caddy/<file> as a root:root 0600 stub — every later reload
@@ -78,7 +72,32 @@ for f in "${CADDY_LOG_FILES[@]}"; do
   fi
 done
 
-# ── 5. Open UFW ports (if active) ──────────────────────────────────────
+# ── 4. Validate & deploy Caddyfile ─────────────────────────────────────
+info "Validating and deploying Caddyfile to $DST_CADDYFILE"
+mkdir -p /etc/caddy
+caddy validate --config "$SRC_CADDYFILE"
+ok "source Caddyfile validated"
+tmp_caddyfile="$(mktemp /etc/caddy/Caddyfile.next.XXXXXX)"
+trap 'rm -f "$tmp_caddyfile"' EXIT
+install -m 0644 "$SRC_CADDYFILE" "$tmp_caddyfile"
+caddy validate --config "$tmp_caddyfile"
+ok "staged Caddyfile validated"
+if [ -f "$DST_CADDYFILE" ] && ! cmp -s "$tmp_caddyfile" "$DST_CADDYFILE"; then
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  cp "$DST_CADDYFILE" "/etc/caddy/Caddyfile.bak-${ts}"
+  ok "backed up existing Caddyfile to /etc/caddy/Caddyfile.bak-${ts}"
+fi
+mv "$tmp_caddyfile" "$DST_CADDYFILE"
+trap - EXIT
+ok "Caddyfile deployed"
+
+# ── 5. Enable & reload caddy ───────────────────────────────────────────
+info "Starting Caddy"
+systemctl enable --now caddy
+systemctl reload caddy
+ok "caddy enabled and reloaded"
+
+# ── 6. Open UFW ports (if active) ──────────────────────────────────────
 info "Configuring firewall"
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow 80/tcp
@@ -87,12 +106,6 @@ if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: a
 else
   ok "ufw not active; skipping (operator may use a different firewall)"
 fi
-
-# ── 6. Enable & reload caddy ───────────────────────────────────────────
-info "Starting Caddy"
-systemctl enable --now caddy
-systemctl reload caddy
-ok "caddy enabled and reloaded"
 
 # ── 7. Done ────────────────────────────────────────────────────────────
 info "Caddy is running on 80/443; verify with: curl -I https://ariel.nielseriknandal.com/"

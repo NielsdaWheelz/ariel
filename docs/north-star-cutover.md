@@ -106,7 +106,7 @@ Justified structured tools include:
 - Agency task start and PR request
 - Discord no-response behavior
 
-Generic search and news are retained only if Ariel needs server-side credentials,
+Generic web search is retained only if Ariel needs server-side credentials,
 grounded artifact capture, citation normalization, or operation in an environment
 without shell/browser access. Otherwise research belongs to the executable
 environment or a skill.

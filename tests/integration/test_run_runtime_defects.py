@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from sqlalchemy.orm import Session
+from sqlalchemy.orm import sessionmaker
 
 from ariel import run_runtime
-from ariel.persistence import TurnRecord
+from ariel.persistence import SessionRecord, TurnRecord
 from ariel.run_runtime import RunProgramResult, execute_run_program
 from tests.fake_sandbox import FakeSandboxRuntime
 
@@ -31,6 +32,7 @@ def _turn() -> TurnRecord:
 
 def _execute(
     *,
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
     fake_process_one_call: Any,
     source: str,
@@ -39,33 +41,50 @@ def _execute(
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     try:
-        return execute_run_program(
-            sandbox=sandbox,
-            source=source,
-            db=cast(Session, object()),
-            session_factory=None,
-            session_id="ses_run_defect",
-            turn=_turn(),
-            proposal_index_start=0,
-            approval_ttl_seconds=300,
-            approval_actor_id="user:test",
-            add_event=lambda *_: None,
-            now_fn=lambda: NOW,
-            new_id_fn=lambda prefix: f"{prefix}_run_defect",
-            runtime_provenance=None,
-            google_runtime=None,
-            execute_google_reads_outside_transaction=False,
-            agency_runtime=None,
-            attachment_runtime=None,
-            allowed_capability_ids={"cap.memory.recall"},
-            settings=None,
-            scratch={},
-        )
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    SessionRecord(
+                        id="ses_run_defect",
+                        is_active=True,
+                        lifecycle_state="active",
+                        rotated_from_session_id=None,
+                        rotation_reason=None,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+                turn = _turn()
+                db.add(turn)
+                db.flush()
+                return execute_run_program(
+                    sandbox=sandbox,
+                    source=source,
+                    db=db,
+                    session_factory=session_factory,
+                    session_id="ses_run_defect",
+                    turn=turn,
+                    proposal_index_start=0,
+                    approval_ttl_seconds=300,
+                    approval_actor_id="user:test",
+                    add_event=lambda *_: None,
+                    now_fn=lambda: NOW,
+                    new_id_fn=lambda prefix: f"{prefix}_run_defect",
+                    runtime_provenance=None,
+                    google_runtime=None,
+                    execute_google_reads_outside_transaction=False,
+                    agency_runtime=None,
+                    attachment_runtime=None,
+                    allowed_capability_ids={"cap.memory.recall"},
+                    settings=None,
+                    scratch={},
+                )
     finally:
         sandbox.close()
 
 
 def test_unknown_process_one_call_status_propagates_as_defect(
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_process_one_call(**kwargs: Any) -> None:
@@ -87,11 +106,15 @@ def test_unknown_process_one_call_status_propagates_as_defect(
 
     with pytest.raises(RuntimeError, match="unknown_call_status: surprise"):
         _execute(
-            monkeypatch=monkeypatch, fake_process_one_call=fake_process_one_call, source=source
+            session_factory=session_factory,
+            monkeypatch=monkeypatch,
+            fake_process_one_call=fake_process_one_call,
+            source=source,
         )
 
 
 def test_missing_process_one_call_output_propagates_as_defect(
+    session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_process_one_call(**_: Any) -> None:
@@ -106,5 +129,8 @@ def test_missing_process_one_call_output_propagates_as_defect(
 
     with pytest.raises(RuntimeError, match=r"memory\.recall: process_one_call_output_count:0"):
         _execute(
-            monkeypatch=monkeypatch, fake_process_one_call=fake_process_one_call, source=source
+            session_factory=session_factory,
+            monkeypatch=monkeypatch,
+            fake_process_one_call=fake_process_one_call,
+            source=source,
         )

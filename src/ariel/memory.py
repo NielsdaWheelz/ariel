@@ -36,6 +36,7 @@ from .capability_registry import run_callable_signature
 from .config import AppSettings
 from .ids import new_id
 from .model_adapter import ModelAdapter, ModelMessage
+from .models import MAIN
 from .persistence import (
     BackgroundTaskRecord,
     EventRecord,
@@ -631,6 +632,7 @@ def run_retriever(
         output_mode="finding",
         finding_mode="memory_recall",
         prompt_version=RETRIEVER_PROMPT_VERSION,
+        model_ref=MAIN,
         budget_seconds=float(settings.memory_recall_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_main_agent_loop=False,
@@ -876,6 +878,7 @@ def run_rememberer(
         output_mode="operations",
         finding_mode=trigger,
         prompt_version=prompt_version,
+        model_ref=MAIN,
         budget_seconds=budget,
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_main_agent_loop=False,

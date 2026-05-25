@@ -176,7 +176,7 @@ production-posture: check-venv
 dev-init:
 	@if [ ! -f "$(DEV_ENV_FILE)" ]; then \
 	  cp .env.dev.example $(DEV_ENV_FILE); \
-	  echo "created $(DEV_ENV_FILE) from .env.dev.example — edit it and set ARIEL_OPENAI_API_KEY and any dev Discord/connector tokens"; \
+	  echo "created $(DEV_ENV_FILE) from .env.dev.example — edit it and set current model provider keys plus any dev Discord/connector tokens"; \
 	else \
 	  echo "$(DEV_ENV_FILE) already exists"; \
 	fi

@@ -18,7 +18,8 @@ first-time setup (checks prerequisites, creates venv, starts db, runs migrations
 make bootstrap
 ```
 
-if the API key is still the placeholder, edit `.env.local` and re-run `make bootstrap`.
+if any current model provider key is still a placeholder, edit `.env.local` and
+re-run `make bootstrap`.
 
 daily API development after bootstrap:
 
@@ -191,7 +192,7 @@ Externally grounded factual retrieval uses citation and provenance contracts:
 
 Grounding safety covers conflicting evidence and mixed proposal sets:
 
-- when any retrieval callable executes (`search.web`, `search.news`, `weather.forecast`, `web.extract`),
+- when any retrieval callable executes (`search.web`, `weather.forecast`, `web.extract`),
   `assistant.message` stays grounded narrative with inline citations and synchronized `assistant.sources[]`,
   even if non-retrieval proposals run in the same turn.
 - mixed-turn non-retrieval outcomes remain auditable through structured surfaces
@@ -435,9 +436,8 @@ production startup fails without a keyring, with a missing active key version, o
 
 memory runtime config:
 
-- `ARIEL_MEMORY_EMBEDDING_PROVIDER` (default `openai`)
-- `ARIEL_MEMORY_EMBEDDING_MODEL` (default `text-embedding-3-small`)
-- `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` (default `1536`; must match schema)
+- `ARIEL_MEMORY_EMBEDDING_DIMENSIONS` (default `1536`; must match the
+  `EMBEDDING` ref in `src/ariel/models.py` and the schema)
 
 memory uses two layers: append-only `memory_log` events and editable
 `memory_notes`. `memory.recall` runs the retriever over that substrate;
@@ -448,10 +448,9 @@ search capability runtime config:
 Search execution delegates to `web-search-tool`'s Brave provider. Ariel still owns capability
 policy, egress preflight, and the `search_results_v1` output mapping.
 
-- `ARIEL_SEARCH_WEB_API_KEY` (required for live Brave-backed web/news search; also authenticates the default Brave web extract endpoint)
+- `ARIEL_SEARCH_WEB_API_KEY` (required for live Brave-backed web search)
 - `ARIEL_SEARCH_BRAVE_BASE_URL` (optional provider base URL; defaults to Brave Search API base)
 - `ARIEL_SEARCH_WEB_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
-- `ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS` (optional provider timeout; defaults to `8.0`)
 
 weather capability runtime config:
 
@@ -474,7 +473,7 @@ egress IP address. maps capabilities are exposed to the agent only when `ARIEL_M
 
 web extract capability runtime config:
 
-- `ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT` (optional; defaults to Brave extract endpoint)
+- `ARIEL_JINA_API_KEY` (required for `web.extract`; Jina Reader bearer key)
 - `ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS` (optional; defaults to `10.0`)
 - `ARIEL_WEB_EXTRACT_MAX_RETRIES` (optional; defaults to `2`, max `5`)
 

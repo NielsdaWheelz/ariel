@@ -27,6 +27,18 @@ ENV_FILE_SELECTOR_ENV_VAR = "ARIEL_ENV_FILE"
 # local secrets and overrides. Dev workflows set `ARIEL_ENV_FILE` (e.g., to
 # `.env.dev`) to swap in an isolated env file without touching local defaults.
 _DEFAULT_ENV_FILES = (_PROJECT_ROOT / ".env", _PROJECT_ROOT / ".env.local")
+_BLOCKED_PROVIDER_ENDPOINT_HOSTS = {"localhost"}
+_BLOCKED_PROVIDER_ENDPOINT_SUFFIXES = (
+    ".internal",
+    ".local",
+    ".localhost",
+    ".home",
+    ".lan",
+)
+_PRODUCTION_PROVIDER_ENDPOINT_HOSTS = {
+    "search_brave_base_url": "api.search.brave.com",
+    "weather_production_endpoint": "api.tomorrow.io",
+}
 
 
 def _resolve_env_files() -> tuple[Path, ...]:
@@ -36,10 +48,57 @@ def _resolve_env_files() -> tuple[Path, ...]:
     path = Path(override)
     if not path.is_absolute():
         path = _PROJECT_ROOT / path
+    if not path.exists():
+        msg = f"{ENV_FILE_SELECTOR_ENV_VAR} points to missing env file: {path}"
+        raise FileNotFoundError(msg)
     return (path,)
 
 
 _ENV_FILES = _resolve_env_files()
+
+
+def _provider_endpoint_host_is_blocked(host: str) -> bool:
+    normalized = host.strip().lower().rstrip(".")
+    if not normalized or normalized in _BLOCKED_PROVIDER_ENDPOINT_HOSTS:
+        return True
+    if any(normalized.endswith(suffix) for suffix in _BLOCKED_PROVIDER_ENDPOINT_SUFFIXES):
+        return True
+    try:
+        ip = ip_address(normalized)
+    except ValueError:
+        return False
+    return any(
+        (
+            ip.is_loopback,
+            ip.is_private,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+def _clean_https_provider_endpoint(value: str, *, field_name: str) -> str:
+    normalized = value.strip().rstrip("/")
+    if not normalized:
+        raise ValueError(f"{field_name} must be nonblank")
+    parsed = urlparse(normalized)
+    if parsed.scheme != "https" or parsed.hostname is None:
+        raise ValueError(f"{field_name} must be a clean https:// URL with a host")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{field_name} must not include userinfo")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must not include an invalid port") from exc
+    if parsed.port is not None:
+        raise ValueError(f"{field_name} must not include an explicit port")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise ValueError(f"{field_name} must not include params, query, or fragment")
+    if _provider_endpoint_host_is_blocked(parsed.hostname):
+        raise ValueError(f"{field_name} must not target localhost or private networks")
+    return normalized
 
 
 class AppSettings(BaseSettings):
@@ -60,12 +119,12 @@ class AppSettings(BaseSettings):
     # SELECT) is non-trivial under load. A short TTL coalesces health-check bursts
     # while still letting a post-startup migration unblock 503s within seconds.
     schema_readiness_ttl_seconds: float = 10.0
-    model_name: str = "gpt-5.5"
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     google_api_key: str | None = None
     openrouter_api_key: str | None = None
     openai_base_url: str | None = None
+    openrouter_base_url: str | None = None
     cloudflare_api_token: str | None = None
     cloudflare_account_id: str | None = None
     model_timeout_seconds: float = 30.0
@@ -127,8 +186,7 @@ class AppSettings(BaseSettings):
     search_brave_base_url: str = "https://api.search.brave.com/res/v1"
     search_web_timeout_seconds: float = 8.0
     search_web_api_key: str | None = None
-    search_news_timeout_seconds: float = 8.0
-    web_extract_provider_endpoint: str | None = None
+    jina_api_key: str | None = None
     web_extract_timeout_seconds: float = 10.0
     web_extract_max_retries: int = 2
     maps_api_key: str | None = None
@@ -175,6 +233,7 @@ class AppSettings(BaseSettings):
         "google_api_key",
         "openrouter_api_key",
         "openai_base_url",
+        "openrouter_base_url",
         "cloudflare_api_token",
         "cloudflare_account_id",
         mode="before",
@@ -187,7 +246,7 @@ class AppSettings(BaseSettings):
 
     @field_validator(
         "search_web_api_key",
-        "web_extract_provider_endpoint",
+        "jina_api_key",
         "maps_api_key",
         "weather_production_api_key",
         "weather_default_location",
@@ -262,11 +321,8 @@ class AppSettings(BaseSettings):
         "weather_dev_endpoint",
     )
     @classmethod
-    def _provider_endpoint_settings_must_be_nonblank(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("provider endpoint settings must be nonblank")
-        return normalized
+    def _provider_endpoint_settings_must_be_clean_https(cls, value: str, info: Any) -> str:
+        return _clean_https_provider_endpoint(value, field_name=str(info.field_name))
 
     @field_validator("local_auth_token", mode="before")
     @classmethod
@@ -290,8 +346,20 @@ class AppSettings(BaseSettings):
         if self.local_auth_required and self.local_auth_token is None:
             raise ValueError("local_auth_token is required when local_auth_required is true")
         if self.deployment_mode == "production":
+            from ariel.models import required_model_provider_env_vars
+
             if not self.local_auth_required:
                 raise ValueError("local_auth_required must be true in production")
+            missing_model_provider_keys = [
+                env_name
+                for env_name in required_model_provider_env_vars()
+                if getattr(self, env_name.removeprefix("ARIEL_").lower()) is None
+            ]
+            if missing_model_provider_keys:
+                joined_names = ", ".join(missing_model_provider_keys)
+                raise ValueError(
+                    f"current model provider keys are required in production: {joined_names}"
+                )
             if self.connector_encryption_secret == "dev-local-connector-secret":
                 raise ValueError(
                     "connector_encryption_secret must not use the dev default in production"
@@ -313,6 +381,13 @@ class AppSettings(BaseSettings):
                 raise ValueError(
                     f"google_oauth_redirect_uri must equal {expected_redirect_uri!r} in production"
                 )
+            if self.weather_provider_mode == "dev":
+                raise ValueError("weather_provider_mode=dev is not allowed in production")
+            for field_name, expected_host in _PRODUCTION_PROVIDER_ENDPOINT_HOSTS.items():
+                endpoint = getattr(self, field_name)
+                actual_host = urlparse(endpoint).hostname
+                if actual_host is None or actual_host.lower() != expected_host:
+                    raise ValueError(f"{field_name} must use {expected_host!r} in production")
             repo_roots = [
                 root.strip() for root in self.agency_allowed_repo_roots.split(",") if root.strip()
             ]
@@ -556,7 +631,6 @@ class AppSettings(BaseSettings):
         "attachment_fetch_timeout_seconds",
         "agency_timeout_seconds",
         "search_web_timeout_seconds",
-        "search_news_timeout_seconds",
         "web_extract_timeout_seconds",
         "maps_timeout_seconds",
         "weather_production_timeout_seconds",
@@ -565,6 +639,7 @@ class AppSettings(BaseSettings):
         "subscriber_heartbeat_interval_seconds",
         "subscriber_heartbeat_staleness_factor",
         "schema_readiness_ttl_seconds",
+        "model_timeout_seconds",
     )
     @classmethod
     def _positive_float_settings_must_be_positive(cls, value: float) -> float:

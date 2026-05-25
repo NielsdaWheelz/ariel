@@ -9,7 +9,7 @@ and `cap.maps.search_places` read capabilities.
 
 Both are allowlisted `read` capabilities with `allow_inline` policy and no approval
 path. They are grounded-retrieval capabilities: each returns a normalized `results[]`
-list with citations, consumed by the same synthesis path as web and news search.
+list with citations, consumed by the same synthesis path as web search.
 
 - `cap.maps.directions` — multi-stop route guidance: an origin, a destination, up
   to ten ordered waypoints, optional Google-chosen waypoint ordering, alternative

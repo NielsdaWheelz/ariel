@@ -5,11 +5,12 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.config import AppSettings
 from ariel.google_connector import GOOGLE_CONNECTOR_ID, GoogleProviderRequestFailure
+from ariel.google_workspace_normalization import normalize_calendar_event
 from ariel.persistence import (
     BackgroundTaskRecord,
     GoogleConnectorRecord,
@@ -19,7 +20,11 @@ from ariel.persistence import (
     SyncCursorRecord,
     SyncRunRecord,
 )
-from ariel.sync_runtime import ProviderSyncFailure, process_provider_sync_due
+from ariel.sync_runtime import (
+    ProviderSyncFailure,
+    _provider_sync_lock_id,
+    process_provider_sync_due,
+)
 
 
 PROVIDER_ACCOUNT_ID = "sub_sync"
@@ -297,6 +302,57 @@ class FakeFullBodyGmailProvider:
 
 
 @dataclass
+class FakeGmailLifecycleProvider:
+    read_calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _request_json(self, **_: Any) -> dict[str, Any]:
+        raise AssertionError("existing Gmail cursor should use history pages")
+
+    def email_list_history(self, **_: Any) -> dict[str, Any]:
+        return {
+            "historyId": "hist-4",
+            "history": [
+                {
+                    "id": "history-lifecycle",
+                    "labelsRemoved": [
+                        {
+                            "message": {
+                                "id": "msg-label",
+                                "threadId": "thr-label",
+                                "labelIds": ["INBOX"],
+                            }
+                        }
+                    ],
+                    "messagesDeleted": [
+                        {"message": {"id": "msg-delete", "threadId": "thr-delete"}}
+                    ],
+                }
+            ],
+        }
+
+    def email_read(
+        self,
+        *,
+        access_token: str,
+        normalized_input: dict[str, Any],
+        provider_account_id: str,
+    ) -> dict[str, Any]:
+        assert access_token == "access-token"
+        assert provider_account_id == PROVIDER_ACCOUNT_ID
+        self.read_calls.append(normalized_input)
+        assert normalized_input == {
+            "message_id": "msg-label",
+            "thread_id": None,
+            "mode": "message",
+        }
+        return gmail_message_read_output(
+            message_id="msg-label",
+            thread_id="thr-label",
+            published_at="2026-05-07T11:00:00Z",
+        )
+
+
+@dataclass
 class FakeUnreadableGmailProvider:
     read_calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -426,6 +482,41 @@ def _seed_google_connector(
                     updated_at=now,
                 )
             )
+
+
+def test_provider_sync_lock_busy_fails_fast_without_sync_run(
+    session_factory: sessionmaker[Session],
+) -> None:
+    lock_id = _provider_sync_lock_id("provider_sync", "google", "calendar", "primary")
+    lock_db = session_factory()
+    try:
+        assert (
+            lock_db.scalar(
+                text("SELECT pg_try_advisory_lock(:lock_id)"),
+                {"lock_id": lock_id},
+            )
+            is True
+        )
+
+        with pytest.raises(ProviderSyncFailure, match="provider_sync_lock_busy"):
+            process_provider_sync_due(
+                session_factory=session_factory,
+                task_payload={
+                    "provider": "google",
+                    "resource_type": "calendar",
+                    "resource_id": "primary",
+                },
+                settings=_settings(),
+                now_fn=lambda: datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
+                new_id_fn=IdFactory(),
+            )
+    finally:
+        lock_db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+        lock_db.commit()
+        lock_db.close()
+
+    with session_factory() as db:
+        assert db.scalars(select(SyncRunRecord)).all() == []
 
 
 def test_gmail_sync_error_connector_fails_before_provider_reads(
@@ -730,6 +821,442 @@ def test_gmail_sync_hydrates_added_messages_into_body_evidence(
     assert [task.task_type for task in tasks] == ["agent_wake"]
 
 
+def test_gmail_sync_restores_same_digest_superseded_body_evidence(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers: list[FakeFullBodyGmailProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeFullBodyGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeFullBodyGmailProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    message_time = datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+    with session_factory() as db:
+        with db.begin():
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id("gpo"),
+                provider_account_id=PROVIDER_ACCOUNT_ID,
+                object_type="gmail_message",
+                external_id="msg-body",
+                thread_external_id="thr-body",
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=message_time,
+                observed_at=now,
+                provider_url="https://mail.google.com/mail/u/0/#inbox/msg-body",
+                metadata_json={"history_id": "history-stale"},
+                content_digest="r" * 64,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(provider_object)
+            db.flush()
+            db.add_all(
+                [
+                    ProviderEvidenceRecord(
+                        id=new_id("pev"),
+                        provider_object_id=provider_object.id,
+                        provider="google",
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        source_kind="gmail_message",
+                        external_id="msg-body",
+                        thread_external_id="thr-body",
+                        calendar_id=None,
+                        source_uri=provider_object.provider_url,
+                        source_timestamp=message_time,
+                        content_digest="b" * 64,
+                        metadata_json={"history_id": "history-stale"},
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="failed",
+                        lifecycle_state="superseded",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    ProviderEvidenceRecord(
+                        id=new_id("pev"),
+                        provider_object_id=provider_object.id,
+                        provider="google",
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        source_kind="gmail_message",
+                        external_id="msg-body",
+                        thread_external_id="thr-body",
+                        calendar_id=None,
+                        source_uri=provider_object.provider_url,
+                        source_timestamp=message_time,
+                        content_digest="c" * 64,
+                        metadata_json={"history_id": "history-newer"},
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="extracted",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                ]
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            restored = db.scalar(
+                select(ProviderEvidenceRecord).where(
+                    ProviderEvidenceRecord.content_digest == "b" * 64
+                )
+            )
+            superseded = db.scalar(
+                select(ProviderEvidenceRecord).where(
+                    ProviderEvidenceRecord.content_digest == "c" * 64
+                )
+            )
+            block = db.scalar(select(ProviderEvidenceBlockRecord).limit(1))
+
+    assert providers[0].read_calls == [
+        {"message_id": "msg-body", "thread_id": None, "mode": "message"}
+    ]
+    assert restored is not None
+    assert restored.lifecycle_state == "available"
+    assert restored.extraction_status == "pending"
+    assert restored.metadata_json == {
+        "history_id": "history-body",
+        "label_ids": ["INBOX"],
+        "change": "messagesAdded",
+        "decode_notes": [],
+        "html_security": None,
+    }
+    assert block is not None
+    assert block.block_kind == "body"
+    assert superseded is not None
+    assert superseded.lifecycle_state == "superseded"
+
+
+def test_gmail_sync_preserves_extracted_same_digest_body_evidence(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers: list[FakeFullBodyGmailProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeFullBodyGmailProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeFullBodyGmailProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    message_time = datetime(2026, 5, 7, 9, 0, tzinfo=UTC)
+    expected_metadata = {
+        "history_id": "history-body",
+        "label_ids": ["INBOX"],
+        "change": "messagesAdded",
+        "decode_notes": [],
+        "html_security": None,
+    }
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+    with session_factory() as db:
+        with db.begin():
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id("gpo"),
+                provider_account_id=PROVIDER_ACCOUNT_ID,
+                object_type="gmail_message",
+                external_id="msg-body",
+                thread_external_id="thr-body",
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=message_time,
+                observed_at=now,
+                provider_url="https://mail.google.com/mail/u/0/#inbox/msg-body",
+                metadata_json={"history_id": "history-stale"},
+                content_digest="r" * 64,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(provider_object)
+            db.flush()
+            db.add(
+                ProviderEvidenceRecord(
+                    id=new_id("pev"),
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
+                    source_kind="gmail_message",
+                    external_id="msg-body",
+                    thread_external_id="thr-body",
+                    calendar_id=None,
+                    source_uri=provider_object.provider_url,
+                    source_timestamp=message_time,
+                    content_digest="b" * 64,
+                    metadata_json=expected_metadata,
+                    taint="provider_untrusted",
+                    sensitivity="private",
+                    retention_policy="provider_source",
+                    extraction_status="extracted",
+                    lifecycle_state="available",
+                    observed_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            evidence = db.scalar(select(ProviderEvidenceRecord).limit(1))
+            block = db.scalar(select(ProviderEvidenceBlockRecord).limit(1))
+
+    assert providers[0].read_calls == [
+        {"message_id": "msg-body", "thread_id": None, "mode": "message"}
+    ]
+    assert evidence is not None
+    assert evidence.lifecycle_state == "available"
+    assert evidence.extraction_status == "extracted"
+    assert evidence.metadata_json == expected_metadata
+    assert block is not None
+    assert block.evidence_id == evidence.id
+
+
+def test_gmail_sync_hydrates_label_changes_and_deletions_into_evidence_lifecycle(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    providers: list[FakeGmailLifecycleProvider] = []
+
+    class FakeGoogleConnectorRuntime:
+        workspace_provider: FakeGmailLifecycleProvider
+
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeGmailLifecycleProvider()
+            providers.append(self.workspace_provider)
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-3",
+        now=now,
+    )
+    with session_factory() as db:
+        with db.begin():
+            label_object = GoogleProviderObjectRecord(
+                id=new_id("gpo"),
+                provider_account_id=PROVIDER_ACCOUNT_ID,
+                object_type="gmail_message",
+                external_id="msg-label",
+                thread_external_id="thr-label",
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=datetime(2026, 5, 7, 10, 0, tzinfo=UTC),
+                observed_at=now,
+                provider_url="https://mail.google.com/mail/u/0/#all/msg-label",
+                metadata_json={
+                    "history_id": "history-before",
+                    "label_ids": ["INBOX", "IMPORTANT"],
+                    "change": "messagesAdded",
+                },
+                content_digest="r" * 64,
+                created_at=now,
+                updated_at=now,
+            )
+            delete_object = GoogleProviderObjectRecord(
+                id=new_id("gpo"),
+                provider_account_id=PROVIDER_ACCOUNT_ID,
+                object_type="gmail_message",
+                external_id="msg-delete",
+                thread_external_id="thr-delete",
+                calendar_id=None,
+                ical_uid=None,
+                status="active",
+                source_timestamp=datetime(2026, 5, 7, 10, 0, tzinfo=UTC),
+                observed_at=now,
+                provider_url="https://mail.google.com/mail/u/0/#all/msg-delete",
+                metadata_json={
+                    "history_id": "history-before",
+                    "label_ids": ["INBOX"],
+                    "change": "messagesAdded",
+                },
+                content_digest="s" * 64,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add_all([label_object, delete_object])
+            db.flush()
+            db.add_all(
+                [
+                    ProviderEvidenceRecord(
+                        id=new_id("pev"),
+                        provider_object_id=label_object.id,
+                        provider="google",
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        source_kind="gmail_message",
+                        external_id="msg-label",
+                        thread_external_id="thr-label",
+                        calendar_id=None,
+                        source_uri=label_object.provider_url,
+                        source_timestamp=label_object.source_timestamp,
+                        content_digest="b" * 64,
+                        metadata_json={
+                            "history_id": "history-before",
+                            "label_ids": ["INBOX", "IMPORTANT"],
+                            "change": "messagesAdded",
+                        },
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="extracted",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                    ProviderEvidenceRecord(
+                        id=new_id("pev"),
+                        provider_object_id=delete_object.id,
+                        provider="google",
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        source_kind="gmail_message",
+                        external_id="msg-delete",
+                        thread_external_id="thr-delete",
+                        calendar_id=None,
+                        source_uri=delete_object.provider_url,
+                        source_timestamp=delete_object.source_timestamp,
+                        content_digest="c" * 64,
+                        metadata_json={
+                            "history_id": "history-before",
+                            "label_ids": ["INBOX"],
+                            "change": "messagesAdded",
+                        },
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="extracted",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    ),
+                ]
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            run = db.scalar(select(SyncRunRecord).limit(1))
+            updated_label_object = db.scalar(
+                select(GoogleProviderObjectRecord).where(
+                    GoogleProviderObjectRecord.external_id == "msg-label"
+                )
+            )
+            updated_delete_object = db.scalar(
+                select(GoogleProviderObjectRecord).where(
+                    GoogleProviderObjectRecord.external_id == "msg-delete"
+                )
+            )
+            label_evidence = db.scalar(
+                select(ProviderEvidenceRecord).where(
+                    ProviderEvidenceRecord.external_id == "msg-label"
+                )
+            )
+            delete_evidence = db.scalar(
+                select(ProviderEvidenceRecord).where(
+                    ProviderEvidenceRecord.external_id == "msg-delete"
+                )
+            )
+
+    assert len(providers) == 1
+    assert providers[0].read_calls == [
+        {"message_id": "msg-label", "thread_id": None, "mode": "message"}
+    ]
+    assert run is not None
+    assert run.status == "succeeded"
+    assert run.item_count == 2
+    assert run.observation_count == 1
+    assert run.cursor_after == "hist-4"
+
+    assert updated_label_object is not None
+    assert updated_label_object.status == "active"
+    assert updated_label_object.metadata_json["history_id"] == "history-lifecycle"
+    assert updated_label_object.metadata_json["label_ids"] == ["INBOX"]
+    assert updated_label_object.metadata_json["change"] == "labelsRemoved"
+    assert label_evidence is not None
+    assert label_evidence.lifecycle_state == "available"
+    assert label_evidence.extraction_status == "pending"
+    assert label_evidence.metadata_json["label_ids"] == ["INBOX"]
+    assert label_evidence.metadata_json["change"] == "labelsRemoved"
+
+    assert updated_delete_object is not None
+    assert updated_delete_object.status == "deleted"
+    assert delete_evidence is not None
+    assert delete_evidence.lifecycle_state == "deleted"
+
+
 def test_gmail_sync_keeps_missing_or_invalid_internal_date_absent(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -923,6 +1450,118 @@ def test_calendar_sync_keeps_missing_or_invalid_updated_timestamp_absent(
     assert [row.source_timestamp for row in evidence_rows] == [None, None]
     assert [row.observed_at for row in evidence_rows] == [now, now]
     assert [row.provider_account_id for row in evidence_rows] == [PROVIDER_ACCOUNT_ID] * 2
+
+
+def test_calendar_sync_refreshes_same_digest_cancelled_evidence(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled_event = {
+        "id": "evt-cancelled",
+        "status": "cancelled",
+        "summary": "Cancelled standup",
+        "updated": "2026-05-22T10:00:00Z",
+        "htmlLink": "https://calendar.google.com/event?eid=evt-cancelled",
+    }
+    content_digest = normalize_calendar_event(
+        cancelled_event,
+        provider_account_id=PROVIDER_ACCOUNT_ID,
+        calendar_id="primary",
+    ).raw_payload_digest
+
+    class FakeCalendarProvider:
+        def calendar_list_event_deltas(self, **_: Any) -> dict[str, Any]:
+            return {"nextSyncToken": "sync-token-2", "items": [cancelled_event]}
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeCalendarProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 24, 12, 0, tzinfo=UTC)
+    stale_time = datetime(2026, 5, 21, 9, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="calendar",
+        resource_id="primary",
+        cursor_value="sync-token-1",
+        now=now,
+    )
+    with session_factory() as db:
+        with db.begin():
+            provider_object = GoogleProviderObjectRecord(
+                id=new_id("gpo"),
+                provider_account_id=PROVIDER_ACCOUNT_ID,
+                object_type="calendar_event",
+                external_id="evt-cancelled",
+                thread_external_id=None,
+                calendar_id="primary",
+                ical_uid=None,
+                status="active",
+                source_timestamp=stale_time,
+                observed_at=stale_time,
+                provider_url="https://calendar.google.com/event?eid=stale",
+                metadata_json={"summary": "Stale", "status": "confirmed"},
+                content_digest=content_digest,
+                created_at=stale_time,
+                updated_at=stale_time,
+            )
+            db.add(provider_object)
+            db.flush()
+            db.add(
+                ProviderEvidenceRecord(
+                    id=new_id("pev"),
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
+                    source_kind="calendar_event",
+                    external_id="evt-cancelled",
+                    thread_external_id="stale-thread",
+                    calendar_id="stale-calendar",
+                    source_uri="https://calendar.google.com/event?eid=stale",
+                    source_timestamp=stale_time,
+                    content_digest=content_digest,
+                    metadata_json={"summary": "Stale", "status": "confirmed"},
+                    taint="provider_untrusted",
+                    sensitivity="private",
+                    retention_policy="provider_source",
+                    extraction_status="extracted",
+                    lifecycle_state="available",
+                    observed_at=stale_time,
+                    created_at=stale_time,
+                    updated_at=stale_time,
+                )
+            )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "calendar", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            evidence = db.scalar(select(ProviderEvidenceRecord).limit(1))
+
+    assert evidence is not None
+    assert evidence.lifecycle_state == "deleted"
+    assert evidence.extraction_status == "not_actionable"
+    assert evidence.thread_external_id is None
+    assert evidence.calendar_id == "primary"
+    assert evidence.source_uri == "https://calendar.google.com/event?eid=evt-cancelled"
+    assert evidence.source_timestamp == datetime(2026, 5, 22, 10, 0, tzinfo=UTC)
+    assert evidence.metadata_json["summary"] == "Cancelled standup"
+    assert evidence.metadata_json["status"] == "cancelled"
+    assert evidence.observed_at == now
+    assert evidence.updated_at == now
 
 
 def test_calendar_sync_uses_bounded_delta_pages(

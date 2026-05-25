@@ -51,6 +51,7 @@ from ariel.google_connector import (
     GOOGLE_WRITE_CAPABILITY_IDS,
     GoogleCapabilityExecutionResult,
     GoogleConnectorRuntime,
+    GoogleProviderRequestFailure,
     google_connected_account_subject,
 )
 from ariel.persistence import (
@@ -61,7 +62,6 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
-    ProviderEvidenceBlockRecord,
     ProviderEvidenceRecord,
     ProviderWriteReceiptRecord,
     TurnRecord,
@@ -69,6 +69,13 @@ from ariel.persistence import (
     to_rfc3339,
 )
 from ariel.policy_engine import evaluate_proposal
+from ariel.provider_evidence_lifecycle import (
+    ProviderEvidenceBlockInput,
+    provider_evidence_ref,
+    record_available_evidence,
+    record_deleted_evidence,
+    record_unavailable_evidence,
+)
 from ariel.redaction import safe_failure_reason
 from ariel.secret_cipher import decrypt_secret, encrypt_secret
 from ariel.weather_state import resolve_weather_location
@@ -979,6 +986,46 @@ def _taint_event_payload(
     }
 
 
+def _memory_output_runtime_provenance(
+    *,
+    capability_id: str,
+    action_attempt: ActionAttemptRecord,
+    output: Any,
+) -> RuntimeProvenance | None:
+    """Mark later syscalls tainted when a memory read returned tainted rows."""
+    if not isinstance(output, dict):
+        return None
+
+    tainted = False
+    if capability_id == "cap.memory.recall":
+        recall_raw = output.get("recall")
+        recall = recall_raw if isinstance(recall_raw, dict) else {}
+        items_raw = recall.get("items")
+        items = items_raw if isinstance(items_raw, list) else []
+        tainted = any(isinstance(item, dict) and item.get("taint") == "tainted" for item in items)
+    elif capability_id == "cap.memory.search":
+        hits_raw = output.get("hits")
+        hits = hits_raw if isinstance(hits_raw, list) else []
+        tainted = any(isinstance(hit, dict) and hit.get("taint") == "tainted" for hit in hits)
+    elif capability_id == "cap.memory.read":
+        tainted = output.get("status") == "found" and output.get("taint") == "tainted"
+
+    if not tainted:
+        return None
+    return RuntimeProvenance(
+        status="tainted",
+        evidence=(
+            {
+                "kind": "prior_tool_output_in_context",
+                "turn_id": action_attempt.turn_id,
+                "action_attempt_id": action_attempt.id,
+                "capability_id": capability_id,
+                "impact_level": action_attempt.impact_level,
+            },
+        ),
+    )
+
+
 _MAX_CITED_SOURCES = 4
 _MAX_SNIPPET_LENGTH = 320
 _MAX_DIRECT_TOOL_OUTPUT_JSON_CHARS = 6_000
@@ -987,7 +1034,6 @@ _MODALITY_HEAVY_VALUES = {"audio", "document", "image", "video"}
 _WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS = {"cap.web.extract"}
 _GROUNDED_RETRIEVAL_CAPABILITIES = {
     "cap.search.web",
-    "cap.search.news",
     "cap.weather.forecast",
     *MAPS_CAPABILITY_IDS,
     *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
@@ -1004,18 +1050,20 @@ _TYPED_AUTH_RECOVERY: dict[str, str] = {
 }
 
 _TYPED_PROVIDER_RECOVERY: dict[str, str] = {
-    "provider_timeout": "Google timed out. Retry shortly.",
-    "provider_network_failure": "Google had a network failure. Retry shortly.",
-    "provider_rate_limited": "Google rate limited this request. Wait briefly, then retry.",
-    "provider_upstream_failure": "Google is degraded right now. Retry shortly.",
+    "provider_timeout": "Provider timed out. Retry shortly.",
+    "provider_network_failure": "Provider network request failed. Retry shortly.",
+    "provider_rate_limited": "Provider rate limited this request. Wait briefly, then retry.",
+    "provider_upstream_failure": "Provider is degraded right now. Retry shortly.",
     "provider_permission_denied": (
         "Provider denied access. Verify scopes, API key restrictions, or file permissions "
         "and retry."
     ),
-    "provider_request_rejected": "Google rejected this request. Verify inputs and retry.",
-    "resource_unavailable": "The file is unavailable. Verify file ID and access, then retry.",
-    "provider_invalid_payload": "Google returned an invalid payload. Retry shortly.",
-    "provider_unreachable": "Google could not be reached. Retry shortly.",
+    "provider_request_rejected": "Provider rejected this request. Verify inputs and retry.",
+    "resource_unavailable": (
+        "The provider resource is unavailable. Verify ID and access, then retry."
+    ),
+    "provider_invalid_payload": "Provider returned an invalid payload. Retry shortly.",
+    "provider_unreachable": "Provider could not be reached. Retry shortly.",
 }
 
 
@@ -1450,23 +1498,62 @@ def _persist_google_provider_evidence(
         else None
     )
 
-    def evidence_ref(stored: ProviderEvidenceRecord) -> dict[str, Any]:
-        block_ids = db.scalars(
-            select(ProviderEvidenceBlockRecord.id)
-            .where(ProviderEvidenceBlockRecord.evidence_id == stored.id)
-            .order_by(ProviderEvidenceBlockRecord.block_index.asc())
-        ).all()
-        return {
-            "provider_evidence_id": stored.id,
-            "read_receipt_id": stored.id,
-            "source_kind": stored.source_kind,
-            "external_id": stored.external_id,
-            "thread_external_id": stored.thread_external_id,
-            "block_ids": block_ids,
-            "citation_refs": [
-                {"kind": "provider_evidence_block", "block_id": block_id} for block_id in block_ids
-            ],
-        }
+    def gmail_block_inputs(raw_blocks: Any) -> list[ProviderEvidenceBlockInput]:
+        blocks: list[ProviderEvidenceBlockInput] = []
+        for block in raw_blocks if isinstance(raw_blocks, list) else []:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            kind = block.get("kind")
+            blocks.append(
+                ProviderEvidenceBlockInput(
+                    block_kind=kind
+                    if kind in {"body", "quote", "signature", "forwarded"}
+                    else "body",
+                    text=block["text"],
+                    digest=str(block.get("digest") or _email_hash(block["text"])),
+                    source_offsets={
+                        "block_id": block.get("block_id"),
+                        "source_message_id": block.get("source_message_id"),
+                        "source_thread_id": block.get("source_thread_id"),
+                    },
+                    metadata_json={
+                        "source_mime_type": block.get("source_mime_type"),
+                        "charset": block.get("charset"),
+                        "truncated": block.get("truncated"),
+                    },
+                )
+            )
+        return blocks
+
+    def calendar_block_inputs(raw_blocks: Any) -> list[ProviderEvidenceBlockInput]:
+        blocks: list[ProviderEvidenceBlockInput] = []
+        for block in raw_blocks if isinstance(raw_blocks, list) else []:
+            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                continue
+            blocks.append(
+                ProviderEvidenceBlockInput(
+                    block_kind="calendar_description",
+                    text=block["text"],
+                    digest=str(block.get("digest") or _email_hash(block["text"])),
+                    source_offsets={"block_id": block.get("block_id")},
+                    metadata_json={"truncated": block.get("truncated")},
+                )
+            )
+        return blocks
+
+    def availability_block_inputs(block_texts: list[str]) -> list[ProviderEvidenceBlockInput]:
+        blocks: list[ProviderEvidenceBlockInput] = []
+        for index, text in enumerate(block_texts):
+            blocks.append(
+                ProviderEvidenceBlockInput(
+                    block_kind="availability",
+                    text=text,
+                    digest=_email_hash(text),
+                    source_offsets={"slot_index": index},
+                    metadata_json={},
+                )
+            )
+        return blocks
 
     if capability_id == "cap.email.read":
         message = output_payload.get("message")
@@ -1579,74 +1666,52 @@ def _persist_google_provider_evidence(
             content_digest = evidence.get("body_digest")
             if not isinstance(content_digest, str) or not content_digest:
                 return []
-            existing = db.scalar(
-                select(ProviderEvidenceRecord)
-                .where(
-                    ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                    ProviderEvidenceRecord.content_digest == content_digest,
+            metadata_json = {
+                "mode": output_payload.get("mode"),
+                "decode_notes": evidence.get("decode_notes", []),
+                "html_security": evidence.get("html_security"),
+                "read_outcome": read_outcome,
+                "anchor_message_id": thread.get("anchor_message_id"),
+            }
+            if read_status == "ok":
+                stored = record_available_evidence(
+                    db=db,
+                    new_id_fn=new_id_fn,
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=provider_account_id,
+                    source_kind="gmail_thread",
+                    external_id=thread_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    source_uri=provider_url,
+                    source_timestamp=source_timestamp,
+                    content_digest=content_digest,
+                    metadata_json=metadata_json,
+                    observed_at=now,
+                    blocks=gmail_block_inputs(raw_blocks),
                 )
-                .limit(1)
-            )
-            if existing is not None:
-                return [evidence_ref(existing)]
-            stored = ProviderEvidenceRecord(
-                id=new_id_fn("pev"),
-                provider_object_id=provider_object.id,
-                provider="google",
-                provider_account_id=provider_account_id,
-                source_kind="gmail_thread",
-                external_id=thread_id,
-                thread_external_id=thread_id,
-                calendar_id=None,
-                source_uri=provider_url,
-                source_timestamp=source_timestamp,
-                content_digest=content_digest,
-                metadata_json={
-                    "mode": output_payload.get("mode"),
-                    "decode_notes": evidence.get("decode_notes", []),
-                    "html_security": evidence.get("html_security"),
-                    "read_outcome": read_outcome,
-                    "anchor_message_id": thread.get("anchor_message_id"),
-                },
-                taint="provider_untrusted",
-                sensitivity="private",
-                retention_policy="provider_source",
-                extraction_status="pending" if read_status == "ok" else "failed",
-                lifecycle_state="available" if read_status == "ok" else "unavailable",
-                observed_at=now,
-                created_at=now,
-                updated_at=now,
-            )
-            db.add(stored)
-            db.flush()
-            for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
-                if not isinstance(block, dict) or not isinstance(block.get("text"), str):
-                    continue
-                kind = block.get("kind")
-                db.add(
-                    ProviderEvidenceBlockRecord(
-                        id=new_id_fn("peb"),
-                        evidence_id=stored.id,
-                        block_index=index,
-                        block_kind=kind
-                        if kind in {"body", "quote", "signature", "forwarded"}
-                        else "body",
-                        text=block["text"],
-                        digest=str(block.get("digest") or _email_hash(block["text"])),
-                        source_offsets={
-                            "block_id": block.get("block_id"),
-                            "source_message_id": block.get("source_message_id"),
-                            "source_thread_id": block.get("source_thread_id"),
-                        },
-                        metadata_json={
-                            "source_mime_type": block.get("source_mime_type"),
-                            "charset": block.get("charset"),
-                            "truncated": block.get("truncated"),
-                        },
-                        created_at=now,
-                    )
+            else:
+                stored = record_unavailable_evidence(
+                    db=db,
+                    new_id_fn=new_id_fn,
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=provider_account_id,
+                    source_kind="gmail_thread",
+                    external_id=thread_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    source_uri=provider_url,
+                    source_timestamp=source_timestamp,
+                    content_digest=content_digest,
+                    metadata_json=metadata_json,
+                    observed_at=now,
+                    blocks=gmail_block_inputs(raw_blocks),
                 )
-            return [evidence_ref(stored)]
+            if stored is None:
+                return []
+            return [provider_evidence_ref(db, stored)]
         if provider_account_id is None:
             account_raw = message.get("provider_account_id")
             if isinstance(account_raw, str) and account_raw.strip():
@@ -1724,18 +1789,9 @@ def _persist_google_provider_evidence(
         content_digest = evidence.get("body_digest")
         if not isinstance(content_digest, str) or not content_digest:
             return []
-        existing = db.scalar(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.content_digest == content_digest,
-            )
-            .limit(1)
-        )
-        if existing is not None:
-            return [evidence_ref(existing)]
-        stored = ProviderEvidenceRecord(
-            id=new_id_fn("pev"),
+        stored = record_available_evidence(
+            db=db,
+            new_id_fn=new_id_fn,
             provider_object_id=provider_object.id,
             provider="google",
             provider_account_id=provider_account_id,
@@ -1755,41 +1811,12 @@ def _persist_google_provider_evidence(
                 "html_security": evidence.get("html_security"),
                 "read_outcome": read_outcome,
             },
-            taint="provider_untrusted",
-            sensitivity="private",
-            retention_policy="provider_source",
-            extraction_status="pending" if read_status == "ok" else "failed",
-            lifecycle_state="available" if read_status == "ok" else "unavailable",
             observed_at=now,
-            created_at=now,
-            updated_at=now,
+            blocks=gmail_block_inputs(raw_blocks),
         )
-        db.add(stored)
-        db.flush()
-        for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
-            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
-                continue
-            kind = block.get("kind")
-            db.add(
-                ProviderEvidenceBlockRecord(
-                    id=new_id_fn("peb"),
-                    evidence_id=stored.id,
-                    block_index=index,
-                    block_kind=kind
-                    if kind in {"body", "quote", "signature", "forwarded"}
-                    else "body",
-                    text=block["text"],
-                    digest=str(block.get("digest") or _email_hash(block["text"])),
-                    source_offsets={"block_id": block.get("block_id")},
-                    metadata_json={
-                        "source_mime_type": block.get("source_mime_type"),
-                        "charset": block.get("charset"),
-                        "truncated": block.get("truncated"),
-                    },
-                    created_at=now,
-                )
-            )
-        return [evidence_ref(stored)]
+        if stored is None:
+            return []
+        return [provider_evidence_ref(db, stored)]
 
     if capability_id == "cap.calendar.propose_slots":
         if provider_account_id is None:
@@ -1857,40 +1884,6 @@ def _persist_google_provider_evidence(
             provider_object.content_digest = content_digest
             provider_object.updated_at = now
 
-        existing = db.scalar(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.content_digest == content_digest,
-            )
-            .limit(1)
-        )
-        if existing is not None:
-            return [evidence_ref(existing)]
-        stored = ProviderEvidenceRecord(
-            id=new_id_fn("pev"),
-            provider_object_id=provider_object.id,
-            provider="google",
-            provider_account_id=provider_account_id,
-            source_kind="calendar_availability",
-            external_id=external_id,
-            thread_external_id=None,
-            calendar_id=None,
-            source_uri=f"calendar://availability/{content_digest[:16]}",
-            source_timestamp=source_timestamp,
-            content_digest=content_digest,
-            metadata_json=content_payload,
-            taint="provider_untrusted",
-            sensitivity="private",
-            retention_policy="provider_source",
-            extraction_status="pending",
-            lifecycle_state="available",
-            observed_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(stored)
-        db.flush()
         block_texts: list[str] = []
         for slot in slots:
             if not isinstance(slot, dict):
@@ -1908,21 +1901,27 @@ def _persist_google_provider_evidence(
             )
         if not block_texts and output_payload.get("no_slots_reason") == "no_slots_available":
             block_texts.append("No matching availability was found in the requested window.")
-        for index, text in enumerate(block_texts):
-            db.add(
-                ProviderEvidenceBlockRecord(
-                    id=new_id_fn("peb"),
-                    evidence_id=stored.id,
-                    block_index=index,
-                    block_kind="availability",
-                    text=text,
-                    digest=_email_hash(text),
-                    source_offsets={"slot_index": index},
-                    metadata_json={},
-                    created_at=now,
-                )
-            )
-        return [evidence_ref(stored)]
+
+        stored = record_available_evidence(
+            db=db,
+            new_id_fn=new_id_fn,
+            provider_object_id=provider_object.id,
+            provider="google",
+            provider_account_id=provider_account_id,
+            source_kind="calendar_availability",
+            external_id=external_id,
+            thread_external_id=None,
+            calendar_id=None,
+            source_uri=f"calendar://availability/{content_digest[:16]}",
+            source_timestamp=source_timestamp,
+            content_digest=content_digest,
+            metadata_json=content_payload,
+            observed_at=now,
+            blocks=availability_block_inputs(block_texts),
+        )
+        if stored is None:
+            return []
+        return [provider_evidence_ref(db, stored)]
 
     if capability_id != "cap.calendar.list":
         return []
@@ -2004,20 +2003,36 @@ def _persist_google_provider_evidence(
         content_digest = event.get("raw_payload_digest")
         if not isinstance(content_digest, str) or not content_digest:
             continue
-        existing = db.scalar(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.content_digest == content_digest,
-            )
-            .limit(1)
-        )
-        if existing is not None:
-            stored_refs.append(evidence_ref(existing))
-            continue
         event_deleted = event.get("status") == "cancelled"
-        stored = ProviderEvidenceRecord(
-            id=new_id_fn("pev"),
+        metadata_json = {"summary": event.get("summary"), "status": event.get("status")}
+        source_uri = (
+            event.get("provider_url") if isinstance(event.get("provider_url"), str) else None
+        )
+        if event_deleted:
+            stored = record_deleted_evidence(
+                db=db,
+                new_id_fn=new_id_fn,
+                provider_object_id=provider_object.id,
+                provider="google",
+                provider_account_id=event_provider_account_id,
+                source_kind="calendar_event",
+                external_id=event_id,
+                thread_external_id=None,
+                calendar_id=calendar_id,
+                source_uri=source_uri,
+                source_timestamp=source_timestamp,
+                content_digest=content_digest,
+                metadata_json=metadata_json,
+                observed_at=now,
+                blocks=calendar_block_inputs(event.get("description_blocks")),
+            )
+            if stored is None:
+                continue
+            stored_refs.append(provider_evidence_ref(db, stored))
+            continue
+        stored = record_available_evidence(
+            db=db,
+            new_id_fn=new_id_fn,
             provider_object_id=provider_object.id,
             provider="google",
             provider_account_id=event_provider_account_id,
@@ -2025,41 +2040,16 @@ def _persist_google_provider_evidence(
             external_id=event_id,
             thread_external_id=None,
             calendar_id=calendar_id,
-            source_uri=event.get("provider_url")
-            if isinstance(event.get("provider_url"), str)
-            else None,
+            source_uri=source_uri,
             source_timestamp=source_timestamp,
             content_digest=content_digest,
-            metadata_json={"summary": event.get("summary"), "status": event.get("status")},
-            taint="provider_untrusted",
-            sensitivity="private",
-            retention_policy="provider_source",
-            extraction_status="not_actionable" if event_deleted else "pending",
-            lifecycle_state="deleted" if event_deleted else "available",
+            metadata_json=metadata_json,
             observed_at=now,
-            created_at=now,
-            updated_at=now,
+            blocks=calendar_block_inputs(event.get("description_blocks")),
         )
-        db.add(stored)
-        db.flush()
-        raw_blocks = event.get("description_blocks")
-        for index, block in enumerate(raw_blocks if isinstance(raw_blocks, list) else []):
-            if not isinstance(block, dict) or not isinstance(block.get("text"), str):
-                continue
-            db.add(
-                ProviderEvidenceBlockRecord(
-                    id=new_id_fn("peb"),
-                    evidence_id=stored.id,
-                    block_index=index,
-                    block_kind="calendar_description",
-                    text=block["text"],
-                    digest=str(block.get("digest") or _email_hash(block["text"])),
-                    source_offsets={"block_id": block.get("block_id")},
-                    metadata_json={"truncated": block.get("truncated")},
-                    created_at=now,
-                )
-            )
-        stored_refs.append(evidence_ref(stored))
+        if stored is None:
+            continue
+        stored_refs.append(provider_evidence_ref(db, stored))
     return stored_refs
 
 
@@ -2560,6 +2550,233 @@ def _append_provider_write_reconcile_unavailable_event(
     )
 
 
+def _mark_provider_write_reconcile_indeterminate(
+    *,
+    db: Session,
+    action_attempt: ActionAttemptRecord,
+    receipt: ProviderWriteReceiptRecord,
+    reason: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    now = now_fn()
+    response_payload = dict(receipt.response_payload)
+    response_payload["reconciliation"] = {
+        "status": "indeterminate",
+        "reason": reason,
+        "checked_at": to_rfc3339(now),
+    }
+    receipt.response_payload = response_payload
+    receipt.response_digest = _json_digest(response_payload)
+    receipt.updated_at = now
+    _append_action_execution_event(
+        db=db,
+        action_attempt=action_attempt,
+        event_type="evt.provider_write.reconcile_unavailable",
+        payload_data={
+            "action_attempt_id": action_attempt.id,
+            "provider_write_receipt_id": receipt.id,
+            "status": receipt.status,
+            "reason": reason,
+            "reconcile_task_enqueued": False,
+        },
+        now_fn=lambda: now,
+        new_id_fn=new_id_fn,
+    )
+
+
+def _mark_provider_write_reconcile_indeterminate_by_receipt_id(
+    *,
+    session_factory: sessionmaker[Session],
+    receipt_id: str,
+    reason: str,
+    now_fn: Callable[[], datetime],
+    new_id_fn: Callable[[str], str],
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            receipt = db.scalar(
+                select(ProviderWriteReceiptRecord)
+                .where(ProviderWriteReceiptRecord.id == receipt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if receipt is None:
+                raise RuntimeError("provider_write_receipt_not_found")
+            action_attempt = db.scalar(
+                select(ActionAttemptRecord)
+                .where(ActionAttemptRecord.id == receipt.action_attempt_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if action_attempt is None:
+                raise RuntimeError("provider_write_action_attempt_not_found")
+            if receipt.status != "ambiguous":
+                return
+            _mark_provider_write_reconcile_indeterminate(
+                db=db,
+                action_attempt=action_attempt,
+                receipt=receipt,
+                reason=reason,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+
+
+def _google_calendar_reconcile_error_is_retryable(reason: str) -> bool:
+    return reason in {
+        "google_upstream_timeout",
+        "google_upstream_network_failure",
+        "google_upstream_429",
+        "google_request_unreachable",
+        "provider_timeout",
+        "provider_network_failure",
+        "provider_rate_limited",
+        "provider_upstream_failure",
+    } or reason.startswith("google_upstream_5")
+
+
+def _calendar_event_text_value(event: dict[str, Any], key: str) -> str:
+    value = event.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _calendar_event_datetime_value(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in ("dateTime", "date"):
+        raw_value = value.get(key)
+        if isinstance(raw_value, str) and raw_value.strip():
+            return raw_value.strip()
+    return ""
+
+
+def _calendar_event_attendee_emails(event: dict[str, Any]) -> list[str]:
+    attendees = event.get("attendees")
+    if not isinstance(attendees, list):
+        return []
+    emails: list[str] = []
+    for attendee in attendees:
+        if not isinstance(attendee, dict):
+            continue
+        email = attendee.get("email")
+        if isinstance(email, str) and email.strip():
+            emails.append(email.strip().lower())
+    return sorted(set(emails))
+
+
+def _google_calendar_reconcile_matches(
+    *,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+    provider_event: dict[str, Any],
+) -> bool:
+    if capability_id == "cap.calendar.respond_to_event":
+        target_email = normalized_input.get("attendee_email")
+        expected_status = normalized_input.get("response_status")
+        if not isinstance(target_email, str) or not isinstance(expected_status, str):
+            return False
+        attendees = provider_event.get("attendees")
+        if not isinstance(attendees, list):
+            return False
+        for attendee in attendees:
+            if not isinstance(attendee, dict):
+                continue
+            email = attendee.get("email")
+            if not isinstance(email, str) or email.strip().lower() != target_email.lower():
+                continue
+            return attendee.get("responseStatus") == expected_status
+        return False
+
+    if capability_id != "cap.calendar.update_event":
+        return False
+    if (
+        "title" in normalized_input
+        and _calendar_event_text_value(provider_event, "summary") != normalized_input["title"]
+    ):
+        return False
+    if (
+        "description" in normalized_input
+        and _calendar_event_text_value(provider_event, "description")
+        != normalized_input["description"]
+    ):
+        return False
+    if (
+        "location" in normalized_input
+        and _calendar_event_text_value(provider_event, "location") != normalized_input["location"]
+    ):
+        return False
+    if (
+        "start_time" in normalized_input
+        and _calendar_event_datetime_value(provider_event.get("start"))
+        != normalized_input["start_time"]
+    ):
+        return False
+    if (
+        "end_time" in normalized_input
+        and _calendar_event_datetime_value(provider_event.get("end"))
+        != normalized_input["end_time"]
+    ):
+        return False
+    if "attendees" in normalized_input:
+        expected_attendees = sorted(
+            {
+                attendee.lower()
+                for attendee in normalized_input["attendees"]
+                if isinstance(attendee, str)
+            }
+        )
+        if _calendar_event_attendee_emails(provider_event) != expected_attendees:
+            return False
+    return True
+
+
+def _google_calendar_reconcile_output(
+    *,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+    provider_event: dict[str, Any],
+    checked_at: datetime,
+) -> dict[str, Any]:
+    event_id_raw = provider_event.get("id")
+    event_id = (
+        event_id_raw.strip()
+        if isinstance(event_id_raw, str) and event_id_raw.strip()
+        else str(normalized_input["event_id"])
+    )
+    calendar_id = str(normalized_input.get("calendar_id") or "primary")
+    html_link = provider_event.get("htmlLink")
+    etag = provider_event.get("etag")
+    updated = provider_event.get("updated")
+    ical_uid = provider_event.get("iCalUID")
+    provider_status = provider_event.get("status")
+    if capability_id == "cap.calendar.respond_to_event":
+        schema_version = "google.calendar.response_result.v1"
+        status = "responded"
+    else:
+        schema_version = "google.calendar.update_result.v1"
+        status = "updated"
+    output: dict[str, Any] = {
+        "schema_version": schema_version,
+        "status": status,
+        "event_id": event_id,
+        "calendar_id": calendar_id,
+        "provider_event_ref": html_link.strip()
+        if isinstance(html_link, str) and html_link.strip()
+        else f"calendar://{event_id}",
+        "etag": etag.strip() if isinstance(etag, str) and etag.strip() else None,
+        "updated": updated.strip() if isinstance(updated, str) and updated.strip() else None,
+        "ical_uid": ical_uid.strip() if isinstance(ical_uid, str) and ical_uid.strip() else None,
+        "provider_status": provider_status.strip()
+        if isinstance(provider_status, str) and provider_status.strip()
+        else None,
+        "executed_at": to_rfc3339(checked_at),
+    }
+    if capability_id == "cap.calendar.respond_to_event":
+        output["response_status"] = normalized_input["response_status"]
+    return output
+
+
 def _response_function_call_output(*, call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "function_call_output",
@@ -2575,12 +2792,14 @@ def process_provider_write_reconcile_due(
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
     agency_runtime: Any | None = None,
+    google_runtime: GoogleConnectorRuntime | None = None,
 ) -> bool:
     receipt_id = task_payload.get("provider_write_receipt_id")
     if not isinstance(receipt_id, str) or not receipt_id:
         raise RuntimeError("provider_write_reconcile_due missing provider_write_receipt_id")
 
     agency_prepared: dict[str, Any] | None = None
+    google_calendar_probe: tuple[str, dict[str, Any], str, str, str, str] | None = None
     indeterminate_reason = "provider_reconcile_requires_provider_specific_probe"
 
     with session_factory() as db:
@@ -2658,29 +2877,184 @@ def process_provider_write_reconcile_due(
                 else:
                     indeterminate_reason = "agency_reconcile_identity_missing"
 
+            if (
+                google_calendar_probe is None
+                and receipt.provider == "google"
+                and receipt.capability_id
+                in {"cap.calendar.update_event", "cap.calendar.respond_to_event"}
+            ):
+                if google_runtime is None:
+                    indeterminate_reason = "google_runtime_not_bound"
+                else:
+                    full_input, full_input_error = _full_action_input_payload(
+                        db=db,
+                        action_attempt=action_attempt,
+                        google_runtime=google_runtime,
+                    )
+                    capability = get_capability(receipt.capability_id)
+                    if full_input_error is not None:
+                        indeterminate_reason = full_input_error
+                    elif capability is None or full_input is None:
+                        indeterminate_reason = "unknown_capability"
+                    else:
+                        normalized_input, validation_error = capability.validate_input(full_input)
+                        if validation_error is not None or normalized_input is None:
+                            indeterminate_reason = validation_error or "schema_invalid"
+                        else:
+                            event_id = normalized_input.get("event_id")
+                            calendar_id = normalized_input.get("calendar_id") or "primary"
+                            if not isinstance(event_id, str) or not event_id:
+                                indeterminate_reason = "calendar_reconcile_identity_missing"
+                            elif not isinstance(calendar_id, str) or not calendar_id:
+                                indeterminate_reason = "calendar_reconcile_identity_missing"
+                            else:
+                                (
+                                    access_token,
+                                    _,
+                                    provider_account_id,
+                                    access_failure,
+                                ) = google_runtime.prepare_capability_access(
+                                    db=db,
+                                    capability_id=receipt.capability_id,
+                                    now_fn=now_fn,
+                                    new_id_fn=new_id_fn,
+                                )
+                                if access_failure is not None:
+                                    indeterminate_reason = (
+                                        access_failure.auth_failure.failure_class
+                                        if access_failure.auth_failure is not None
+                                        else (
+                                            access_failure.error
+                                            or "calendar_reconcile_access_failed"
+                                        )
+                                    )
+                                elif access_token is None or provider_account_id is None:
+                                    indeterminate_reason = "calendar_reconcile_access_failed"
+                                elif provider_account_id != receipt.provider_account_id:
+                                    indeterminate_reason = "calendar_reconcile_account_mismatch"
+                                else:
+                                    google_calendar_probe = (
+                                        receipt.capability_id,
+                                        normalized_input,
+                                        access_token,
+                                        provider_account_id,
+                                        calendar_id,
+                                        event_id,
+                                    )
+
             if agency_prepared is None:
-                now = now_fn()
-                response_payload = dict(receipt.response_payload)
-                response_payload["reconciliation"] = {
-                    "status": "indeterminate",
-                    "reason": indeterminate_reason,
-                    "checked_at": to_rfc3339(now),
-                }
-                receipt.response_payload = response_payload
-                receipt.response_digest = _json_digest(response_payload)
-                receipt.updated_at = now
+                if google_calendar_probe is not None:
+                    pass
+                else:
+                    _mark_provider_write_reconcile_indeterminate(
+                        db=db,
+                        action_attempt=action_attempt,
+                        receipt=receipt,
+                        reason=indeterminate_reason,
+                        now_fn=now_fn,
+                        new_id_fn=new_id_fn,
+                    )
+                    return True
+
+    if google_calendar_probe is not None:
+        assert google_runtime is not None
+        (
+            capability_id,
+            normalized_input,
+            access_token,
+            provider_account_id,
+            calendar_id,
+            event_id,
+        ) = google_calendar_probe
+        try:
+            provider_event = google_runtime.workspace_provider.calendar_get_event(
+                access_token=access_token,
+                calendar_id=calendar_id,
+                event_id=event_id,
+            )
+        except GoogleProviderRequestFailure as exc:
+            reason = safe_failure_reason(
+                exc.code,
+                safe_reason="calendar_reconcile_probe_failed",
+            )
+            if exc.code == "resource_not_found":
+                reason = "calendar_reconcile_resource_not_found"
+            _mark_provider_write_reconcile_indeterminate_by_receipt_id(
+                session_factory=session_factory,
+                receipt_id=receipt_id,
+                reason=reason,
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            if _google_calendar_reconcile_error_is_retryable(exc.code):
+                raise
+            return True
+        if not _google_calendar_reconcile_matches(
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            provider_event=provider_event,
+        ):
+            _mark_provider_write_reconcile_indeterminate_by_receipt_id(
+                session_factory=session_factory,
+                receipt_id=receipt_id,
+                reason="calendar_reconcile_state_mismatch",
+                now_fn=now_fn,
+                new_id_fn=new_id_fn,
+            )
+            return True
+
+        checked_at = now_fn()
+        output_payload = _google_calendar_reconcile_output(
+            capability_id=capability_id,
+            normalized_input=normalized_input,
+            provider_event=provider_event,
+            checked_at=checked_at,
+        )
+        with session_factory() as db:
+            with db.begin():
+                receipt = db.scalar(
+                    select(ProviderWriteReceiptRecord)
+                    .where(ProviderWriteReceiptRecord.id == receipt_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if receipt is None:
+                    raise RuntimeError("provider_write_receipt_not_found")
+                action_attempt = db.scalar(
+                    select(ActionAttemptRecord)
+                    .where(ActionAttemptRecord.id == receipt.action_attempt_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if action_attempt is None:
+                    raise RuntimeError("provider_write_action_attempt_not_found")
+                if receipt.status != "ambiguous":
+                    return False
+                receipt = _record_provider_write_receipt(
+                    db=db,
+                    action_attempt=action_attempt,
+                    status="succeeded",
+                    normalized_input=normalized_input,
+                    provider_account_id=provider_account_id,
+                    output_payload=output_payload,
+                    now_fn=lambda: checked_at,
+                    new_id_fn=new_id_fn,
+                )
+                action_attempt.status = "succeeded"
+                action_attempt.execution_output = receipt.response_payload
+                action_attempt.execution_error = None
+                action_attempt.updated_at = checked_at
                 _append_action_execution_event(
                     db=db,
                     action_attempt=action_attempt,
-                    event_type="evt.provider_write.reconcile_unavailable",
+                    event_type="evt.action.execution.succeeded",
                     payload_data={
                         "action_attempt_id": action_attempt.id,
+                        "output": receipt.response_payload,
                         "provider_write_receipt_id": receipt.id,
-                        "status": receipt.status,
-                        "reason": indeterminate_reason,
-                        "reconcile_task_enqueued": False,
+                        "reconciled": True,
                     },
-                    now_fn=lambda: now,
+                    now_fn=lambda: checked_at,
                     new_id_fn=new_id_fn,
                 )
                 return True
@@ -3645,6 +4019,16 @@ def process_one_call(
                         "output": execution_result.output,
                     },
                 )
+            )
+        if is_memory_capability_call:
+            memory_runtime_provenance = _memory_output_runtime_provenance(
+                capability_id=capability_id,
+                action_attempt=action_attempt,
+                output=execution_result.output,
+            )
+            ctx.result_runtime_provenance = RuntimeProvenance.merge_optional(
+                ctx.result_runtime_provenance,
+                memory_runtime_provenance,
             )
         if is_retrieval_call:
             if is_attachment_capability_call:

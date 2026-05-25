@@ -31,11 +31,12 @@ from google.cloud.pubsub_v1.subscriber.exceptions import (  # type: ignore[impor
 )
 from google.oauth2 import service_account  # type: ignore[import-untyped]
 from sqlalchemy import create_engine, select
-from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .clock import utcnow
 from .config import AppSettings
+from .db_errors import is_retryable_dbapi_failure, is_unique_constraint_failure
 from .ids import new_id
 from .google_connector import google_connected_account_subject
 from .persistence import (
@@ -48,18 +49,6 @@ from .persistence import (
 _log = logging.getLogger(__name__)
 
 SUBSCRIBER_NAME = "gmail_pubsub"
-_RETRYABLE_DB_SQLSTATES = frozenset(
-    {
-        "40001",  # serialization_failure
-        "40P01",  # deadlock_detected
-        "53300",  # too_many_connections
-        "55P03",  # lock_not_available
-        "57014",  # query_canceled
-        "57P01",  # admin_shutdown
-        "57P02",  # crash_shutdown
-        "57P03",  # cannot_connect_now
-    }
-)
 _PROVIDER_EVENT_DEDUPE_CONSTRAINT = "provider_events_dedupe_key_key"
 _HEARTBEAT_SUBSCRIBER_CONSTRAINT = "uq_subscriber_heartbeat_subscriber_name"
 
@@ -137,31 +126,6 @@ def _parse_message_payload(message: Any) -> GmailPubSubNotification:
         history_id=history_id_raw.strip(),
         publish_time_iso=publish_time.isoformat() if isinstance(publish_time, datetime) else None,
     )
-
-
-def _db_sqlstate(exc: DBAPIError) -> str | None:
-    sqlstate = getattr(exc.orig, "sqlstate", None)
-    if isinstance(sqlstate, str):
-        return sqlstate
-    pgcode = getattr(exc.orig, "pgcode", None)
-    return pgcode if isinstance(pgcode, str) else None
-
-
-def _db_constraint_name(exc: IntegrityError) -> str | None:
-    diag = getattr(exc.orig, "diag", None)
-    constraint_name = getattr(diag, "constraint_name", None)
-    return constraint_name if isinstance(constraint_name, str) else None
-
-
-def _is_retryable_dbapi_failure(exc: DBAPIError) -> bool:
-    sqlstate = _db_sqlstate(exc)
-    if sqlstate is None:
-        return isinstance(exc, OperationalError)
-    return sqlstate.startswith("08") or sqlstate in _RETRYABLE_DB_SQLSTATES
-
-
-def _is_unique_constraint_failure(exc: IntegrityError, constraint_name: str) -> bool:
-    return _db_sqlstate(exc) == "23505" and _db_constraint_name(exc) == constraint_name
 
 
 def _ack_message(message: Any) -> None:
@@ -280,11 +244,11 @@ def _persist_provider_event(
                     now=now,
                 )
     except IntegrityError as exc:
-        if not _is_unique_constraint_failure(exc, _PROVIDER_EVENT_DEDUPE_CONSTRAINT):
+        if not is_unique_constraint_failure(exc, _PROVIDER_EVENT_DEDUPE_CONSTRAINT):
             raise
         raise PubSubProviderEventPersistenceFailure() from exc
     except DBAPIError as exc:
-        if not _is_retryable_dbapi_failure(exc):
+        if not is_retryable_dbapi_failure(exc):
             raise
         raise PubSubProviderEventPersistenceFailure() from exc
     return "accepted"
@@ -338,11 +302,11 @@ def _write_heartbeat(
                     row.last_message_at = now
                 row.updated_at = now
     except IntegrityError as exc:
-        if not _is_unique_constraint_failure(exc, _HEARTBEAT_SUBSCRIBER_CONSTRAINT):
+        if not is_unique_constraint_failure(exc, _HEARTBEAT_SUBSCRIBER_CONSTRAINT):
             raise
         raise PubSubHeartbeatWriteFailure() from exc
     except DBAPIError as exc:
-        if not _is_retryable_dbapi_failure(exc):
+        if not is_retryable_dbapi_failure(exc):
             raise
         raise PubSubHeartbeatWriteFailure() from exc
 

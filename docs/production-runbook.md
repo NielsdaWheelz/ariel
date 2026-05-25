@@ -7,7 +7,8 @@ ingress.
 
 Production uses:
 
-- OpenAI Responses API only.
+- The model refs declared in `src/ariel/models.py`: `MAIN`, `RESEARCH`,
+  `VISION`, and `EMBEDDING`.
 - Discord Gateway for ambient chat, operational slash commands, buttons,
   approvals, jobs, and status. Slash commands are rails and control surfaces,
   not AI judgment surfaces.
@@ -21,7 +22,7 @@ Production follows [ai-first.md](ai-first.md): model and subagent calls own
 judgment; deterministic services own validation, authorization, idempotency,
 taint, replay, recovery, and audit.
 
-No voice, legacy model provider, Chat Completions, public Ariel API, fallback provider, or
+No voice, legacy model override env, public Ariel API, fallback provider, or
 Tailscale requirement is part of this deployment.
 
 For running an isolated local dev stack on the same host without touching the
@@ -36,6 +37,7 @@ Use a dedicated Linux user:
 
 - User: `ariel`
 - App root: `/opt/ariel`
+- App state root: `/var/lib/ariel`
 - Agency root: `/opt/agency`
 - Agency state root: `/var/lib/agency`
 - Env file: `/etc/ariel/ariel.env`
@@ -64,6 +66,32 @@ apt-get install -y caddy git postgresql postgresql-contrib
 8. Install the Agency binary at `/opt/agency/bin/agency`, owned by `root`
    and executable by the `ariel` service user. The checked-in
    `deploy/systemd/agency-daemon.service` runs this binary directly.
+
+## Cutover From A User Checkout
+
+If the host is still running ad hoc services as a human user from
+`/home/<user>/src/personal/ariel`, do not copy that shape into production.
+Cut over to the canonical layout first:
+
+1. Commit or otherwise preserve the exact Ariel revision to deploy.
+2. From `/opt/ariel`, install the checked-in production service scaffold:
+
+   ```sh
+   sudo bash scripts/install_production_services.sh
+   ```
+
+   This creates the `ariel` user when missing, prepares root-owned install
+   roots under `/opt`, writable runtime state under `/var/lib/ariel` and
+   `/var/lib/agency`, installs the checked-in systemd units, and reloads
+   systemd. It does not start services.
+3. Build `/etc/ariel/ariel.env` from the rotated production secrets and set file
+   mode `0640`, owned by `root:ariel`.
+4. Install `runsc` on the host `PATH`, install Agency at
+   `/opt/agency/bin/agency`, and install Ariel dependencies in `/opt/ariel`.
+5. Stop the old user-scoped Ariel and Agency processes only after the canonical
+   services are installed and ready to start.
+6. Enable the checked-in systemd units, run `make production-posture`, then run
+   the Discord and Agency smokes below.
 
 ## Sandbox Runtime
 
@@ -133,17 +161,16 @@ ARIEL_CONNECTOR_ENCRYPTION_SECRET=<non-dev-connector-secret>
 ARIEL_CONNECTOR_ENCRYPTION_KEY_VERSION=v1
 ARIEL_CONNECTOR_ENCRYPTION_KEYS='{"v1":"<base64url-16-24-or-32-byte-key>"}'
 ARIEL_OPENAI_API_KEY=<openai-api-key>
-ARIEL_MODEL_NAME=gpt-5.5
+ARIEL_GOOGLE_API_KEY=<google-api-key>
+ARIEL_OPENROUTER_API_KEY=<openrouter-api-key>
 ARIEL_MODEL_REASONING_EFFORT=medium
-ARIEL_MODEL_VERBOSITY=low
 ARIEL_MODEL_TIMEOUT_SECONDS=<seconds>
+ARIEL_ATTACHMENT_BLOB_STORE_PATH=/var/lib/ariel/attachment-blobs
 ```
 
 Required memory settings:
 
 ```sh
-ARIEL_MEMORY_EMBEDDING_PROVIDER=openai
-ARIEL_MEMORY_EMBEDDING_MODEL=text-embedding-3-small
 ARIEL_MEMORY_EMBEDDING_DIMENSIONS=1536
 ```
 
@@ -182,6 +209,25 @@ Set `ARIEL_AGENCY_EVENT_SECRET=<shared-event-secret>` only when signed
 daemon socket capabilities still run, but the public Agency event route returns
 `E_AGENCY_EVENTS_DISABLED`.
 
+Bootstrap Agency state as the `ariel` service user before enabling the daemon:
+
+```sh
+sudo -u ariel env AGENCY_DATA_DIR=/var/lib/agency \
+  HOME=/var/lib/agency CODEX_HOME=/var/lib/agency/.codex \
+  /opt/agency/bin/agency repo add /opt/ariel
+sudo -u ariel env AGENCY_DATA_DIR=/var/lib/agency \
+  HOME=/var/lib/agency CODEX_HOME=/var/lib/agency/.codex \
+  /opt/agency/bin/agency repo add /opt/agency
+sudo -u ariel env AGENCY_DATA_DIR=/var/lib/agency \
+  HOME=/var/lib/agency CODEX_HOME=/var/lib/agency/.codex \
+  /opt/agency/bin/agency repo ls --json
+```
+
+The Agency daemon must have its runner and Codex configuration available under
+the same environment used by `agency-daemon.service`. If a user-scoped Agency
+daemon was used during recovery, disable it after the system daemon is healthy
+and Ariel has been repointed at `/var/lib/agency/agencyd.sock`.
+
 Required worker settings:
 
 ```sh
@@ -189,7 +235,7 @@ ARIEL_WORKER_POLL_SECONDS=1.0
 ARIEL_PROVIDER_RECONCILE_SYNC_INTERVAL_SECONDS=3600
 ```
 
-Required Google Workspace push settings when Gmail/Calendar push is enabled:
+Required Google Workspace push settings:
 
 ```sh
 ARIEL_GOOGLE_OAUTH_CLIENT_ID=<google-oauth-client-id>
@@ -209,8 +255,9 @@ configured explicitly by `ARIEL_GOOGLE_OAUTH_REDIRECT_URI` and must match the
 Google OAuth client. Calendar push callbacks are authenticated by the per-watch
 `X-Goog-Channel-Token` values stored with active watch-channel records.
 `ARIEL_GOOGLE_PUBSUB_TOPIC`, `ARIEL_GOOGLE_PUBSUB_SUBSCRIPTION`, and
-`ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` must be set together: all three for
-Gmail push on, none for off.
+`ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH` are a required group for canonical
+production posture. Local/development settings may leave all three unset, but
+production posture requires all three.
 
 The single-threaded `ariel-worker` service drains the one `background_tasks`
 queue: scheduled agent wakes, provider push and poll ingestion, `memory_encode`,
@@ -233,13 +280,16 @@ Set provider keys only for enabled capabilities:
 
 ```sh
 ARIEL_SEARCH_WEB_API_KEY=<brave-api-key>
+ARIEL_JINA_API_KEY=<jina-api-key>
 ARIEL_MAPS_API_KEY=<google-maps-platform-api-key>
 ARIEL_WEATHER_PROVIDER_MODE=production
 ARIEL_WEATHER_PRODUCTION_API_KEY=<weather-api-key>
 ```
 
-The model runtime is OpenAI Responses only. Keep model settings to the current
-`ARIEL_OPENAI_*` and `ARIEL_MODEL_*` fields in `src/ariel/config.py`.
+The model runtime follows the checked-in refs in `src/ariel/models.py`. Keep
+provider keys to the current refs: `MAIN` and `RESEARCH` currently require
+OpenRouter, `VISION` currently requires Google, and `EMBEDDING` currently
+requires OpenAI.
 
 Restrict `ARIEL_MAPS_API_KEY` in the Google Cloud console to the Routes API, Places API
 (New), and Geocoding API, and to this deployment's egress IP address. An unrestricted Maps
@@ -355,13 +405,23 @@ The checked-in `agency-daemon.service` starts
 All Ariel services use:
 
 - `User=ariel`
+- `Group=ariel`
 - `WorkingDirectory=/opt/ariel`
 - `EnvironmentFile=/etc/ariel/ariel.env`
 - `Restart=always`
 - `RestartSec=5`
 - `NoNewPrivileges=true`
+- `PrivateTmp=true`
+- `PrivateDevices=true`
 - `ProtectSystem=full`
-- no Linux capabilities
+- `ProtectHome=true`
+- `ProtectControlGroups=true`
+- `ProtectKernelTunables=true`
+- `ProtectKernelModules=true`
+- `RestrictSUIDSGID=true`
+- `LockPersonality=true`
+- `CapabilityBoundingSet=` with no Linux capabilities
+- `SystemCallArchitectures=native`
 
 `ariel-api` hosts the in-process `run` sandbox, so its unit must reach `runsc`
 on `PATH`. Installing `runsc` to `/usr/local/bin` satisfies this; otherwise add
@@ -378,6 +438,7 @@ Service ordering:
 Start or restart with:
 
 ```sh
+sudo bash scripts/install_production_services.sh
 systemctl daemon-reload
 systemctl enable --now agency-daemon ariel-api ariel-worker ariel-pubsub ariel-discord
 systemctl restart ariel-api ariel-worker ariel-pubsub ariel-discord
@@ -385,9 +446,13 @@ make production-posture
 ```
 
 `make production-posture` checks systemd state, Ariel unit hardening, the Agency
-daemon/socket, and loopback health without loading the Ariel env file. Add
-`--check-db-schema` to `scripts/verify_production_posture.py` only when a direct
-database readiness check is needed.
+daemon/socket, loopback health, canonical install/state roots, and
+`/etc/ariel/ariel.env` as a production `AppSettings` source. It rejects stale
+unknown `ARIEL_*` names, non-production settings, non-canonical Agency roots,
+and missing required production env vars, including current checked-in model
+provider keys. Add `--check-db-schema` to
+`scripts/verify_production_posture.py` only when a direct database readiness
+check is needed.
 
 ## Caddy And TLS
 
@@ -461,8 +526,8 @@ curl -X POST -H "Authorization: Bearer ${ARIEL_LOCAL_AUTH_TOKEN}" 'http://127.0.
 System health:
 
 ```sh
-systemctl is-active postgresql agency-daemon ariel-api ariel-worker ariel-discord
-journalctl -u ariel-api -u ariel-worker -u ariel-discord -u agency-daemon --since -15m
+systemctl is-active postgresql agency-daemon ariel-api ariel-worker ariel-pubsub ariel-discord
+journalctl -u ariel-api -u ariel-worker -u ariel-pubsub -u ariel-discord -u agency-daemon --since -15m
 ```
 
 Network health:
@@ -478,7 +543,7 @@ Expected state:
 - Discord bot is connected over Gateway.
 - Agency socket exists at `ARIEL_AGENCY_SOCKET_PATH`.
 - Postgres accepts local connections.
-- No Chat Completions or legacy provider configuration is present.
+- No legacy provider override or fallback provider configuration is present.
 
 Functional health:
 
@@ -507,7 +572,7 @@ systemctl stop ariel-discord
 2. Stop workers if they are executing unsafe or unwanted work:
 
 ```sh
-systemctl stop ariel-worker
+systemctl stop ariel-worker ariel-pubsub
 ```
 
 3. Restore the previous Ariel revision in `/opt/ariel`.
@@ -518,6 +583,7 @@ systemctl stop ariel-worker
 ```sh
 systemctl restart ariel-api
 systemctl restart ariel-worker
+systemctl restart ariel-pubsub
 systemctl restart ariel-discord
 ```
 
@@ -546,10 +612,11 @@ Discord:
 - Confirm ambient owner DMs and configured home-guild messages are accepted.
 - Re-issue status messages for active jobs when needed.
 
-OpenAI:
+Model providers:
 
-- Confirm `ARIEL_OPENAI_API_KEY` is valid.
-- Confirm Responses calls use `store: false`.
+- Confirm the current `MAIN`, `RESEARCH`, `VISION`, and `EMBEDDING` provider keys from
+  `src/ariel/models.py` are valid.
+- Confirm hosted model calls do not opt into provider-side storage.
 - Do not persist raw reasoning items during incident capture.
 
 Worker:
@@ -569,16 +636,17 @@ Worker:
   through one configured home guild plus owner DMs.
 - No `/ariel` or `/ask` AI slash commands are registered; `/status`, `/jobs`, and
   `/capture` are deterministic operational rails only.
-- Responses API is the only production model path.
-- No legacy provider, Chat Completions, compatibility flag, or fallback provider is
-  configured.
+- Production model paths are limited to the checked-in `MAIN`, `RESEARCH`,
+  `VISION`, and `EMBEDDING` refs in `src/ariel/models.py`.
+- No legacy provider override, compatibility flag, or fallback provider is configured.
 - Every internal capability call goes through validation, policy, egress checks,
   audit logging, and the approval path when required.
 - Agency work starts through the `agency.*` run callables and the local daemon socket.
 - `ARIEL_AGENCY_ALLOWED_REPO_ROOTS` contains only approved absolute repo roots.
 - Postgres survives process restarts with conversations, jobs, approvals, memory, and
   Agency identifiers intact.
-- systemd restarts all four services after process failure or host reboot.
+- systemd restarts Agency and all four Ariel services after process failure or
+  host reboot.
 - Caddy exposes only required callback routes over TLS.
 - `make verify` passes for the deployed revision, including the required eval groups.
 - A Discord smoke test, an approval-button test, and an Agency smoke job pass after

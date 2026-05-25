@@ -29,6 +29,7 @@ from .app import (
 from .capability_registry import REMEMBERER_CAPABILITY_IDS, capability_action_label
 from .clock import utcnow
 from .config import AppSettings
+from .discord_actions import approval_custom_id
 from .google_connector import (
     GOOGLE_CONNECTOR_ID,
     GoogleWatchRegistrationFailure,
@@ -178,13 +179,13 @@ def _deliver_to_discord(
                         "type": 2,
                         "style": 3,
                         "label": "Approve",
-                        "custom_id": f"ariel:approval:approve:{entry['ref']}",
+                        "custom_id": approval_custom_id("approve", str(entry["ref"])),
                     },
                     {
                         "type": 2,
                         "style": 4,
                         "label": "Deny",
-                        "custom_id": f"ariel:approval:deny:{entry['ref']}",
+                        "custom_id": approval_custom_id("deny", str(entry["ref"])),
                     },
                 ],
             }
@@ -563,6 +564,7 @@ def process_one_task(
                     session_factory=session_factory,
                     task_payload=task_payload,
                     agency_runtime=build_agency_runtime(resolved_settings),
+                    google_runtime=build_google_runtime(resolved_settings),
                     now_fn=utcnow,
                     new_id_fn=new_id,
                 )
@@ -929,7 +931,7 @@ def _process_agency_event_received(
                 agency_event.status = "failed"
                 agency_event.error = "job event missing external_job_id"
                 agency_event.processed_at = now
-                raise RuntimeError("job event missing external_job_id")
+                return
 
             status = _job_status_for_event(agency_event.event_type)
             payload = dict(agency_event.payload)

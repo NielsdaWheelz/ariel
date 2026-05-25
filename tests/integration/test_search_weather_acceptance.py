@@ -34,8 +34,8 @@ from tests.integration.responses_helpers import (
 
 
 class ActionRunAdapter(FakeModelAdapter):
-    provider = "provider.news-weather"
-    model = "model.news-weather-v1"
+    provider = "provider.search-weather"
+    model = "model.search-weather-v1"
 
     def __init__(
         self,
@@ -54,11 +54,8 @@ class ActionRunAdapter(FakeModelAdapter):
                 provider=self.provider, model=self.model, messages=request.messages
             )
         assistant_text = {
-            "news update": "EU AI transparency and enforcement updates are active [1][2].",
             "web search fixture": "The product launch page is indexed [1].",
             "search egress deny": "blocked: egress_destination_denied",
-            "news egress deny": "blocked: egress_destination_denied",
-            "news recency": "Freshness note: one source is stale and one has missing or ambiguous timing [1][2].",
             "weather explicit": "Tokyo tomorrow forecast timestamp 2026-03-03T13:00:00Z [1].",
             "weather missing location": "Which city or location should I use?",
             "weather timeout": "uncertain because the weather provider timed out; retry later.",
@@ -73,7 +70,7 @@ class ActionRunAdapter(FakeModelAdapter):
             calls=copy.deepcopy(run_calls),
             provider=self.provider,
             model=self.model,
-            provider_response_id="resp_news_weather_123",
+            provider_response_id="resp_search_weather_123",
             input_tokens=34,
             output_tokens=19,
         )
@@ -259,6 +256,14 @@ def test_search_web_executes_against_brave_provider_with_citations(
         assert len(sources) == 1
         assert sources[0]["title"] == "Product launch page"
         assert sources[0]["source"] == "https://example.com/product-launch"
+        artifact = client.get(f"/v1/artifacts/{sources[0]['artifact_id']}")
+        assert artifact.status_code == 200
+        artifact_payload = artifact.json()["artifact"]
+        assert artifact_payload["id"] == sources[0]["artifact_id"]
+        assert artifact_payload["title"] == sources[0]["title"]
+        assert artifact_payload["source"] == sources[0]["source"]
+        assert artifact_payload["retrieved_at"] == sources[0]["retrieved_at"]
+        assert artifact_payload["published_at"] == sources[0]["published_at"]
 
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.search.web"
@@ -276,91 +281,13 @@ def test_search_web_executes_against_brave_provider_with_citations(
     assert FakeBraveProvider.last_request.limit == 5
 
 
-def test_news_results_have_sources_citations_and_allowlisted_read_lifecycle(
+def test_search_web_egress_fails_closed_before_execute(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(_: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "query": "ai regulation europe",
-                "retrieved_at": "2026-03-03T12:00:00Z",
-                "results": [
-                    {
-                        "title": "EU lawmakers finalize AI transparency package",
-                        "source": "https://example.com/eu-ai-package",
-                        "snippet": "European lawmakers reached a final text for AI transparency rules.",
-                        "published_at": "2026-03-03T10:00:00Z",
-                    },
-                    {
-                        "title": "National regulators coordinate AI enforcement",
-                        "source": "https://example.com/ai-enforcement",
-                        "snippet": "Regulators announced a joint enforcement calendar for 2026.",
-                        "published_at": "2026-03-03T09:15:00Z",
-                    },
-                ],
-            }
-
-        return replace(capability, execute=execute)
-
-    _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
-
-    adapter = ActionRunAdapter(
-        run_calls_by_message={
-            "news update": [
-                {
-                    "name": "search.news",
-                    "input": {"query": "ai regulation europe"},
-                }
-            ]
-        }
-    )
-    with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="news update")
-        turn_data = _turn_data(client, session_id)
-
-        assert "[1]" in turn_data["assistant_message"]
-        assert "[2]" in turn_data["assistant_message"]
-
-        sources = _turn_sources(client, turn_data["id"])
-        assert isinstance(sources, list)
-        assert len(sources) == 2
-        for source in sources:
-            assert isinstance(source, dict)
-            _assert_source_contract(source)
-            assert source["published_at"] is not None
-
-        attempt = _surface_attempt(turn_data)
-        assert attempt["proposal"]["capability_id"] == "cap.search.news"
-        assert attempt["policy"]["decision"] == "allow_inline"
-        assert attempt["execution"]["status"] == "succeeded"
-
-        for source in sources:
-            artifact = client.get(f"/v1/artifacts/{source['artifact_id']}")
-            assert artifact.status_code == 200
-            artifact_payload = artifact.json()["artifact"]
-            assert artifact_payload["id"] == source["artifact_id"]
-            assert artifact_payload["title"] == source["title"]
-            assert artifact_payload["source"] == source["source"]
-            assert artifact_payload["retrieved_at"] == source["retrieved_at"]
-            assert artifact_payload["published_at"] == source["published_at"]
-
-
-@pytest.mark.parametrize(
-    ("capability_id", "syscall", "message"),
-    [
-        ("cap.search.web", "search.web", "search egress deny"),
-        ("cap.search.news", "search.news", "news egress deny"),
-    ],
-)
-def test_search_web_and_news_egress_fails_closed_before_execute(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-    capability_id: str,
-    syscall: str,
-    message: str,
-) -> None:
+    capability_id = "cap.search.web"
+    syscall = "search.web"
+    message = "search egress deny"
     capability_execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
@@ -407,60 +334,6 @@ def test_search_web_and_news_egress_fails_closed_before_execute(
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
         assert capability_execute_attempts == 0
-
-
-def test_news_recency_discloses_stale_and_ambiguous_timing(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
-        def execute(_: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "query": "battery market updates",
-                "retrieved_at": "2026-03-03T12:00:00Z",
-                "results": [
-                    {
-                        "title": "Quarterly battery market wrap",
-                        "source": "https://example.com/battery-quarterly",
-                        "snippet": "Battery prices fell across several regions this quarter.",
-                        "published_at": "2025-10-15T08:00:00Z",
-                    },
-                    {
-                        "title": "Supply chain bulletin",
-                        "source": "https://example.com/supply-bulletin",
-                        "snippet": "Multiple exporters reported new shipping constraints this week.",
-                        "published_at": None,
-                    },
-                ],
-            }
-
-        return replace(capability, execute=execute)
-
-    _patch_capability_lookup(monkeypatch, capability_id="cap.search.news", mutate=mutate)
-
-    adapter = ActionRunAdapter(
-        run_calls_by_message={
-            "news recency": [
-                {
-                    "name": "search.news",
-                    "input": {"query": "battery market updates"},
-                }
-            ]
-        }
-    )
-    with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="news recency")
-        turn_data = _turn_data(client, session_id)
-
-        message = turn_data["assistant_message"].lower()
-        assert "freshness" in message
-        assert "stale" in message
-        assert "missing" in message or "ambiguous" in message
-
-        sources = _turn_sources(client, turn_data["id"])
-        assert len(sources) == 2
-        assert any(source["published_at"] is None for source in sources)
 
 
 def test_weather_explicit_location_wins_and_response_contains_location_timeframe_and_timestamps(
@@ -589,17 +462,14 @@ def test_weather_without_resolvable_location_asks_clarification_instead_of_guess
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("ARIEL_WEATHER_DEFAULT_LOCATION", raising=False)
+    execute_attempts = 0
 
     def mutate(capability: CapabilityDefinition) -> CapabilityDefinition:
         def execute(input_payload: dict[str, Any]) -> dict[str, Any]:
-            if input_payload.get("location") is None:
-                raise CapabilityExecutionError("weather_location_required")
-            return _weather_output(
-                input_payload,
-                forecast_time="2026-03-03T13:00:00Z",
-                retrieved_at="2026-03-03T12:59:30Z",
-                summary="Weather forecast available.",
-            )
+            nonlocal execute_attempts
+            execute_attempts += 1
+            del input_payload
+            raise AssertionError("weather execution should not run without a resolved location")
 
         return replace(capability, execute=execute)
 
@@ -631,7 +501,10 @@ def test_weather_without_resolvable_location_asks_clarification_instead_of_guess
 
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.weather.forecast"
-        assert attempt["execution"]["status"] in {"failed", "not_executed"}
+        assert attempt["policy"]["decision"] == "deny"
+        assert attempt["policy"]["reason"] == "weather_location_required"
+        assert attempt["execution"]["status"] == "not_executed"
+        assert execute_attempts == 0
 
 
 def test_weather_upstream_failure_is_explicit_and_recoverable(

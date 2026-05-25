@@ -127,69 +127,8 @@ def test_search_web_maps_provider_results_to_search_results_v1(
     assert _FakeProvider.last_request.limit == 5
 
 
-def test_search_news_uses_news_result_type_and_preserves_egress_preflight(
+def test_search_provider_errors_map_to_execution_errors(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_search_tool(monkeypatch)
-    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "shared-key")
-    monkeypatch.setenv("ARIEL_SEARCH_BRAVE_BASE_URL", "https://search.example.test/res/v1")
-    _FakeProvider.response = WebSearchResponse(
-        provider="brave",
-        provider_request_id="req_test",
-        retrieved_at="2026-04-27T13:00:00Z",
-        results=(
-            _result(
-                title="News",
-                url="https://publisher.test/story",
-                snippet="Story",
-                published_at="2026-04-27T12:30:00Z",
-            ),
-        ),
-    )
-
-    capability = registry.get_capability("cap.search.news")
-    assert capability is not None
-    assert capability.execute is not None
-    assert capability.declare_egress_intent is not None
-    output = capability.execute({"query": "news query"})
-
-    assert capability.allowed_egress_destinations == ("search.example.test",)
-    assert capability.declare_egress_intent({"query": "news query"}) == [
-        {
-            "destination": "https://search.example.test/res/v1/news/search",
-            "payload": {"query": "news query"},
-        }
-    ]
-    assert output == {
-        "query": "news query",
-        "retrieved_at": "2026-04-27T13:00:00Z",
-        "results": [
-            {
-                "title": "News",
-                "source": "https://publisher.test/story",
-                "snippet": "Story",
-                "published_at": "2026-04-27T12:30:00Z",
-            }
-        ],
-        "status": "succeeded",
-    }
-    assert _FakeProvider.last_request is not None
-    assert _FakeProvider.last_request.query == "news query"
-    assert _FakeProvider.last_request.result_type == registry.WebSearchResultType.NEWS
-    assert _FakeProvider.last_request.limit == 5
-
-
-@pytest.mark.parametrize(
-    ("capability_id", "expected_error"),
-    [
-        ("cap.search.web", "search provider rate limited"),
-        ("cap.search.news", "news provider rate limited"),
-    ],
-)
-def test_search_provider_errors_map_to_execution_errors_by_capability(
-    monkeypatch: pytest.MonkeyPatch,
-    capability_id: str,
-    expected_error: str,
 ) -> None:
     _install_fake_search_tool(monkeypatch)
     monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "test-key")
@@ -199,16 +138,15 @@ def test_search_provider_errors_map_to_execution_errors_by_capability(
         provider="test",
     )
 
-    with pytest.raises(registry.CapabilityExecutionError, match=expected_error):
-        capability = registry.get_capability(capability_id)
+    with pytest.raises(registry.CapabilityExecutionError, match="search provider rate limited"):
+        capability = registry.get_capability("cap.search.web")
         assert capability is not None
         assert capability.execute is not None
         capability.execute({"query": "example query"})
 
 
-@pytest.mark.parametrize("capability_id", ["cap.search.web", "cap.search.news"])
-def test_search_web_and_news_validate_query_only_inputs(capability_id: str) -> None:
-    capability = registry.get_capability(capability_id)
+def test_search_web_validates_query_only_inputs() -> None:
+    capability = registry.get_capability("cap.search.web")
     assert capability is not None
 
     normalized, error = capability.validate_input({"query": "  launch plan  "})
@@ -217,7 +155,6 @@ def test_search_web_and_news_validate_query_only_inputs(capability_id: str) -> N
     assert normalized == {"query": "launch plan"}
 
 
-@pytest.mark.parametrize("capability_id", ["cap.search.web", "cap.search.news"])
 @pytest.mark.parametrize(
     "payload",
     [
@@ -231,10 +168,10 @@ def test_search_web_and_news_validate_query_only_inputs(capability_id: str) -> N
         {"query": "x" * 1001},
     ],
 )
-def test_search_web_and_news_reject_non_query_or_malformed_inputs(
-    capability_id: str,
+def test_search_web_rejects_non_query_or_malformed_inputs(
     payload: dict[str, Any],
 ) -> None:
+    capability_id = "cap.search.web"
     capability = registry.get_capability(capability_id)
     assert capability is not None
 
@@ -244,40 +181,31 @@ def test_search_web_and_news_reject_non_query_or_malformed_inputs(
     assert error == "schema_invalid"
 
 
-@pytest.mark.parametrize(
-    ("endpoint", "should_send_key"),
-    [
-        ("", True),
-        ("https://extract.example.test/v1/extract", False),
-    ],
-)
-def test_web_extract_sends_brave_key_only_to_brave_endpoint(
+def test_web_extract_calls_jina_reader_with_bearer_key(
     monkeypatch: pytest.MonkeyPatch,
-    endpoint: str,
-    should_send_key: bool,
 ) -> None:
     class _Response:
         status_code = 200
 
         def json(self) -> dict[str, Any]:
             return {
-                "document": {
+                "code": 200,
+                "data": {
                     "url": "https://example.com/article",
                     "title": "Example",
                     "content": "Extracted article body.",
-                }
+                },
             }
 
-    seen_headers: dict[str, str] = {}
+    seen: dict[str, Any] = {}
 
-    def fake_post(*args: Any, **kwargs: Any) -> _Response:
-        del args
-        seen_headers.update(kwargs["headers"])
+    def fake_get(url: str, **kwargs: Any) -> _Response:
+        seen["url"] = url
+        seen["headers"] = kwargs["headers"]
         return _Response()
 
-    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "shared-brave-key")
-    monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", endpoint)
-    monkeypatch.setattr(registry.httpx, "post", fake_post)
+    monkeypatch.setenv("ARIEL_JINA_API_KEY", "jina-test-key")
+    monkeypatch.setattr(registry.httpx, "get", fake_get)
 
     capability = registry.get_capability("cap.web.extract")
     assert capability is not None
@@ -285,7 +213,65 @@ def test_web_extract_sends_brave_key_only_to_brave_endpoint(
     output = capability.execute({"url": "https://example.com/article"})
 
     assert output["status"] == "succeeded"
-    assert ("x-subscription-token" in seen_headers) is should_send_key
+    assert seen["url"] == "https://r.jina.ai/https://example.com/article"
+    assert seen["headers"]["authorization"] == "Bearer jina-test-key"
+    assert seen["headers"]["accept"] == "application/json"
+
+
+def test_web_extract_validator_normalizes_public_urls_at_input_boundary() -> None:
+    capability = registry.get_capability("cap.web.extract")
+    assert capability is not None
+
+    normalized, error = capability.validate_input({"url": "  HTTPS://Example.COM/path#frag  "})
+
+    assert error is None
+    assert normalized == {"url": "https://example.com/path"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_error"),
+    [
+        ({"url": "definitely-not-a-url"}, "url_invalid"),
+        ({"url": "ftp://example.com/resource"}, "url_scheme_unsupported"),
+        ({"url": "http://127.0.0.1/private"}, "url_destination_unsafe"),
+        ({"url": "https://example.com:invalid-port/path"}, "url_invalid"),
+    ],
+)
+def test_web_extract_validator_rejects_unsafe_urls_with_typed_errors(
+    payload: dict[str, Any],
+    expected_error: str,
+) -> None:
+    capability = registry.get_capability("cap.web.extract")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == expected_error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"q": "https://example.com"},
+        {"url": "https://example.com", "limit": 5},
+        {"url": ""},
+        {"url": "   "},
+        {"url": 123},
+        {"url": "https://example.com/" + ("x" * 2049)},
+    ],
+)
+def test_web_extract_validator_keeps_shape_failures_schema_invalid(
+    payload: dict[str, Any],
+) -> None:
+    capability = registry.get_capability("cap.web.extract")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == "schema_invalid"
 
 
 def test_weather_dev_adapter_parses_wttr_payload_without_api_key(
@@ -332,6 +318,17 @@ def test_weather_dev_adapter_parses_wttr_payload_without_api_key(
         "timestamp": "2026-05-24T00:00:00Z",
     }
     assert output["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("payload", [{"timeframe": "today"}, {"location": ""}])
+def test_weather_validator_requires_resolved_location(payload: dict[str, Any]) -> None:
+    capability = registry.get_capability("cap.weather.forecast")
+    assert capability is not None
+
+    normalized, error = capability.validate_input(payload)
+
+    assert normalized is None
+    assert error == "weather_location_required"
 
 
 def test_weather_production_adapter_parses_tomorrow_io_payload(

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from ariel.app import build_google_runtime
 from ariel.clock import utcnow
@@ -30,6 +31,11 @@ from tests.integration.responses_helpers import (
     responses_with_run_calls,
 )
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from ariel.persistence import (
+    GoogleProviderObjectRecord,
+    ProviderEvidenceBlockRecord,
+    ProviderEvidenceRecord,
+)
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
@@ -1722,6 +1728,305 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
                 assert output["message"]["provider_account_id"] == "sub_reads"
                 assert "payment confirmed" not in rendered_message
                 assert "email msg-1" in rendered_message
+
+
+def test_email_read_restores_same_digest_provider_evidence(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "open restored item": [{"name": "email.read", "input": {"message_id": "msg-1"}}]
+        },
+        assistant_text_by_message={"open restored item": "email msg-1 is available."},
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-restore-read": FakeTokenBundle(
+                account_subject="sub_restore_read",
+                account_email="restore@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_restore",
+                refresh_token="tok_refresh_restore",
+            )
+        }
+    )
+    workspace_provider = FakeGoogleWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
+    published_at = datetime(2026, 3, 2, 9, 0, tzinfo=UTC)
+    now = utcnow()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-restore-read")
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                provider_object = GoogleProviderObjectRecord(
+                    id="gpo_restore_read",
+                    provider_account_id="sub_restore_read",
+                    object_type="gmail_message",
+                    external_id="msg-1",
+                    thread_external_id="thr-1",
+                    calendar_id=None,
+                    ical_uid=None,
+                    status="active",
+                    source_timestamp=published_at,
+                    observed_at=now,
+                    provider_url="https://mail.google.com/mail/u/0/#all/msg-1",
+                    metadata_json={"subject": "stale"},
+                    content_digest="e" * 64,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(provider_object)
+                db.flush()
+                db.add_all(
+                    [
+                        ProviderEvidenceRecord(
+                            id="pev_restore_same",
+                            provider_object_id=provider_object.id,
+                            provider="google",
+                            provider_account_id="sub_restore_read",
+                            source_kind="gmail_message",
+                            external_id="msg-1",
+                            thread_external_id="thr-1",
+                            calendar_id=None,
+                            source_uri=provider_object.provider_url,
+                            source_timestamp=published_at,
+                            content_digest="f" * 64,
+                            metadata_json={"decode_notes": ["stale"]},
+                            taint="provider_untrusted",
+                            sensitivity="private",
+                            retention_policy="provider_source",
+                            extraction_status="failed",
+                            lifecycle_state="superseded",
+                            observed_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        ),
+                        ProviderEvidenceRecord(
+                            id="pev_restore_newer",
+                            provider_object_id=provider_object.id,
+                            provider="google",
+                            provider_account_id="sub_restore_read",
+                            source_kind="gmail_message",
+                            external_id="msg-1",
+                            thread_external_id="thr-1",
+                            calendar_id=None,
+                            source_uri=provider_object.provider_url,
+                            source_timestamp=published_at,
+                            content_digest="0" * 64,
+                            metadata_json={"decode_notes": []},
+                            taint="provider_untrusted",
+                            sensitivity="private",
+                            retention_policy="provider_source",
+                            extraction_status="extracted",
+                            lifecycle_state="available",
+                            observed_at=now,
+                            created_at=now,
+                            updated_at=now,
+                        ),
+                    ]
+                )
+
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="open restored item")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        output = attempt["execution"]["output"]
+
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                restored = db.get(ProviderEvidenceRecord, "pev_restore_same")
+                superseded = db.get(ProviderEvidenceRecord, "pev_restore_newer")
+                block = db.scalar(
+                    select(ProviderEvidenceBlockRecord).where(
+                        ProviderEvidenceBlockRecord.evidence_id == "pev_restore_same"
+                    )
+                )
+
+    assert attempt["policy"]["decision"] == "allow_inline"
+    assert attempt["approval"]["status"] == "not_requested"
+    assert attempt["execution"]["status"] == "succeeded"
+    assert output["provider_evidence_refs"][0]["provider_evidence_id"] == "pev_restore_same"
+    assert restored is not None
+    assert restored.lifecycle_state == "available"
+    assert restored.extraction_status == "pending"
+    assert superseded is not None
+    assert superseded.lifecycle_state == "superseded"
+    assert block is not None
+    assert block.text == "body preview: payment confirmed for invoice #44"
+    assert "payment confirmed" not in turn_data["assistant_message"]
+
+
+def test_calendar_list_same_digest_cancellation_marks_evidence_deleted(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CancelledEventWorkspaceProvider(FakeGoogleWorkspaceProvider):
+        def calendar_list(
+            self,
+            *,
+            access_token: str,
+            normalized_input: dict[str, Any],
+            provider_account_id: str,
+        ) -> dict[str, Any]:
+            del access_token, normalized_input
+            return {
+                "schema_version": "google.calendar.events.v1",
+                "status": "succeeded",
+                "window_start": "2026-03-04T00:00:00Z",
+                "window_end": "2026-03-05T00:00:00Z",
+                "events": [
+                    {
+                        "provider_account_id": provider_account_id,
+                        "calendar_id": "primary",
+                        "event_id": "evt-cancelled",
+                        "ical_uid": None,
+                        "recurring_event_id": "evt-recurring",
+                        "status": "cancelled",
+                        "summary": None,
+                        "description_blocks": [],
+                        "organizer": None,
+                        "creator": None,
+                        "attendees": [],
+                        "start": {"value": None, "timezone": None, "all_day": False},
+                        "end": {"value": None, "timezone": None, "all_day": False},
+                        "all_day": False,
+                        "recurrence": [],
+                        "location": None,
+                        "conference_data": None,
+                        "reminders": None,
+                        "updated": "2026-03-03T09:00:00Z",
+                        "etag": None,
+                        "provider_url": None,
+                        "hangout_link": None,
+                        "raw_payload_digest": "9" * 64,
+                    }
+                ],
+                "retrieved_at": "2026-03-03T12:00:00Z",
+            }
+
+    adapter = ActionProposalAdapter(
+        run_calls_by_message={
+            "show cancelled event": [
+                {
+                    "name": "calendar.list",
+                    "input": {
+                        "window_start": "2026-03-04T00:00:00Z",
+                        "window_end": "2026-03-05T00:00:00Z",
+                    },
+                }
+            ]
+        },
+        assistant_text_by_message={"show cancelled event": "calendar updated."},
+    )
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-cancelled-event": FakeTokenBundle(
+                account_subject="sub_cancelled_event",
+                account_email="cancelled@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_cancelled",
+                refresh_token="tok_refresh_cancelled",
+            )
+        }
+    )
+    workspace_provider = CancelledEventWorkspaceProvider()
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime",
+        lambda settings: build_google_runtime(
+            settings,
+            oauth_client=oauth_client,
+            workspace_provider=cast(GoogleWorkspaceProvider, workspace_provider),
+        ),
+    )
+    updated_at = datetime(2026, 3, 3, 9, 0, tzinfo=UTC)
+    now = utcnow()
+    with _build_client(postgres_url, adapter) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=workspace_provider,
+        )
+        _connect_google(client, code="connect-cancelled-event")
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                provider_object = GoogleProviderObjectRecord(
+                    id="gpo_cancelled_event",
+                    provider_account_id="sub_cancelled_event",
+                    object_type="calendar_event",
+                    external_id="evt-cancelled",
+                    thread_external_id=None,
+                    calendar_id="primary",
+                    ical_uid=None,
+                    status="active",
+                    source_timestamp=updated_at,
+                    observed_at=now,
+                    provider_url=None,
+                    metadata_json={"summary": "old value"},
+                    content_digest="9" * 64,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(provider_object)
+                db.flush()
+                db.add(
+                    ProviderEvidenceRecord(
+                        id="pev_cancelled_event",
+                        provider_object_id=provider_object.id,
+                        provider="google",
+                        provider_account_id="sub_cancelled_event",
+                        source_kind="calendar_event",
+                        external_id="evt-cancelled",
+                        thread_external_id=None,
+                        calendar_id="primary",
+                        source_uri=None,
+                        source_timestamp=updated_at,
+                        content_digest="9" * 64,
+                        metadata_json={"summary": "old value", "status": "confirmed"},
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="extracted",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="show cancelled event")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        output = attempt["execution"]["output"]
+
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                provider_object = db.get(GoogleProviderObjectRecord, "gpo_cancelled_event")
+                evidence = db.get(ProviderEvidenceRecord, "pev_cancelled_event")
+
+    assert attempt["policy"]["decision"] == "allow_inline"
+    assert attempt["approval"]["status"] == "not_requested"
+    assert attempt["execution"]["status"] == "succeeded"
+    assert output["provider_evidence_refs"][0]["provider_evidence_id"] == "pev_cancelled_event"
+    assert provider_object is not None
+    assert provider_object.status == "deleted"
+    assert evidence is not None
+    assert evidence.lifecycle_state == "deleted"
+    assert evidence.extraction_status == "not_actionable"
+    assert evidence.metadata_json == {"summary": None, "status": "cancelled"}
 
 
 def test_attendee_slots_are_limited_scope_and_recoverable_without_freebusy_scope(

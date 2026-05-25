@@ -8,6 +8,7 @@ fail()  { printf '\033[1;31m    ✗ %s\033[0m\n' "$1"; }
 SA_NAME="ariel-runtime"
 SA_DISPLAY_NAME="Ariel runtime"
 KEY_PATH="${HOME}/.ariel-secrets/gcp-pubsub-sa.json"
+PRODUCTION_KEY_PATH="/etc/ariel/secrets/gcp-pubsub-sa.json"
 
 # ── 1. Check prerequisites ─────────────────────────────────────────────
 info "Checking prerequisites"
@@ -67,8 +68,10 @@ ok "key written (mode 600)"
 info "Done"
 printf '    SA email   (paste into RUNTIME_SA_EMAIL for scripts/gcp_provision_pubsub.sh):\n'
 printf '      \033[1m%s\033[0m\n' "${SA_EMAIL}"
-printf '    Key path   (paste into ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH):\n'
+printf '    Local key path   (move into the deployment secrets dir):\n'
 printf '      \033[1m%s\033[0m\n' "${KEY_PATH}"
+printf '    Production env value for ARIEL_GOOGLE_APPLICATION_CREDENTIALS_PATH:\n'
+printf '      \033[1m%s\033[0m\n' "${PRODUCTION_KEY_PATH}"
 printf '    Once the new key is in use, revoke and delete old keys:\n'
 printf '      gcloud iam service-accounts keys list --iam-account %s --project %s\n' "${SA_EMAIL}" "${GCP_PROJECT}"
 printf '      gcloud iam service-accounts keys delete <KEY_ID> --iam-account %s --project %s\n\n' "${SA_EMAIL}" "${GCP_PROJECT}"

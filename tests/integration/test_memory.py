@@ -993,6 +993,48 @@ def test_memory_notes_route_lists_operator_visible_notes(
     }
 
 
+def test_memory_log_route_lists_operator_visible_log_rows(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 22, 12, 0, tzinfo=UTC)
+    with TestClient(_app(postgres_url, _TwoPhaseAdapter(), monkeypatch)) as client:
+        with cast(Any, client.app).state.session_factory() as db:
+            with db.begin():
+                db.add(
+                    MemoryLogRecord(
+                        id="mev_route_visible",
+                        kind="recall",
+                        content="Remember the incident checklist.",
+                        embedding=None,
+                        session_id=None,
+                        turn_id=None,
+                        taint="clean",
+                        source_ref="manual-smoke",
+                        created_at=now,
+                    )
+                )
+
+        response = client.get("/v1/memory/log?limit=5")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "log": [
+            {
+                "id": "mev_route_visible",
+                "created_at": "2026-05-22T12:00:00Z",
+                "kind": "recall",
+                "content": "Remember the incident checklist.",
+                "session_id": None,
+                "turn_id": None,
+                "taint": "clean",
+                "source_ref": "manual-smoke",
+            }
+        ],
+    }
+
+
 # ===========================================================================
 # 12. Append-only trigger via SQLAlchemy session
 # ===========================================================================

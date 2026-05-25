@@ -204,8 +204,7 @@ exposed to at most two of {untrusted input, private data, outbound reach}, never
 all three.
 
 - **`web`** — whitelist `RESEARCH_WEB_CAPABILITY_IDS`: `cap.search.web`,
-  `cap.search.news`, `cap.web.extract`. Untrusted input and outbound reach; no
-  private data.
+  `cap.web.extract`. Untrusted input and outbound reach; no private data.
 - **`personal`** — whitelist `RESEARCH_PERSONAL_CAPABILITY_IDS`:
   `cap.email.search`, `cap.email.read`, `cap.drive.search`, `cap.drive.read`,
   `cap.calendar.list`. Private data and untrusted input (the mailbox is

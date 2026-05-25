@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
-from ariel.persistence import JobRecord
+from ariel.persistence import JobEventRecord, JobRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
@@ -166,6 +166,69 @@ def test_jobs_endpoint_lists_recent_jobs_deterministically(postgres_url: str) ->
         detail = client.get("/v1/jobs/job_001")
         assert detail.status_code == 200
         assert detail.json()["job"]["id"] == "job_001"
+        assert adapter.calls == 0
+
+
+def test_job_events_endpoint_lists_job_events_deterministically(postgres_url: str) -> None:
+    adapter = NoAiOpsAdapter()
+    now = datetime(2026, 4, 29, 12, 0, tzinfo=UTC)
+    with _build_client(postgres_url, adapter) as client:
+        with _session_factory(client)() as db:
+            with db.begin():
+                db.add(
+                    JobRecord(
+                        id="job_events",
+                        source="agency.local",
+                        external_job_id="external-events",
+                        title="Evented job",
+                        status="running",
+                        summary="Job summary.",
+                        latest_payload={"status": "running"},
+                        created_at=now - timedelta(minutes=10),
+                        updated_at=now,
+                    )
+                )
+                db.add_all(
+                    [
+                        JobEventRecord(
+                            id="jev_002",
+                            job_id="job_events",
+                            agency_event_id=None,
+                            event_type="job.progress",
+                            payload={"step": 2},
+                            created_at=now,
+                        ),
+                        JobEventRecord(
+                            id="jev_001",
+                            job_id="job_events",
+                            agency_event_id=None,
+                            event_type="job.started",
+                            payload={"step": 1},
+                            created_at=now - timedelta(minutes=1),
+                        ),
+                    ]
+                )
+
+        response = client.get("/v1/jobs/job_events/events")
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["ok"] is True
+        assert [event["id"] for event in payload["events"]] == ["jev_001", "jev_002"]
+        assert payload["events"][0]["event_type"] == "job.started"
+        assert payload["events"][1]["payload"] == {"step": 2}
+        assert adapter.calls == 0
+
+
+def test_job_detail_and_events_reject_missing_job_without_model(postgres_url: str) -> None:
+    adapter = NoAiOpsAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        detail = client.get("/v1/jobs/missing-job")
+        events = client.get("/v1/jobs/missing-job/events")
+
+        assert detail.status_code == 404
+        assert detail.json()["error"]["code"] == "E_JOB_NOT_FOUND"
+        assert events.status_code == 404
+        assert events.json()["error"]["code"] == "E_JOB_NOT_FOUND"
         assert adapter.calls == 0
 
 

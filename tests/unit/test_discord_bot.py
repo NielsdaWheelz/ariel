@@ -20,7 +20,6 @@ from ariel.discord_bot import (
     list_jobs,
     record_capture,
     submit_discord_turn,
-    _is_ariel_custom_id,
 )
 
 
@@ -340,6 +339,27 @@ def test_discord_bot_registers_only_deterministic_ops_slash_commands() -> None:
     assert bot.tree.get_command("capture") is not None
 
 
+def test_setup_hook_syncs_slash_commands_only_to_home_guild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, int | None]] = []
+    bot = _bot()
+
+    def fake_copy_global_to(*, guild: discord.Object) -> None:
+        calls.append(("copy_global_to", guild.id))
+
+    async def fake_sync(*, guild: discord.Object | None = None) -> list[object]:
+        calls.append(("sync", None if guild is None else guild.id))
+        return []
+
+    monkeypatch.setattr(bot.tree, "copy_global_to", fake_copy_global_to)
+    monkeypatch.setattr(bot.tree, "sync", fake_sync)
+
+    asyncio.run(bot.setup_hook())
+
+    assert calls == [("copy_global_to", 1), ("sync", 1)]
+
+
 def test_format_discord_message_truncates_to_safe_size() -> None:
     formatted = format_discord_message("x" * 2000)
     assert formatted.endswith("\n[truncated]")
@@ -499,6 +519,47 @@ def test_decide_approval_posts_discord_decision(
     ]
 
 
+def test_decide_approval_posts_discord_denial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_clients: list[FakeHttpClient] = []
+
+    def fake_client(*, timeout: float) -> FakeHttpClient:
+        assert timeout == 60.0
+        client = FakeHttpClient(
+            responses=[
+                httpx.Response(
+                    200,
+                    json={
+                        "ok": True,
+                        "approval": {"reference": "apr_123", "status": "denied"},
+                        "assistant": {"message": "approval denied"},
+                    },
+                )
+            ]
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr("ariel.discord_bot.httpx.Client", fake_client)
+
+    message = decide_approval(
+        ariel_base_url="http://127.0.0.1:8000",
+        approval_ref="apr_123",
+        decision="deny",
+    )
+
+    assert message == "Approval denied: apr_123\napproval denied"
+    assert fake_clients[0].calls == [
+        {
+            "method": "POST",
+            "url": "http://127.0.0.1:8000/v1/approvals",
+            "headers": None,
+            "json": {"approval_ref": "apr_123", "decision": "deny"},
+        }
+    ]
+
+
 def test_status_command_fetches_only_deterministic_ops_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -643,7 +704,11 @@ def test_slash_status_sends_ephemeral_deterministic_response(
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 
-def test_slash_status_rejects_wrong_user() -> None:
+def test_slash_status_rejects_wrong_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_get_status(**_: object) -> str:
+        raise AssertionError("wrong-user status command must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.get_status", fail_get_status)
     bot = _bot()
     interaction = FakeInteraction(user_id=44)
 
@@ -665,6 +730,28 @@ def test_slash_status_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert interaction.response.messages[0]["ephemeral"] is True
     assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+def test_slash_status_allows_configured_user_dm(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_get_status(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+    ) -> str:
+        calls.append({"ariel_base_url": ariel_base_url, "ariel_auth_token": ariel_auth_token})
+        return "Ariel status: ok"
+
+    monkeypatch.setattr("ariel.discord_bot.get_status", fake_get_status)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=None)
+
+    asyncio.run(bot._slash_status(cast(discord.Interaction, interaction)))
+
+    assert calls == [{"ariel_base_url": "http://127.0.0.1:8000", "ariel_auth_token": None}]
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == "Ariel status: ok"
 
 
 def test_slash_jobs_sends_ephemeral_deterministic_response(
@@ -690,6 +777,30 @@ def test_slash_jobs_sends_ephemeral_deterministic_response(
         "Recent jobs:\n- job_123: running: Draft release notes"
     )
     assert interaction.followup.messages[0]["ephemeral"] is True
+
+
+def test_slash_jobs_allows_configured_user_dm(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_list_jobs(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+    ) -> str:
+        calls.append({"ariel_base_url": ariel_base_url, "ariel_auth_token": ariel_auth_token})
+        return "Recent jobs:\n- job_123: running: Draft release notes"
+
+    monkeypatch.setattr("ariel.discord_bot.list_jobs", fake_list_jobs)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=None)
+
+    asyncio.run(bot._slash_jobs(cast(discord.Interaction, interaction)))
+
+    assert calls == [{"ariel_base_url": "http://127.0.0.1:8000", "ariel_auth_token": None}]
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == (
+        "Recent jobs:\n- job_123: running: Draft release notes"
+    )
 
 
 def test_slash_jobs_rejects_wrong_user(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,6 +872,44 @@ def test_slash_capture_sends_ephemeral_deterministic_response(
     assert interaction.followup.messages[0]["ephemeral"] is True
 
 
+def test_slash_capture_allows_configured_user_dm(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_record_capture(
+        *,
+        ariel_base_url: str,
+        ariel_auth_token: str | None = None,
+        text: str,
+        discord_interaction_id: int,
+    ) -> str:
+        calls.append(
+            {
+                "ariel_base_url": ariel_base_url,
+                "ariel_auth_token": ariel_auth_token,
+                "text": text,
+                "discord_interaction_id": discord_interaction_id,
+            }
+        )
+        return "Capture recorded: cpt_123"
+
+    monkeypatch.setattr("ariel.discord_bot.record_capture", fake_record_capture)
+    bot = _bot()
+    interaction = FakeInteraction(guild_id=None)
+
+    asyncio.run(bot._slash_capture(cast(discord.Interaction, interaction), "save this"))
+
+    assert calls == [
+        {
+            "ariel_base_url": "http://127.0.0.1:8000",
+            "ariel_auth_token": None,
+            "text": "save this",
+            "discord_interaction_id": 987,
+        }
+    ]
+    assert interaction.response.deferrals == [{"thinking": True, "ephemeral": True}]
+    assert interaction.followup.messages[0]["content"] == "Capture recorded: cpt_123"
+
+
 def test_slash_capture_rejects_wrong_user(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_record_capture(**_: object) -> str:
         raise AssertionError("wrong-user capture command must not call Ariel API")
@@ -789,12 +938,59 @@ def test_slash_capture_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> N
     assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
-def test_is_ariel_custom_id_recognizes_supported_action_prefix() -> None:
-    assert _is_ariel_custom_id("ariel:approval:approve:apr_123") is True
+def test_on_interaction_ignores_non_ariel_component_custom_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("non-Ariel component custom id must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id="external:approval:approve:apr_123")
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages == []
+    assert interaction.response.edits == []
+    assert interaction.followup.messages == []
 
 
-def test_is_ariel_custom_id_rejects_unknown_action() -> None:
-    assert _is_ariel_custom_id("ariel:proactive:ack:case_123") is False
+@pytest.mark.parametrize("data", [{}, {"custom_id": 123}])
+def test_on_interaction_ignores_missing_or_non_string_custom_id(
+    monkeypatch: pytest.MonkeyPatch,
+    data: dict[str, Any],
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("missing/non-string custom id must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction()
+    interaction.data = data
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages == []
+    assert interaction.response.edits == []
+    assert interaction.followup.messages == []
+
+
+def test_on_interaction_ignores_already_acknowledged_interaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("already-acknowledged interaction must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id="ariel:approval:approve:apr_123")
+    interaction.response._done = True
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages == []
+    assert interaction.response.edits == []
+    assert interaction.followup.messages == []
 
 
 def test_on_interaction_handles_approval_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -899,10 +1095,48 @@ def test_on_interaction_duplicate_approval_click_surfaces_api_error(
     assert interaction.response.edits[0]["view"] is None
 
 
-def test_on_interaction_rejects_wrong_user() -> None:
+@pytest.mark.parametrize(
+    "custom_id",
+    [
+        "ariel:approval:approve:",
+        "ariel:approval:approve:   ",
+        "ariel:approval:deny:",
+        "ariel:approval:deny:\t",
+        "ariel:approval:maybe:apr_123",
+    ],
+)
+def test_on_interaction_rejects_invalid_approval_custom_id(
+    monkeypatch: pytest.MonkeyPatch,
+    custom_id: str,
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("invalid approval custom id must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id=custom_id, channel_id=88)
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages[0]["content"] == (
+        "Ariel action failed: invalid Discord action id."
+    )
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert isinstance(interaction.response.messages[0]["allowed_mentions"], discord.AllowedMentions)
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_on_interaction_rejects_wrong_user(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("wrong-user approval click must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
     bot = _bot()
     interaction = FakeInteraction(
-        custom_id="ariel:approval:approve:apr_123",
+        custom_id=f"ariel:approval:{decision}:apr_123",
         user_id=44,
     )
 
@@ -912,16 +1146,45 @@ def test_on_interaction_rejects_wrong_user() -> None:
     assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
 
 
-def test_on_interaction_rejects_wrong_guild(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_on_interaction_rejects_wrong_guild(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
     def fail_decide_approval(**_: object) -> str:
         raise AssertionError("wrong-guild approval click must not call Ariel API")
 
     monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
     bot = _bot()
     interaction = FakeInteraction(
-        custom_id="ariel:approval:approve:apr_123",
+        custom_id=f"ariel:approval:{decision}:apr_123",
         guild_id=99,
     )
+
+    _send_interaction(bot, interaction)
+
+    assert interaction.response.messages[0]["ephemeral"] is True
+    assert "limited to the configured Discord user" in interaction.response.messages[0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("custom_id", "kwargs"),
+    [
+        ("ariel:approval:maybe:apr_123", {"user_id": 44}),
+        ("ariel:approval:maybe:apr_123", {"guild_id": 99}),
+    ],
+)
+def test_on_interaction_authorizes_before_parsing_malformed_ariel_custom_id(
+    monkeypatch: pytest.MonkeyPatch,
+    custom_id: str,
+    kwargs: dict[str, int],
+) -> None:
+    def fail_decide_approval(**_: object) -> str:
+        raise AssertionError("unauthorized malformed custom id must not call Ariel API")
+
+    monkeypatch.setattr("ariel.discord_bot.decide_approval", fail_decide_approval)
+    bot = _bot()
+    interaction = FakeInteraction(custom_id=custom_id, **kwargs)
 
     _send_interaction(bot, interaction)
 
@@ -1062,6 +1325,52 @@ def test_on_message_answers_home_guild_message_in_any_channel(
     assert message.replies == []
 
 
+def test_on_message_answers_owner_dm_attachment_read_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        message_id=457,
+        content="read this attachment",
+        guild=None,
+        channel=FakeChannel(channel_id=77),
+        attachments=[
+            FakeAttachment(
+                attachment_id=778,
+                filename="report.pdf",
+                content_type="application/pdf",
+                size=2048,
+                url="https://cdn.example.test/report.pdf",
+            )
+        ],
+    )
+
+    _send_message(bot, message)
+
+    assert calls[0]["prompt"] == "read this attachment"
+    assert calls[0]["discord_context"] == {
+        "guild_id": None,
+        "channel_id": 77,
+        "message_id": 457,
+        "author_id": 3,
+        "mentioned_bot": False,
+        "attachments": [
+            {
+                "source": "discord",
+                "source_attachment_id": 778,
+                "filename": "report.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 2048,
+                "attachment_ref": "discord:778",
+                "download_url": "https://cdn.example.test/report.pdf",
+            }
+        ],
+    }
+    assert calls[0]["discord_message_id"] == 457
+    assert message.replies == []
+
+
 def test_on_message_answers_attachment_only_home_guild_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1079,6 +1388,44 @@ def test_on_message_answers_attachment_only_home_guild_message(
 
     assert calls[0]["prompt"] == "What would you like me to do with the attachment(s)?"
     assert calls[0]["discord_context"]["attachments"][0]["filename"] == "photo.png"
+    assert "Uploaded attachment(s)." not in calls[0]["prompt"]
+    assert message.replies == []
+
+
+def test_on_message_answers_attachment_only_owner_dm_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        message_id=655,
+        content="",
+        guild=None,
+        channel=FakeChannel(channel_id=77),
+        attachments=[FakeAttachment(filename="photo.png", content_type="image/png")],
+    )
+
+    _send_message(bot, message)
+
+    assert calls[0]["prompt"] == "What would you like me to do with the attachment(s)?"
+    assert calls[0]["discord_context"] == {
+        "guild_id": None,
+        "channel_id": 77,
+        "message_id": 655,
+        "author_id": 3,
+        "mentioned_bot": False,
+        "attachments": [
+            {
+                "source": "discord",
+                "source_attachment_id": 555,
+                "filename": "photo.png",
+                "content_type": "image/png",
+                "size_bytes": 12,
+                "attachment_ref": "discord:555",
+                "download_url": "https://cdn.example.test/notes.txt",
+            }
+        ],
+    }
     assert "Uploaded attachment(s)." not in calls[0]["prompt"]
     assert message.replies == []
 
@@ -1220,6 +1567,57 @@ def test_on_message_ignores_non_owner_home_guild_ambient_message(
         author=FakeUser(user_id=44),
         guild=FakeGuild(guild_id=1),
         channel=FakeChannel(channel_id=88),
+    )
+
+    _send_message(bot, message)
+
+    assert calls == []
+    assert message.replies == []
+
+
+def test_on_message_ignores_non_owner_dm(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        content="ambient from someone else",
+        author=FakeUser(user_id=44),
+        guild=None,
+        channel=FakeChannel(channel_id=77),
+    )
+
+    _send_message(bot, message)
+
+    assert calls == []
+    assert message.replies == []
+
+
+def test_on_message_ignores_self_authored_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        content="message from the bot account",
+        author=FakeUser(user_id=999, bot=False),
+        guild=FakeGuild(guild_id=1),
+        channel=FakeChannel(channel_id=88),
+    )
+
+    _send_message(bot, message)
+
+    assert calls == []
+    assert message.replies == []
+
+
+def test_on_message_ignores_mention_only_owner_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_discord_turn(monkeypatch)
+    bot = _bot()
+    message = FakeDiscordMessage(
+        content="<@999>   ",
+        author=FakeUser(user_id=3),
+        guild=FakeGuild(guild_id=1),
+        channel=FakeChannel(channel_id=88),
+        mentions=[FakeUser(user_id=999, bot=True)],
     )
 
     _send_message(bot, message)

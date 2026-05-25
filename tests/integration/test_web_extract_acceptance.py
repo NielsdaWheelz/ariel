@@ -96,10 +96,7 @@ class _FakeHTTPResponse:
 
 @pytest.fixture(autouse=True)
 def _web_extract_provider_bound(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT",
-        "https://extract.provider.test/v1/extract",
-    )
+    monkeypatch.setenv("ARIEL_JINA_API_KEY", "jina-test-key")
 
 
 def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
@@ -207,11 +204,14 @@ def _provider_payload(
     *, final_url: str, content: str, title: str = "Example article"
 ) -> dict[str, Any]:
     return {
-        "final_url": final_url,
-        "title": title,
-        "retrieved_at": "2026-03-07T05:00:00Z",
-        "published_at": "2026-03-06T20:00:00Z",
-        "content": content,
+        "code": 200,
+        "status": 20000,
+        "data": {
+            "title": title,
+            "url": final_url,
+            "publishedTime": "2026-03-06T20:00:00Z",
+            "content": content,
+        },
     }
 
 
@@ -229,17 +229,15 @@ def test_web_extract_executes_inline_with_structured_output_citations_and_proven
 ) -> None:
     outbound_calls: list[dict[str, Any]] = []
 
-    def fake_post(
+    def fake_get(
         url: str,
         *,
-        json: dict[str, Any],
         headers: dict[str, Any],
         timeout: float,
     ) -> _FakeHTTPResponse:
         outbound_calls.append(
             {
                 "url": url,
-                "json": copy.deepcopy(json),
                 "headers": copy.deepcopy(headers),
                 "timeout": timeout,
             }
@@ -256,7 +254,7 @@ def test_web_extract_executes_inline_with_structured_output_citations_and_proven
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
 
     adapter = ActionRunAdapter(
         run_calls_by_message={
@@ -298,20 +296,23 @@ def test_web_extract_executes_inline_with_structured_output_citations_and_proven
             "content_blocks",
         }
         assert output["document"]["canonical_source"] == "https://example.com/research/article"
-        assert output["document"]["retrieved_at"] == "2026-03-07T05:00:00Z"
+        # retrieved_at is the time WE called Jina (Jina's envelope has no
+        # retrieved_at field — only publishedTime), so assert shape, not value.
+        assert isinstance(output["document"]["retrieved_at"], str)
+        assert output["document"]["retrieved_at"].endswith("Z")
         assert isinstance(output["document"]["content_blocks"], list)
         assert output["document"]["content_blocks"]
         assert output["provider"] == {
-            "endpoint": "https://extract.provider.test/v1/extract",
+            "endpoint": "https://r.jina.ai/",
             "attempt_count": 1,
         }
 
         assert len(outbound_calls) == 1
-        assert outbound_calls[0]["url"] == "https://extract.provider.test/v1/extract"
         assert (
-            outbound_calls[0]["json"]["url"]
-            == "https://example.com/research/article?utm_source=rss"
+            outbound_calls[0]["url"]
+            == "https://r.jina.ai/https://example.com/research/article?utm_source=rss"
         )
+        assert outbound_calls[0]["headers"]["authorization"] == "Bearer jina-test-key"
 
         assert "[1]" in turn_data["assistant_message"]
         sources = _turn_sources(client, turn_data["id"])
@@ -338,7 +339,7 @@ def test_web_extract_executes_inline_with_structured_output_citations_and_proven
         ("https://example.com:invalid-port/path", "url_invalid", "valid"),
     ],
 )
-def test_url_safety_preflight_fails_closed_before_provider_dispatch(
+def test_url_safety_input_policy_fails_closed_before_provider_dispatch(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
     input_url: str,
@@ -347,13 +348,13 @@ def test_url_safety_preflight_fails_closed_before_provider_dispatch(
 ) -> None:
     outbound_calls = 0
 
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         nonlocal outbound_calls
         outbound_calls += 1
         msg = "provider should not be called for safety-preflight failures"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={"unsafe url": [{"name": "web.extract", "input": {"url": input_url}}]},
         assistant_text_by_message={
@@ -365,13 +366,18 @@ def test_url_safety_preflight_fails_closed_before_provider_dispatch(
         post_message_and_drain(client, session_id, message="unsafe url")
         turn_data = _turn_data(client, session_id)
         attempt = _surface_attempt(turn_data)
-        assert attempt["execution"]["status"] == "failed"
-        assert attempt["execution"]["error"] == expected_error
+        assert attempt["policy"]["decision"] == "deny"
+        assert attempt["policy"]["reason"] == expected_error
+        assert attempt["execution"]["status"] == "not_executed"
+        assert attempt["execution"]["error"] is None
         rendered_message = turn_data["assistant_message"].lower()
         assert expected_error in rendered_message
         assert expected_hint in rendered_message
         assert _turn_sources(client, turn_data["id"]) == []
         assert outbound_calls == 0
+        event_types = _event_types(turn_data)
+        assert event_types.count("evt.action.execution.started") == 0
+        assert event_types.count("evt.action.execution.failed") == 0
 
 
 @pytest.mark.parametrize(
@@ -487,7 +493,7 @@ def test_transient_provider_failure_retries_are_bounded_and_single_outcome(
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "2")
     call_count = 0
 
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         nonlocal call_count
         del args, kwargs
         call_count += 1
@@ -502,7 +508,7 @@ def test_transient_provider_failure_retries_are_bounded_and_single_outcome(
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "retry extraction": [
@@ -534,13 +540,13 @@ def test_provider_retry_exhaustion_fails_once_with_typed_error(
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "2")
     call_count = 0
 
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         nonlocal call_count
         del args, kwargs
         call_count += 1
         return _FakeHTTPResponse(status_code=503, payload={"error": "temporary outage"})
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "retry exhaustion": [
@@ -584,7 +590,7 @@ def test_typed_url_extraction_failures_are_actionable_and_auditable(
     expected_error: str,
     expected_hint: str,
 ) -> None:
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         del args, kwargs
         if failure_mode == "restricted":
             return _FakeHTTPResponse(status_code=403, payload={"error": "forbidden"})
@@ -594,7 +600,7 @@ def test_typed_url_extraction_failures_are_actionable_and_auditable(
             return _FakeHTTPResponse(status_code=200, json_raises=True)
         return _FakeHTTPResponse(status_code=502, payload={"error": "upstream"})
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "failing extraction": [
@@ -622,7 +628,7 @@ def test_provider_malformed_final_url_is_fail_closed(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         del args, kwargs
         return _FakeHTTPResponse(
             status_code=200,
@@ -633,7 +639,7 @@ def test_provider_malformed_final_url_is_fail_closed(
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "malformed final url": [
@@ -654,21 +660,63 @@ def test_provider_malformed_final_url_is_fail_closed(
         assert "provider_invalid_payload" in turn_data["assistant_message"]
 
 
+def test_provider_unsafe_final_url_is_fail_closed(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outbound_calls = 0
+
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+        nonlocal outbound_calls
+        del args, kwargs
+        outbound_calls += 1
+        return _FakeHTTPResponse(
+            status_code=200,
+            payload=_provider_payload(
+                final_url="http://127.0.0.1/private",
+                content="Provider returned unsafe final URL.",
+                title="Unsafe final url",
+            ),
+        )
+
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
+    adapter = ActionRunAdapter(
+        run_calls_by_message={
+            "unsafe final url": [
+                {
+                    "name": "web.extract",
+                    "input": {"url": "https://example.com/research/article"},
+                }
+            ]
+        },
+        assistant_text_by_message={"unsafe final url": "url_destination_unsafe: public URL only."},
+    )
+    with _build_client(postgres_url, adapter) as client:
+        session_id = _session_id(client)
+        post_message_and_drain(client, session_id, message="unsafe final url")
+        turn_data = _turn_data(client, session_id)
+        attempt = _surface_attempt(turn_data)
+        assert attempt["policy"]["decision"] == "allow_inline"
+        assert attempt["execution"]["status"] == "failed"
+        assert attempt["execution"]["error"] == "url_destination_unsafe"
+        assert "url_destination_unsafe" in turn_data["assistant_message"]
+        assert outbound_calls == 1
+
+
 def test_public_ipv6_urls_remain_allowed_and_canonical(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outbound_urls: list[str] = []
 
-    def fake_post(
+    def fake_get(
         url: str,
         *,
-        json: dict[str, Any],
         headers: dict[str, Any],
         timeout: float,
     ) -> _FakeHTTPResponse:
-        del url, headers, timeout
-        outbound_urls.append(json["url"])
+        del headers, timeout
+        outbound_urls.append(url)
         return _FakeHTTPResponse(
             status_code=200,
             payload=_provider_payload(
@@ -678,7 +726,7 @@ def test_public_ipv6_urls_remain_allowed_and_canonical(
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "ipv6 extraction": [
@@ -704,7 +752,9 @@ def test_public_ipv6_urls_remain_allowed_and_canonical(
             output["document"]["resolved_url"]
             == "https://[2606:4700:4700::1111]/research/article/?utm_source=rss"
         )
-        assert outbound_urls == ["https://[2606:4700:4700::1111]/research/article"]
+        assert outbound_urls == [
+            "https://r.jina.ai/https://[2606:4700:4700::1111]/research/article"
+        ]
 
 
 def test_large_pages_are_bounded_and_partial_disclosure_is_explicit(
@@ -713,7 +763,7 @@ def test_large_pages_are_bounded_and_partial_disclosure_is_explicit(
 ) -> None:
     very_large_content = " ".join(["evidence"] * 12000)
 
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         del args, kwargs
         return _FakeHTTPResponse(
             status_code=200,
@@ -724,7 +774,7 @@ def test_large_pages_are_bounded_and_partial_disclosure_is_explicit(
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "large extraction": [
@@ -754,7 +804,7 @@ def test_web_extract_preserves_grounding_and_lifecycle_inspectability(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_post(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
+    def fake_get(*args: Any, **kwargs: Any) -> _FakeHTTPResponse:
         del args, kwargs
         return _FakeHTTPResponse(
             status_code=200,
@@ -765,7 +815,7 @@ def test_web_extract_preserves_grounding_and_lifecycle_inspectability(
             ),
         )
 
-    monkeypatch.setattr(capability_registry_module.httpx, "post", fake_post)
+    monkeypatch.setattr(capability_registry_module.httpx, "get", fake_get)
     adapter = ActionRunAdapter(
         run_calls_by_message={
             "mixed turn": [

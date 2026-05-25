@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from ariel.action_runtime import process_action_execution_task
+from ariel.action_runtime import process_action_execution_task, process_provider_write_reconcile_due
 from ariel.capability_registry import (
     canonical_action_payload,
     capability_contract_hash,
@@ -21,6 +21,7 @@ from ariel.capability_registry import (
 from ariel.google_connector import (
     GOOGLE_GMAIL_MODIFY_SCOPE,
     GoogleCapabilityExecutionResult,
+    GoogleProviderRequestFailure,
 )
 from ariel.persistence import (
     ActionAttemptRecord,
@@ -54,6 +55,9 @@ class FakeWorkspaceProvider:
     before_state: list[dict[str, Any]]
     state_payload: dict[str, Any] | None = None
     state_reads: int = 0
+    calendar_event_payload: dict[str, Any] | None = None
+    calendar_get_event_failure: GoogleProviderRequestFailure | None = None
+    calendar_get_event_calls: list[dict[str, str]] = field(default_factory=list)
 
     def email_get_message_label_state(
         self,
@@ -66,6 +70,25 @@ class FakeWorkspaceProvider:
         if self.state_payload is not None:
             return self.state_payload
         return {"state": self.before_state}
+
+    def calendar_get_event(
+        self,
+        *,
+        access_token: str,
+        calendar_id: str,
+        event_id: str,
+    ) -> dict[str, Any]:
+        self.calendar_get_event_calls.append(
+            {
+                "access_token": access_token,
+                "calendar_id": calendar_id,
+                "event_id": event_id,
+            }
+        )
+        if self.calendar_get_event_failure is not None:
+            raise self.calendar_get_event_failure
+        assert self.calendar_event_payload is not None
+        return self.calendar_event_payload
 
 
 @dataclass
@@ -401,6 +424,296 @@ def test_calendar_write_actions_record_receipts_and_authority(
     }
     assert event is not None
     assert event.payload["output"] == execution_output
+
+
+def _seed_ambiguous_google_calendar_receipt(
+    session_factory: sessionmaker[Session],
+    *,
+    receipt_id: str,
+    action_attempt_id: str,
+    capability_id: str,
+    client_key: str,
+) -> None:
+    with session_factory() as db:
+        with db.begin():
+            action_attempt = db.get(ActionAttemptRecord, action_attempt_id)
+            assert action_attempt is not None
+            action_attempt.status = "failed"
+            action_attempt.execution_error = "provider_result_unknown"
+            action_attempt.execution_output = {
+                "dispatch_state": "provider_call_started",
+                "provider_account_id": PROVIDER_ACCOUNT_ID,
+            }
+            db.add(
+                ProviderWriteReceiptRecord(
+                    id=receipt_id,
+                    provider="google",
+                    provider_account_id=PROVIDER_ACCOUNT_ID,
+                    action_attempt_id=action_attempt_id,
+                    capability_id=capability_id,
+                    idempotency_key=_provider_write_idempotency_key(
+                        capability_id=capability_id,
+                        provider_account_id=PROVIDER_ACCOUNT_ID,
+                        client_key=client_key,
+                    ),
+                    status="ambiguous",
+                    provider_object_ids={
+                        "event_id": action_attempt.proposed_input["event_id"],
+                        "calendar_id": action_attempt.proposed_input.get("calendar_id", "primary"),
+                    },
+                    request_digest=action_attempt.payload_hash,
+                    response_payload={
+                        "dispatch_state": "provider_call_started",
+                        "provider_account_id": PROVIDER_ACCOUNT_ID,
+                        "error": "provider_result_unknown",
+                    },
+                    ambiguity_reason="provider_result_unknown",
+                    provider_timestamp=None,
+                    provider_etag=None,
+                    provider_history_id=None,
+                    response_digest="d" * 64,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+
+def test_calendar_update_ambiguous_receipt_reconciles_with_readback(
+    session_factory: sessionmaker[Session],
+) -> None:
+    workspace_provider = FakeWorkspaceProvider(
+        before_state=[],
+        calendar_event_payload={
+            "id": "evt_update",
+            "summary": "Updated risk review",
+            "description": "Private event notes.",
+            "location": "Room 1",
+            "attendees": [{"email": "niels@example.com"}],
+            "htmlLink": "https://calendar.google.com/event?eid=evt_update",
+            "etag": '"etag_update"',
+            "updated": "2026-05-08T12:00:05Z",
+            "iCalUID": "evt_update@google.com",
+            "status": "confirmed",
+        },
+    )
+    runtime = FakeGoogleRuntime(workspace_provider=workspace_provider)
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_cal_upd_recon",
+        capability_id="cap.calendar.update_event",
+        proposed_input={
+            "event_id": "evt_update",
+            "calendar_id": "primary",
+            "title": "Updated risk review",
+            "description": "Private event notes.",
+            "location": "Room 1",
+            "attendees": ["niels@example.com"],
+            "idempotency_key": "calendar-update-reconcile",
+            "user_instruction_ref": "turn:turn_email",
+        },
+        proposal_index=11,
+    )
+    _seed_ambiguous_google_calendar_receipt(
+        session_factory,
+        receipt_id="pwr_cal_update",
+        action_attempt_id="act_cal_upd_recon",
+        capability_id="cap.calendar.update_event",
+        client_key="calendar-update-reconcile",
+    )
+
+    assert process_provider_write_reconcile_due(
+        session_factory=session_factory,
+        task_payload={"provider_write_receipt_id": "pwr_cal_update"},
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("cal_update_reconcile"),
+    )
+
+    assert workspace_provider.calendar_get_event_calls == [
+        {"access_token": "tok_live", "calendar_id": "primary", "event_id": "evt_update"}
+    ]
+    assert runtime.executions == []
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_cal_upd_recon")
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_cal_update")
+        event = db.scalar(
+            select(EventRecord)
+            .where(EventRecord.event_type == "evt.action.execution.succeeded")
+            .limit(1)
+        )
+    assert action_attempt is not None
+    assert receipt is not None
+    assert event is not None
+    assert action_attempt.status == "succeeded"
+    assert receipt.status == "succeeded"
+    assert receipt.response_payload["schema_version"] == "google.calendar.update_result.v1"
+    assert event.payload["reconciled"] is True
+    assert "Private event notes." not in json.dumps(action_attempt.execution_output, sort_keys=True)
+
+
+def test_calendar_rsvp_ambiguous_receipt_reconciles_with_readback(
+    session_factory: sessionmaker[Session],
+) -> None:
+    workspace_provider = FakeWorkspaceProvider(
+        before_state=[],
+        calendar_event_payload={
+            "id": "evt_rsvp",
+            "attendees": [
+                {"email": "niels@example.com", "responseStatus": "accepted"},
+            ],
+            "htmlLink": "https://calendar.google.com/event?eid=evt_rsvp",
+            "etag": '"etag_rsvp"',
+            "updated": "2026-05-08T12:00:06Z",
+            "iCalUID": "evt_rsvp@google.com",
+            "status": "confirmed",
+        },
+    )
+    runtime = FakeGoogleRuntime(workspace_provider=workspace_provider)
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_calendar_rsvp_reconcile",
+        capability_id="cap.calendar.respond_to_event",
+        proposed_input={
+            "event_id": "evt_rsvp",
+            "calendar_id": "primary",
+            "attendee_email": "NIELS@EXAMPLE.COM",
+            "response_status": "accepted",
+            "idempotency_key": "calendar-rsvp-reconcile",
+            "user_instruction_ref": "turn:turn_email",
+        },
+        proposal_index=12,
+    )
+    _seed_ambiguous_google_calendar_receipt(
+        session_factory,
+        receipt_id="pwr_cal_rsvp",
+        action_attempt_id="act_calendar_rsvp_reconcile",
+        capability_id="cap.calendar.respond_to_event",
+        client_key="calendar-rsvp-reconcile",
+    )
+
+    assert process_provider_write_reconcile_due(
+        session_factory=session_factory,
+        task_payload={"provider_write_receipt_id": "pwr_cal_rsvp"},
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("cal_rsvp_reconcile"),
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_calendar_rsvp_reconcile")
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_cal_rsvp")
+    assert action_attempt is not None
+    assert receipt is not None
+    assert action_attempt.status == "succeeded"
+    assert receipt.status == "succeeded"
+    assert receipt.response_payload["schema_version"] == "google.calendar.response_result.v1"
+    assert receipt.response_payload["response_status"] == "accepted"
+
+
+def test_calendar_rsvp_ambiguous_receipt_records_mismatch_without_replay(
+    session_factory: sessionmaker[Session],
+) -> None:
+    workspace_provider = FakeWorkspaceProvider(
+        before_state=[],
+        calendar_event_payload={
+            "id": "evt_rsvp_mismatch",
+            "attendees": [
+                {"email": "niels@example.com", "responseStatus": "declined"},
+            ],
+        },
+    )
+    runtime = FakeGoogleRuntime(workspace_provider=workspace_provider)
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_calendar_rsvp_mismatch",
+        capability_id="cap.calendar.respond_to_event",
+        proposed_input={
+            "event_id": "evt_rsvp_mismatch",
+            "calendar_id": "primary",
+            "attendee_email": "niels@example.com",
+            "response_status": "accepted",
+            "idempotency_key": "calendar-rsvp-mismatch",
+            "user_instruction_ref": "turn:turn_email",
+        },
+        proposal_index=13,
+    )
+    _seed_ambiguous_google_calendar_receipt(
+        session_factory,
+        receipt_id="pwr_cal_mismatch",
+        action_attempt_id="act_calendar_rsvp_mismatch",
+        capability_id="cap.calendar.respond_to_event",
+        client_key="calendar-rsvp-mismatch",
+    )
+
+    assert process_provider_write_reconcile_due(
+        session_factory=session_factory,
+        task_payload={"provider_write_receipt_id": "pwr_cal_mismatch"},
+        google_runtime=runtime,  # type: ignore[arg-type]
+        agency_runtime=None,
+        now_fn=lambda: NOW,
+        new_id_fn=_id_factory("cal_rsvp_mismatch"),
+    )
+
+    with session_factory() as db:
+        action_attempt = db.get(ActionAttemptRecord, "act_calendar_rsvp_mismatch")
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_cal_mismatch")
+    assert action_attempt is not None
+    assert receipt is not None
+    assert action_attempt.status == "failed"
+    assert receipt.status == "ambiguous"
+    assert receipt.response_payload["reconciliation"]["reason"] == (
+        "calendar_reconcile_state_mismatch"
+    )
+    assert runtime.executions == []
+
+
+def test_calendar_reconcile_transient_probe_failure_retries_task(
+    session_factory: sessionmaker[Session],
+) -> None:
+    workspace_provider = FakeWorkspaceProvider(
+        before_state=[],
+        calendar_get_event_failure=GoogleProviderRequestFailure("google_upstream_503"),
+    )
+    runtime = FakeGoogleRuntime(workspace_provider=workspace_provider)
+    _seed_action_attempt(
+        session_factory,
+        action_attempt_id="act_calendar_reconcile_retry",
+        capability_id="cap.calendar.respond_to_event",
+        proposed_input={
+            "event_id": "evt_retry",
+            "calendar_id": "primary",
+            "attendee_email": "niels@example.com",
+            "response_status": "accepted",
+            "idempotency_key": "calendar-rsvp-retry",
+            "user_instruction_ref": "turn:turn_email",
+        },
+        proposal_index=14,
+    )
+    _seed_ambiguous_google_calendar_receipt(
+        session_factory,
+        receipt_id="pwr_cal_retry",
+        action_attempt_id="act_calendar_reconcile_retry",
+        capability_id="cap.calendar.respond_to_event",
+        client_key="calendar-rsvp-retry",
+    )
+
+    with pytest.raises(GoogleProviderRequestFailure, match="google_upstream_503"):
+        process_provider_write_reconcile_due(
+            session_factory=session_factory,
+            task_payload={"provider_write_receipt_id": "pwr_cal_retry"},
+            google_runtime=runtime,  # type: ignore[arg-type]
+            agency_runtime=None,
+            now_fn=lambda: NOW,
+            new_id_fn=_id_factory("cal_reconcile_retry"),
+        )
+
+    with session_factory() as db:
+        receipt = db.get(ProviderWriteReceiptRecord, "pwr_cal_retry")
+    assert receipt is not None
+    assert receipt.status == "ambiguous"
+    assert receipt.response_payload["reconciliation"]["reason"] == "google_upstream_503"
 
 
 def _seed_failed_email_write_receipt(

@@ -36,6 +36,7 @@ from ariel.persistence import (
 from ariel.secret_cipher import encrypt_secret
 from ariel.sync_runtime import process_provider_sync_due
 from ariel.worker import (
+    process_one_task,
     process_provider_reconcile_sync_due,
     process_provider_watch_renew_due,
     seed_approval_expiry_task,
@@ -625,6 +626,81 @@ def test_watch_renew_handler_rearms_near_expiry_channel(
             assert channel.expires_at == datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
 
 
+def test_worker_provider_watch_renew_due_arm_renews_and_rearms(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    due_at = datetime(2000, 1, 1, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory, now=now, settings=settings, granted_scopes=[GMAIL_READ_SCOPE]
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id="wch_worker_existing",
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_connected",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="hist-old",
+                    status="active",
+                    expires_at=now + timedelta(hours=3),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            db.add(
+                BackgroundTaskRecord(
+                    id="tsk_worker_watch_renew",
+                    task_type="provider_watch_renew_due",
+                    idempotency_key=None,
+                    provider_write_receipt_id=None,
+                    payload={"origin": "test"},
+                    attempts=2,
+                    recurrence_seconds=6 * 3600,
+                    run_after=due_at,
+                    created_at=due_at,
+                    updated_at=due_at,
+                )
+            )
+
+    provider = WatchRecordingProvider(gmail_expiration=datetime(2026, 6, 10, 12, 0, tzinfo=UTC))
+    runtime = GoogleConnectorRuntime(
+        oauth_client=ConnectOAuthClient(granted_scopes=[GMAIL_READ_SCOPE]),
+        workspace_provider=cast(Any, provider),
+        redirect_uri=settings.google_oauth_redirect_uri,
+        oauth_state_ttl_seconds=settings.google_oauth_state_ttl_seconds,
+        encryption_secret=settings.connector_encryption_secret,
+        encryption_key_version=settings.connector_encryption_key_version,
+        encryption_keys=settings.connector_encryption_keys,
+        pubsub_topic=PUBSUB_TOPIC,
+        public_webhook_base_url=None,
+    )
+    monkeypatch.setattr("ariel.worker.build_google_runtime", lambda _settings: runtime)
+
+    assert process_one_task(session_factory=session_factory, settings=settings) is True
+
+    assert len(provider.gmail_watch_calls) == 1
+    with session_factory() as db:
+        task = db.get(BackgroundTaskRecord, "tsk_worker_watch_renew")
+        channel = db.get(ProviderWatchChannelRecord, "wch_worker_existing")
+
+    assert task is not None
+    assert task.attempts == 0
+    assert task.run_after > due_at
+    assert channel is not None
+    assert channel.status == "active"
+    assert channel.cursor_seed == "hist-watch-1"
+    assert channel.expires_at == datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+
+
 def test_watch_renew_handler_error_connector_does_not_register_watch(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
@@ -694,6 +770,69 @@ def test_watch_renew_handler_error_connector_does_not_register_watch(
     assert connector.status == "error"
     assert connector.last_error_code == "account_identity_missing"
     assert tasks == []
+    assert channel is not None
+    assert channel.cursor_seed == "hist-old"
+
+
+def test_watch_renew_handler_token_refresh_failure_enqueues_connector_error_wake(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory, now=now, settings=settings, granted_scopes=[GMAIL_READ_SCOPE]
+    )
+    with session_factory() as db:
+        with db.begin():
+            db.add(
+                ProviderWatchChannelRecord(
+                    id="wch_refresh_failure",
+                    provider="google",
+                    resource_type="gmail",
+                    resource_id="sub_connected",
+                    channel_id=None,
+                    channel_token=None,
+                    provider_resource_id=None,
+                    cursor_seed="hist-old",
+                    status="active",
+                    expires_at=now + timedelta(hours=3),
+                    last_error_code=None,
+                    last_error_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+    class RefreshFailureRuntime:
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            raise RuntimeError("token_refresh_failed")
+
+    monkeypatch.setattr(
+        "ariel.worker.build_google_runtime", lambda _settings: RefreshFailureRuntime()
+    )
+
+    process_provider_watch_renew_due(
+        session_factory=session_factory,
+        settings=settings,
+        now_fn=lambda: now,
+        new_id_fn=IdFactory(),
+    )
+
+    with session_factory() as db:
+        with db.begin():
+            tasks = db.scalars(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+            ).all()
+            channel = db.get(ProviderWatchChannelRecord, "wch_refresh_failure")
+
+    assert len(tasks) == 1
+    assert tasks[0].payload == {
+        "note": (
+            "The Google connector reported an error token_refresh_failed; "
+            "the user may need to reconnect."
+        )
+    }
     assert channel is not None
     assert channel.cursor_seed == "hist-old"
 
@@ -935,6 +1074,70 @@ def test_reconcile_handler_enqueues_provider_sync_due_for_each_cursor(
     resource_types = sorted(task.payload["resource_type"] for task in tasks)
     assert resource_types == ["calendar", "gmail"]
     assert all(task.payload["provider"] == "google" for task in tasks)
+
+
+def test_worker_provider_reconcile_sync_due_arm_enqueues_sync_tasks_and_rearms(
+    session_factory: sessionmaker[Session],
+) -> None:
+    now = datetime(2026, 5, 18, 12, 0, tzinfo=UTC)
+    due_at = datetime(2000, 1, 1, tzinfo=UTC)
+    settings = _settings()
+    _seed_connected_connector(
+        session_factory,
+        now=now,
+        settings=settings,
+        granted_scopes=[GMAIL_READ_SCOPE, CALENDAR_READ_SCOPE],
+    )
+    with session_factory() as db:
+        with db.begin():
+            for resource_type in ("gmail", "calendar"):
+                db.add(
+                    SyncCursorRecord(
+                        id=f"cur_worker_{resource_type}",
+                        provider="google",
+                        resource_type=resource_type,
+                        resource_id="primary",
+                        cursor_value="cursor-1",
+                        cursor_version=1,
+                        status="ready",
+                        last_successful_sync_at=None,
+                        last_error_code=None,
+                        last_error_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            db.add(
+                BackgroundTaskRecord(
+                    id="tsk_worker_reconcile_sync",
+                    task_type="provider_reconcile_sync_due",
+                    idempotency_key=None,
+                    provider_write_receipt_id=None,
+                    payload={"origin": "test"},
+                    attempts=2,
+                    recurrence_seconds=settings.provider_reconcile_sync_interval_seconds,
+                    run_after=due_at,
+                    created_at=due_at,
+                    updated_at=due_at,
+                )
+            )
+
+    assert process_one_task(session_factory=session_factory, settings=settings) is True
+
+    with session_factory() as db:
+        task = db.get(BackgroundTaskRecord, "tsk_worker_reconcile_sync")
+        tasks = db.scalars(
+            select(BackgroundTaskRecord).where(
+                BackgroundTaskRecord.task_type == "provider_sync_due"
+            )
+        ).all()
+
+    assert task is not None
+    assert task.attempts == 0
+    assert task.run_after > due_at
+    resource_types = sorted(sync_task.payload["resource_type"] for sync_task in tasks)
+    assert resource_types == ["calendar", "gmail"]
+    assert all(sync_task.payload["provider"] == "google" for sync_task in tasks)
 
 
 def test_seed_provider_maintenance_tasks_creates_recurring_rows_once(

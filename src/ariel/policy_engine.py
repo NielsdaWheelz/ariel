@@ -40,7 +40,7 @@ def evaluate_proposal(
             normalized_input=None,
             impact_level=capability.impact_level,
             decision="deny",
-            reason="schema_invalid",
+            reason=input_error or "schema_invalid",
         )
 
     if capability.policy_decision == "deny":

@@ -11,6 +11,8 @@ import time
 from typing import Mapping
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from .config import ENV_FILE_SELECTOR_ENV_VAR
+
 
 _DEFAULT_DATABASE_URL = "postgresql+psycopg://localhost/ariel"
 DEV_DB_ENV_VARS = frozenset(
@@ -101,11 +103,14 @@ def load_local_env(
     environment always wins last.
     """
     proc_env = dict(environ or os.environ)
-    override = proc_env.get("ARIEL_ENV_FILE", "").strip()
+    override = proc_env.get(ENV_FILE_SELECTOR_ENV_VAR, "").strip()
     if override:
         override_path = Path(override)
         if not override_path.is_absolute():
             override_path = project_root / override_path
+        if not override_path.exists():
+            msg = f"{ENV_FILE_SELECTOR_ENV_VAR} points to missing env file: {override_path}"
+            raise FileNotFoundError(msg)
         env_files: tuple[Path, ...] = (override_path,)
     else:
         env_files = (project_root / ".env", project_root / ".env.local")

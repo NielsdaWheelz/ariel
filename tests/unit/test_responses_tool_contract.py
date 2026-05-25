@@ -25,6 +25,7 @@ from ariel.executor import ExecutionResult
 from ariel.memory import MemoryExecutionError
 from ariel.model_adapter import ToolCall
 from ariel.persistence import TurnRecord
+from ariel.production_posture import ARIEL_INSTALL_ROOT
 from ariel.prompts import MAIN_AGENT_PROMPT_VERSION, MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS
 from ariel.run_runtime import parse_run_function_call, run_tool_definitions
 
@@ -46,6 +47,18 @@ def test_normal_response_tool_surface_is_single_strict_run_tool() -> None:
     tools = run_tool_definitions()
     assert [tool.name for tool in tools] == ["run"]
     assert_strict_object_schema(tools[0].parameters, "run")
+
+
+def test_run_tool_description_does_not_advertise_turn_scoped_capabilities() -> None:
+    description = run_tool_definitions()[0].description
+    capability_aliases = {
+        alias
+        for capability_id in internal_callable_capability_ids()
+        if (alias := run_callable_name_for_capability_id(capability_id)) is not None
+    }
+
+    assert "listed for this turn" in description
+    assert [alias for alias in sorted(capability_aliases) if alias in description] == []
 
 
 def test_main_agent_prompt_is_versioned_static_contract() -> None:
@@ -170,12 +183,6 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
             "cap.search.web",
             {"query"},
             {"query": "best espresso machines 2026"},
-        ),
-        (
-            "search.news",
-            "cap.search.news",
-            {"query"},
-            {"query": "berlin elections"},
         ),
         (
             "web.extract",
@@ -501,7 +508,7 @@ def test_run_callable_signatures_match_validators_for_common_capabilities() -> N
                 "no_include_untracked",
             },
             {
-                "repo_root": "/home/niels/src/personal/ariel",
+                "repo_root": ARIEL_INSTALL_ROOT,
                 "name": "Manual smoke survey",
                 "prompt": "Inspect only.",
                 "base_branch": "main",
@@ -576,7 +583,7 @@ def test_agency_run_validator_accepts_its_normalized_payload_for_approval_replay
 
     normalized, error = capability.validate_input(
         {
-            "repo_root": "/home/niels/src/personal/ariel",
+            "repo_root": ARIEL_INSTALL_ROOT,
             "name": "Replayable Agency run",
             "prompt": "Inspect only.",
             "base_branch": " main ",
@@ -595,7 +602,7 @@ def test_agency_run_validator_accepts_its_normalized_payload_for_approval_replay
     assert replayed == normalized
     assert capability.validate_input(
         {
-            "repo_root": "/home/niels/src/personal/ariel",
+            "repo_root": ARIEL_INSTALL_ROOT,
             "name": "Replayable Agency run",
             "prompt": "Inspect only.",
             "env": {"SMOKE_FLAG": "enabled"},
@@ -813,7 +820,6 @@ def test_provider_capabilities_follow_runtime_bindings() -> None:
                 "runtime_bindings": {
                     "web_extract": False,
                     "search_web": False,
-                    "search_news": False,
                     "maps": False,
                     "weather": False,
                 },
@@ -827,7 +833,6 @@ def test_provider_capabilities_follow_runtime_bindings() -> None:
                 "runtime_bindings": {
                     "web_extract": True,
                     "search_web": True,
-                    "search_news": True,
                     "maps": True,
                     "weather": True,
                 },
@@ -838,7 +843,6 @@ def test_provider_capabilities_follow_runtime_bindings() -> None:
     gated_capabilities = {
         "cap.web.extract",
         "cap.search.web",
-        "cap.search.news",
         "cap.maps.directions",
         "cap.maps.search_places",
         "cap.weather.forecast",

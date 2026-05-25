@@ -634,6 +634,11 @@ def test_default_workspace_provider_calendar_update_and_rsvp_patch_google_event(
             "source_evidence_id": "pev_1",
         },
     )
+    fetched = provider.calendar_get_event(
+        access_token="tok_live",
+        calendar_id="primary",
+        event_id="evt_1",
+    )
 
     assert calls[0]["method"] == "PATCH"
     assert calls[0]["url"].endswith("/calendar/v3/calendars/primary/events/evt_1")
@@ -647,6 +652,9 @@ def test_default_workspace_provider_calendar_update_and_rsvp_patch_google_event(
     assert updated["etag"] == "etag_evt_1"
     assert responded["schema_version"] == "google.calendar.response_result.v1"
     assert responded["response_status"] == "accepted"
+    assert calls[2]["method"] == "GET"
+    assert calls[2]["url"].endswith("/calendar/v3/calendars/primary/events/evt_1")
+    assert fetched["id"] == "evt_1"
 
 
 def test_default_workspace_provider_retries_transient_errors_before_success(
@@ -1951,6 +1959,26 @@ def test_calendar_write_validator_rejects_missing_event_id() -> None:
     }
     assert not is_typed_google_read_output(
         capability_id="cap.calendar.create_event", payload=payload
+    )
+
+
+def test_calendar_write_validator_rejects_extra_private_text_fields() -> None:
+    payload: dict[str, Any] = {
+        "schema_version": "google.calendar.update_result.v1",
+        "status": "updated",
+        "event_id": "evt_update",
+        "calendar_id": "primary",
+        "provider_event_ref": "https://calendar.google.com/event?eid=evt_update",
+        "etag": '"etag_update"',
+        "updated": "2026-05-19T11:00:00Z",
+        "ical_uid": "evt_update@google.com",
+        "provider_status": "confirmed",
+        "executed_at": "2026-05-19T11:00:00Z",
+        "description": "private event notes",
+    }
+
+    assert not is_typed_google_read_output(
+        capability_id="cap.calendar.update_event", payload=payload
     )
 
 

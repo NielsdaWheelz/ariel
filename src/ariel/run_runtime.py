@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .action_runtime import (
@@ -132,8 +133,8 @@ def run_tool_definitions() -> list[ToolSpec]:
                 "handling, and the safe standard library (json, re, datetime, math). Every "
                 "effect is a typed syscall to a namespaced host callable -- "
                 "agent.emit_message for user-visible output, agent.emit_value for internal "
-                "data, and capability syscalls such as memory.recall, email.search, or "
-                "agency.run. A syscall returns its result into the program; an "
+                "data, and only the capability syscalls listed for this turn. A syscall "
+                "returns its result into the program; an "
                 "approval-gated syscall returns a pending value and is not executed inline. "
                 "Call exactly one run tool with the program as the source string."
             ),
@@ -232,6 +233,17 @@ def _capability_syscall_value(function_call_output: dict[str, Any]) -> tuple[boo
     # justify-defect: process_one_call owns this finite status channel; an
     # unknown status means the producer contract changed without this consumer.
     raise RuntimeError(f"unknown_call_status: {status}")
+
+
+def _turn_action_attempt_count(db: Session, *, turn_id: str) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(ActionAttemptRecord)
+            .where(ActionAttemptRecord.turn_id == turn_id)
+        )
+        or 0
+    )
 
 
 def execute_run_program(
@@ -485,6 +497,10 @@ def execute_run_program(
         if ctx.result_runtime_provenance is not None:
             current_provenance[0] = ctx.result_runtime_provenance
             program_taint_evidence.extend(ctx.result_runtime_provenance.evidence)
+        call_index = max(
+            call_index,
+            _turn_action_attempt_count(db, turn_id=turn.id) - proposal_index_start,
+        )
 
         new_outputs = ctx.function_call_outputs[outputs_before:]
         if len(new_outputs) != 1:

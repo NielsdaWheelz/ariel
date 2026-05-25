@@ -24,13 +24,18 @@ from ariel.google_workspace_normalization import normalize_calendar_event
 from ariel.persistence import (
     GoogleConnectorRecord,
     GoogleProviderObjectRecord,
-    ProviderEvidenceBlockRecord,
-    ProviderEvidenceRecord,
     ProviderEventRecord,
     SyncCursorRecord,
     SyncRunRecord,
     enqueue_background_task,
     to_rfc3339,
+)
+from ariel.provider_evidence_lifecycle import (
+    ProviderEvidenceBlockInput,
+    mark_provider_object_evidence_deleted,
+    record_available_evidence,
+    record_deleted_evidence,
+    record_unavailable_evidence,
 )
 
 _CALENDAR_SYNC_PAGE_SIZE = 10
@@ -65,8 +70,11 @@ def _acquire_provider_sync_lock(
         lock_db.close()
         return None, None
     lock_id = _provider_sync_lock_id("provider_sync", provider, resource_type, resource_id)
-    lock_db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+    acquired = lock_db.scalar(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id})
     lock_db.commit()
+    if acquired is not True:
+        lock_db.close()
+        raise ProviderSyncFailure("provider_sync_lock_busy")
     return lock_db, lock_id
 
 
@@ -726,81 +734,9 @@ def _sync_calendar_item(
         provider_object.updated_at = now
 
     if status == "deleted":
-        evidence_rows = db.scalars(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.lifecycle_state != "deleted",
-                ProviderEvidenceRecord.content_digest != content_digest,
-            )
-            .with_for_update()
-        ).all()
-        for evidence_row in evidence_rows:
-            evidence_row.lifecycle_state = "deleted"
-            evidence_row.updated_at = now
-        cancellation_evidence = db.scalar(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.content_digest == content_digest,
-            )
-            .limit(1)
-        )
-        if cancellation_evidence is None:
-            cancellation_evidence = ProviderEvidenceRecord(
-                id=new_id_fn("pev"),
-                provider_object_id=provider_object.id,
-                provider="google",
-                provider_account_id=provider_account_id,
-                source_kind="calendar_event",
-                external_id=external_id,
-                thread_external_id=None,
-                calendar_id=resource_id,
-                source_uri=normalized.provider_url,
-                source_timestamp=source_timestamp,
-                content_digest=content_digest,
-                metadata_json=metadata,
-                taint="provider_untrusted",
-                sensitivity="private",
-                retention_policy="provider_source",
-                extraction_status="not_actionable",
-                lifecycle_state="deleted",
-                observed_at=now,
-                created_at=now,
-                updated_at=now,
-            )
-            db.add(cancellation_evidence)
-        else:
-            cancellation_evidence.lifecycle_state = "deleted"
-            cancellation_evidence.extraction_status = "not_actionable"
-            cancellation_evidence.updated_at = now
-        return True
-
-    evidence = db.scalar(
-        select(ProviderEvidenceRecord)
-        .where(
-            ProviderEvidenceRecord.provider_object_id == provider_object.id,
-            ProviderEvidenceRecord.content_digest == content_digest,
-        )
-        .with_for_update()
-        .limit(1)
-    )
-    if evidence is not None and evidence.lifecycle_state != "available":
-        return True
-    if evidence is None:
-        superseded_rows = db.scalars(
-            select(ProviderEvidenceRecord)
-            .where(
-                ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                ProviderEvidenceRecord.lifecycle_state == "available",
-            )
-            .with_for_update()
-        ).all()
-        for superseded_row in superseded_rows:
-            superseded_row.lifecycle_state = "superseded"
-            superseded_row.updated_at = now
-        evidence = ProviderEvidenceRecord(
-            id=new_id_fn("pev"),
+        record_deleted_evidence(
+            db=db,
+            new_id_fn=new_id_fn,
             provider_object_id=provider_object.id,
             provider="google",
             provider_account_id=provider_account_id,
@@ -812,45 +748,52 @@ def _sync_calendar_item(
             source_timestamp=source_timestamp,
             content_digest=content_digest,
             metadata_json=metadata,
-            taint="provider_untrusted",
-            sensitivity="private",
-            retention_policy="provider_source",
-            extraction_status="pending",
-            lifecycle_state="available",
             observed_at=now,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(evidence)
-        db.flush()
-        existing_block_id = db.scalar(
-            select(ProviderEvidenceBlockRecord.id)
-            .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
-            .limit(1)
-        )
-        if existing_block_id is None:
-            for index, block in enumerate(normalized.description_blocks):
-                db.add(
-                    ProviderEvidenceBlockRecord(
-                        id=new_id_fn("peb"),
-                        evidence_id=evidence.id,
-                        block_index=index,
-                        block_kind="calendar_description",
-                        text=block.text,
-                        digest=block.digest,
-                        source_offsets={"block_id": block.block_id},
-                        metadata_json={
-                            "source_mime_type": block.source_mime_type,
-                            "truncated": block.truncated,
-                        },
-                        created_at=now,
-                    )
+            blocks=[
+                ProviderEvidenceBlockInput(
+                    block_kind="calendar_description",
+                    text=block.text,
+                    digest=block.digest,
+                    source_offsets={"block_id": block.block_id},
+                    metadata_json={
+                        "source_mime_type": block.source_mime_type,
+                        "truncated": block.truncated,
+                    },
                 )
-    elif evidence.metadata_json != metadata:
-        evidence.metadata_json = metadata
-        evidence.extraction_status = "pending"
-        evidence.observed_at = now
-        evidence.updated_at = now
+                for block in normalized.description_blocks
+            ],
+        )
+        return True
+
+    record_available_evidence(
+        db=db,
+        new_id_fn=new_id_fn,
+        provider_object_id=provider_object.id,
+        provider="google",
+        provider_account_id=provider_account_id,
+        source_kind="calendar_event",
+        external_id=external_id,
+        thread_external_id=None,
+        calendar_id=resource_id,
+        source_uri=normalized.provider_url,
+        source_timestamp=source_timestamp,
+        content_digest=content_digest,
+        metadata_json=metadata,
+        observed_at=now,
+        blocks=[
+            ProviderEvidenceBlockInput(
+                block_kind="calendar_description",
+                text=block.text,
+                digest=block.digest,
+                source_offsets={"block_id": block.block_id},
+                metadata_json={
+                    "source_mime_type": block.source_mime_type,
+                    "truncated": block.truncated,
+                },
+            )
+            for block in normalized.description_blocks
+        ],
+    )
     return True
 
 
@@ -1022,32 +965,16 @@ def _sync_gmail_history(
                 provider_object.updated_at = now
             item_count += 1
             if object_status == "deleted":
-                evidence_rows = db.scalars(
-                    select(ProviderEvidenceRecord)
-                    .where(
-                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                        ProviderEvidenceRecord.lifecycle_state != "deleted",
-                    )
-                    .with_for_update()
-                ).all()
-                for evidence_row in evidence_rows:
-                    evidence_row.lifecycle_state = "deleted"
-                    evidence_row.updated_at = now
-                observation_count += len(evidence_rows)
+                observation_count += mark_provider_object_evidence_deleted(
+                    db=db,
+                    provider_object_id=provider_object.id,
+                    observed_at=now,
+                )
             elif read_status != "ok" and isinstance(read_outcome, dict):
                 unavailable_digest = content_digest
                 if isinstance(read_evidence, dict):
                     body_digest = _payload_text(read_evidence, "body_digest")
                     unavailable_digest = body_digest or unavailable_digest
-                existing_unavailable = db.scalar(
-                    select(ProviderEvidenceRecord)
-                    .where(
-                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                        ProviderEvidenceRecord.content_digest == unavailable_digest,
-                    )
-                    .with_for_update()
-                    .limit(1)
-                )
                 unavailable_metadata = {
                     "history_id": history_id,
                     "label_ids": label_ids,
@@ -1060,55 +987,28 @@ def _sync_gmail_history(
                     if isinstance(read_evidence, dict)
                     else None,
                 }
-                if existing_unavailable is None:
-                    db.add(
-                        ProviderEvidenceRecord(
-                            id=new_id_fn("pev"),
-                            provider_object_id=provider_object.id,
-                            provider="google",
-                            provider_account_id=provider_account_id,
-                            source_kind="gmail_message",
-                            external_id=message_id,
-                            thread_external_id=thread_id,
-                            calendar_id=None,
-                            source_uri=provider_object.provider_url,
-                            source_timestamp=message_received_at,
-                            content_digest=unavailable_digest,
-                            metadata_json=unavailable_metadata,
-                            taint="provider_untrusted",
-                            sensitivity="private",
-                            retention_policy="provider_source",
-                            extraction_status="failed",
-                            lifecycle_state="unavailable",
-                            observed_at=now,
-                            created_at=now,
-                            updated_at=now,
-                        )
-                    )
-                elif existing_unavailable.lifecycle_state == "unavailable":
-                    existing_unavailable.thread_external_id = thread_id
-                    existing_unavailable.source_uri = provider_object.provider_url
-                    existing_unavailable.source_timestamp = message_received_at
-                    existing_unavailable.metadata_json = unavailable_metadata
-                    existing_unavailable.lifecycle_state = "unavailable"
-                    existing_unavailable.extraction_status = "failed"
-                    existing_unavailable.observed_at = now
-                    existing_unavailable.updated_at = now
+                record_unavailable_evidence(
+                    db=db,
+                    new_id_fn=new_id_fn,
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=provider_account_id,
+                    source_kind="gmail_message",
+                    external_id=message_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    source_uri=provider_object.provider_url,
+                    source_timestamp=message_received_at,
+                    content_digest=unavailable_digest,
+                    metadata_json=unavailable_metadata,
+                    observed_at=now,
+                )
                 observation_count += 1
             if read_status == "ok" and isinstance(read_evidence, dict):
                 evidence_content_digest = content_digest
                 body_digest = _payload_text(read_evidence, "body_digest")
                 if body_digest is not None:
                     evidence_content_digest = body_digest
-                existing_evidence = db.scalar(
-                    select(ProviderEvidenceRecord)
-                    .where(
-                        ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                        ProviderEvidenceRecord.content_digest == evidence_content_digest,
-                    )
-                    .with_for_update()
-                    .limit(1)
-                )
                 evidence_metadata = {
                     "history_id": history_id,
                     "label_ids": label_ids,
@@ -1116,97 +1016,51 @@ def _sync_gmail_history(
                     "decode_notes": read_evidence.get("decode_notes", []),
                     "html_security": read_evidence.get("html_security"),
                 }
-                if (
-                    existing_evidence is not None
-                    and existing_evidence.lifecycle_state != "available"
-                ):
-                    continue
-                if existing_evidence is None:
-                    superseded_rows = db.scalars(
-                        select(ProviderEvidenceRecord)
-                        .where(
-                            ProviderEvidenceRecord.provider_object_id == provider_object.id,
-                            ProviderEvidenceRecord.content_digest != evidence_content_digest,
-                            ProviderEvidenceRecord.lifecycle_state == "available",
+                raw_blocks = read_evidence.get("blocks")
+                block_inputs: list[ProviderEvidenceBlockInput] = []
+                for block in raw_blocks if isinstance(raw_blocks, list) else []:
+                    if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                        continue
+                    kind = block.get("kind")
+                    block_inputs.append(
+                        ProviderEvidenceBlockInput(
+                            block_kind=kind
+                            if kind in {"body", "quote", "signature", "forwarded"}
+                            else "body",
+                            text=block["text"],
+                            digest=str(
+                                block.get("digest") or _json_digest({"text": block["text"]})
+                            ),
+                            source_offsets={
+                                "block_id": block.get("block_id"),
+                                "source_message_id": block.get("source_message_id"),
+                            },
+                            metadata_json={
+                                "source_mime_type": block.get("source_mime_type"),
+                                "charset": block.get("charset"),
+                                "truncated": block.get("truncated"),
+                            },
                         )
-                        .with_for_update()
-                    ).all()
-                    for superseded_row in superseded_rows:
-                        superseded_row.lifecycle_state = "superseded"
-                        superseded_row.updated_at = now
-                    evidence = ProviderEvidenceRecord(
-                        id=new_id_fn("pev"),
-                        provider_object_id=provider_object.id,
-                        provider="google",
-                        provider_account_id=provider_account_id,
-                        source_kind="gmail_message",
-                        external_id=message_id,
-                        thread_external_id=thread_id,
-                        calendar_id=None,
-                        source_uri=provider_object.provider_url,
-                        source_timestamp=message_received_at,
-                        content_digest=evidence_content_digest,
-                        metadata_json=evidence_metadata,
-                        taint="provider_untrusted",
-                        sensitivity="private",
-                        retention_policy="provider_source",
-                        extraction_status="pending",
-                        lifecycle_state="available",
-                        observed_at=now,
-                        created_at=now,
-                        updated_at=now,
                     )
-                    db.add(evidence)
-                    db.flush()
-                    existing_block_id = db.scalar(
-                        select(ProviderEvidenceBlockRecord.id)
-                        .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
-                        .limit(1)
-                    )
-                    raw_blocks = read_evidence.get("blocks")
-                    if existing_block_id is None:
-                        for index, block in enumerate(
-                            raw_blocks if isinstance(raw_blocks, list) else []
-                        ):
-                            if not isinstance(block, dict) or not isinstance(
-                                block.get("text"), str
-                            ):
-                                continue
-                            kind = block.get("kind")
-                            db.add(
-                                ProviderEvidenceBlockRecord(
-                                    id=new_id_fn("peb"),
-                                    evidence_id=evidence.id,
-                                    block_index=index,
-                                    block_kind=kind
-                                    if kind in {"body", "quote", "signature", "forwarded"}
-                                    else "body",
-                                    text=block["text"],
-                                    digest=str(
-                                        block.get("digest") or _json_digest({"text": block["text"]})
-                                    ),
-                                    source_offsets={
-                                        "block_id": block.get("block_id"),
-                                        "source_message_id": block.get("source_message_id"),
-                                    },
-                                    metadata_json={
-                                        "source_mime_type": block.get("source_mime_type"),
-                                        "charset": block.get("charset"),
-                                        "truncated": block.get("truncated"),
-                                    },
-                                    created_at=now,
-                                )
-                            )
-                else:
-                    labels_changed = existing_evidence.metadata_json.get("label_ids") != label_ids
-                    existing_evidence.thread_external_id = thread_id
-                    existing_evidence.source_uri = provider_object.provider_url
-                    existing_evidence.source_timestamp = message_received_at
-                    existing_evidence.metadata_json = evidence_metadata
-                    existing_evidence.observed_at = now
-                    existing_evidence.updated_at = now
-                    if labels_changed or key in {"labelsAdded", "labelsRemoved"}:
-                        existing_evidence.extraction_status = "pending"
+                evidence = record_available_evidence(
+                    db=db,
+                    new_id_fn=new_id_fn,
+                    provider_object_id=provider_object.id,
+                    provider="google",
+                    provider_account_id=provider_account_id,
+                    source_kind="gmail_message",
+                    external_id=message_id,
+                    thread_external_id=thread_id,
+                    calendar_id=None,
+                    source_uri=provider_object.provider_url,
+                    source_timestamp=message_received_at,
+                    content_digest=evidence_content_digest,
+                    metadata_json=evidence_metadata,
+                    observed_at=now,
+                    blocks=block_inputs,
+                )
+                if evidence is None:
+                    continue
     return item_count, observation_count
 
 

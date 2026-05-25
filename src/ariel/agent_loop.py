@@ -63,7 +63,7 @@ from .model_adapter import (
     ToolCall,
     ToolSpec,
 )
-from .models import MAIN
+from .models import ModelRef
 from .persistence import ActionAttemptRecord, TurnRecord
 from .run_runtime import (
     ScratchEntry,
@@ -137,6 +137,8 @@ class LoopConfig:
     prompt_version:
         The semantic version of the system prompt for this loop configuration.
         Recorded with any ``ai_judgments`` row the loop writes.
+    model_ref:
+        The concrete model role this loop calls.
     budget_seconds:
         Wall-clock budget for the loop.
     max_model_calls:
@@ -179,6 +181,7 @@ class LoopConfig:
     output_mode: Literal["message", "finding", "operations"]
     finding_mode: str
     prompt_version: str
+    model_ref: ModelRef
     budget_seconds: float
     max_model_calls: int
     is_main_agent_loop: bool
@@ -331,8 +334,8 @@ def run_agent_loop(
         add_event(
             "evt.model.started",
             {
-                "provider": MAIN.provider,
-                "model": MAIN.model,
+                "provider": cfg.model_ref.provider,
+                "model": cfg.model_ref.model,
                 "model_call_count": model_call_count,
             },
         )
@@ -345,10 +348,10 @@ def run_agent_loop(
             candidate_response = asyncio.run(
                 model_adapter.call(
                     ModelCall(
-                        model=MAIN,
+                        model=cfg.model_ref,
                         messages=messages,
                         tools=tools,
-                        tool_choice="auto",
+                        tool_choice="required",
                         reasoning=ReasoningConfig(effort=settings.model_reasoning_effort),
                         max_output_tokens=settings.max_response_tokens,
                     )
@@ -378,8 +381,8 @@ def run_agent_loop(
             add_event(
                 "evt.model.failed",
                 {
-                    "provider": MAIN.provider,
-                    "model": MAIN.model,
+                    "provider": cfg.model_ref.provider,
+                    "model": cfg.model_ref.model,
                     "duration_ms": duration_ms,
                     "failure_reason": getattr(exc, "safe_reason", str(exc)),
                     "model_call_count": model_call_count,
@@ -490,7 +493,17 @@ def run_agent_loop(
             model_adapter=model_adapter,
             is_main_agent_loop=cfg.is_main_agent_loop,
         )
-        created_action_attempt_count += len(run_program_result.action_attempts)
+        created_action_attempt_count = max(
+            created_action_attempt_count + len(run_program_result.action_attempts),
+            int(
+                db.scalar(
+                    select(func.count())
+                    .select_from(ActionAttemptRecord)
+                    .where(ActionAttemptRecord.turn_id == turn.id)
+                )
+                or 0
+            ),
+        )
         # Thread taint across programs in the same turn.
         final_runtime_provenance = RuntimeProvenance.merge_optional(
             final_runtime_provenance,

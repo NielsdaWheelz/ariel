@@ -55,8 +55,9 @@ class _ProbeAdapter(ModelAdapter):
         *,
         substrate: Model | None = None,
         embedder: EmbeddingModel | None = None,
+        settings: AppSettings | None = None,
     ) -> None:
-        super().__init__(_settings())
+        super().__init__(settings or _settings())
         self._probe_substrate = substrate
         self._probe_embedder = embedder
 
@@ -103,6 +104,33 @@ def test_call_extracts_tool_calls() -> None:
     assert response.tool_calls[0].name == "lookup"
     assert response.tool_calls[0].arguments == {"q": "x"}
     assert response.tool_calls[0].call_id == "c1"
+
+
+def test_call_marks_function_tools_strict_for_provider_schema() -> None:
+    def fn(_msgs: list[ModelMessage], info: AgentInfo) -> PydAIModelResponse:
+        assert len(info.function_tools) == 1
+        assert info.function_tools[0].strict is True
+        return PydAIModelResponse(
+            parts=[ToolCallPart(tool_name="lookup", args={}, tool_call_id="c1")]
+        )
+
+    adapter = _adapter_with(FunctionModel(fn))
+    tools = [
+        ToolSpec(
+            name="lookup",
+            description="d",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        )
+    ]
+
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs(), tools=tools)))
+
+    assert response.tool_calls[0].name == "lookup"
 
 
 def test_call_parses_string_tool_call_arguments() -> None:
@@ -189,6 +217,48 @@ def test_call_lifts_provider_response_id_and_usage_details() -> None:
     assert response.usage.output_tokens == 3
     assert response.usage.cached_tokens == 4
     assert response.usage.reasoning_tokens == 7
+
+
+def test_call_uses_configured_timeout() -> None:
+    async def fn(_msgs: list[ModelMessage], _info: AgentInfo) -> PydAIModelResponse:
+        await asyncio.sleep(0.2)
+        return PydAIModelResponse(parts=[TextPart(content="late")])
+
+    settings = _settings().model_copy(update={"model_timeout_seconds": 0.01})
+    adapter = _ProbeAdapter(substrate=FunctionModel(fn), settings=settings)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
+
+
+def test_openrouter_uses_its_own_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeProvider:
+        def __init__(self, *, api_key: str | None, base_url: str | None) -> None:
+            calls.append({"kind": "provider", "api_key": api_key, "base_url": base_url})
+
+    class FakeChatModel:
+        def __init__(self, model: str, *, provider: object) -> None:
+            calls.append({"kind": "model", "model": model, "provider": provider})
+
+    monkeypatch.setattr("ariel.model_adapter.OpenAIProvider", FakeProvider)
+    monkeypatch.setattr("ariel.model_adapter.OpenAIChatModel", FakeChatModel)
+    settings = AppSettings(
+        openai_base_url="https://openai.example.test/v1",
+        openrouter_api_key="openrouter-key",
+        openrouter_base_url="https://openrouter.example.test/api/v1",
+    )
+
+    ModelAdapter(settings)._build_model(ModelRef(provider="openrouter", model="router-model"))
+
+    assert calls[0] == {
+        "kind": "provider",
+        "api_key": "openrouter-key",
+        "base_url": "https://openrouter.example.test/api/v1",
+    }
+    assert calls[1]["kind"] == "model"
+    assert calls[1]["model"] == "router-model"
 
 
 def test_embed_returns_vector_per_input() -> None:

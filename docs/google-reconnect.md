@@ -32,29 +32,41 @@ Then every curl in this doc becomes `curl "${auth[@]}" …`.
 
 Each `start` / `reconnect` returns an `authorization_url`. You open that URL in a browser, grant the requested scopes on Google's consent screen, and Google redirects to the callback which completes the flow.
 
-## The simple recipe — most users want this
+## The simple recipe
 
-You are an existing user (`gmail.readonly + calendar.readonly` already granted). You want everything else (identity scopes + the common write capabilities). Run these one at a time. Each step opens one browser consent screen; you approve, Google redirects back, and the next step's request unions in more scopes (existing grants always carry forward).
+`capability_intent` accepts either a single value or a **comma-separated list**.
+The scope sets union together, so you can bundle every capability you want into
+one consent screen. Existing grants always carry forward — reconnect never
+removes scopes.
+
+### Clear missing-scope Google smoke blockers (one consent screen)
+
+Run this when the manual smoke ledger shows Google rows as `not_enabled`. It
+asks for every write and Drive scope Ariel currently knows about, in one
+browser approval. This only fixes missing grants. If a capability still returns
+`provider_permission_denied` after the requested scopes are granted, investigate
+Google API enablement, OAuth app or admin restrictions, and Drive/calendar ACLs
+instead of repeating reconnect.
 
 ```bash
-# Step 1: identity scopes (openid + email + profile) - populates account identity
+curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.calendar.propose_slots,cap.calendar.create_event,cap.email.draft,cap.email.send,cap.email.archive,cap.drive.search,cap.drive.read,cap.drive.share' | jq -r '.oauth.authorization_url'
+# → open the URL in a browser, click Allow once
+```
+
+`cap.calendar.create_event` covers create/update/respond. `cap.email.archive`
+covers archive/trash/labels/undo (undo also needs a prior reversible mutation
+receipt). If your OAuth client in Cloud Console is missing any of the
+restricted scopes the consent URL requests, Google rejects with
+`invalid_scope`; see the Cloud Console section below.
+
+### Single-intent form (still works)
+
+```bash
+# Identity scopes only (openid + email + profile)
 curl -s "${auth[@]}" -X POST http://127.0.0.1:8000/v1/connectors/google/reconnect | jq -r '.oauth.authorization_url'
-# → open the URL in a browser, click Allow
 
-# Step 2: Gmail send
+# One capability at a time
 curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.send' | jq -r '.oauth.authorization_url'
-# → open the URL, Allow
-
-# Step 3: Calendar write (create / update / respond)
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.calendar.create_event' | jq -r '.oauth.authorization_url'
-# → open the URL, Allow
-
-# Optional — only add if you actually want them, each is one extra prompt:
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.archive' | jq -r '.oauth.authorization_url'  # archive / trash / labels
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.email.draft'   | jq -r '.oauth.authorization_url'  # drafts
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.search'  | jq -r '.oauth.authorization_url'  # Drive metadata search
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.share'   | jq -r '.oauth.authorization_url'  # Drive share
-curl -s "${auth[@]}" -X POST 'http://127.0.0.1:8000/v1/connectors/google/reconnect?capability_intent=cap.drive.read'    | jq -r '.oauth.authorization_url'  # Drive read content
 ```
 
 After each `curl`, check the granted state:
@@ -105,11 +117,12 @@ while `cap.email.draft` adds `gmail.compose`.
 
 ## Troubleshooting
 
-- **`E_CONNECTOR_RECONNECT_INVALID_INTENT`** — the `capability_intent` value doesn't match the table above. Check for typos.
+- **`E_CONNECTOR_RECONNECT_INVALID_INTENT`** — one or more `capability_intent` values don't match the table above. When using the comma-separated form, any single bad value rejects the whole request — the error `details.reason` names the offending intent. Check for typos.
 - **`access_denied` from Google** — you clicked Cancel on the consent screen, or your email isn't in the test-users list.
 - **`invalid_scope` from Google** — the scope you requested isn't enabled on the OAuth client. Open Cloud Console → OAuth consent screen → **Add or Remove Scopes**.
 - **`E_CONNECTOR_CALLBACK_FAILED` with `provider_invalid_payload`** — Google did not return usable userinfo identity. Confirm the OAuth consent screen includes `openid`, `userinfo.email`, and `userinfo.profile`, then retry the reconnect.
-- **Granted scopes still don't include the new one after Allow** — verify the callback succeeded: check `curl "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google/events | jq '.events[0:5]'` for a recent `evt.connector.google.reconnect.succeeded`.
+- **Granted scopes still don't include the new one after Allow** — verify the callback succeeded: check `curl "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google/events | jq '.events[-5:]'` for a recent `evt.connector.google.reconnect.succeeded`.
+- **Scopes are present but Drive or Calendar calls still fail with `provider_permission_denied` or `missing_calendar` diagnostics** — this is not a reconnect loop. Check Drive API enablement, OAuth app/admin restrictions, and whether the file, shared drive, attendee calendar, or calendar ID is actually visible to the connected account.
 - **`E_LOCAL_AUTH_TOKEN_INVALID`** — you didn't load the `auth=(…)` array, or `/etc/ariel/ariel.env` doesn't have `ARIEL_LOCAL_AUTH_TOKEN`. Sanity-check with `echo "$ARIEL_LOCAL_AUTH_TOKEN" | wc -c` (≥33 chars including newline).
 
 ## Disconnect

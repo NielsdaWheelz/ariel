@@ -15,16 +15,16 @@ Two parallel stacks coexist on the host:
 | ------------------- | ------------------------------------ | ------------------------------------------- |
 | Env file            | `/etc/ariel/ariel.env`               | `.env.dev`                                  |
 | Env-file selector   | systemd `EnvironmentFile`            | `ARIEL_ENV_FILE=.env.dev`                   |
-| Postgres container  | `ariel-postgres`                     | `ariel-postgres-dev`                        |
-| Postgres port       | `127.0.0.1:5433`                     | `127.0.0.1:5435`                            |
-| Postgres volume     | `ariel-postgres-data`                | `ariel-postgres-dev-data`                   |
+| Postgres service    | `postgresql.service`                 | `ariel-postgres-dev`                        |
+| Postgres port       | `127.0.0.1:5432`                     | `127.0.0.1:5435`                            |
+| Postgres data       | host-managed Postgres data dir       | `ariel-postgres-dev-data`                   |
 | API bind            | `127.0.0.1:8000`                     | `127.0.0.1:8001`                            |
 | Discord bot token   | prod token in `/etc/ariel/ariel.env` | (operator paste a separate dev bot token)   |
 | Process supervisor  | `systemd` (`ariel-api`, `-worker`, `-discord`, `-pubsub`) | foreground `make dev-api`, `dev-worker`, `dev-discord` |
 
 The two stacks share nothing at runtime: different DB, different port, different
 process. Running `make dev-up`, `make dev-api`, etc. never reads `.env.local`
-and never touches the prod container.
+and never touches the production Postgres service.
 
 ## Mechanism
 
@@ -42,12 +42,13 @@ DB URL.
 ## First-time setup
 
 1. Create the dev env file from the template and edit it. The dev DB defaults
-   are wired into `.env.dev.example` — only `ARIEL_OPENAI_API_KEY` and any
-   optional Discord/Google tokens need attention.
+   are wired into `.env.dev.example`; set the provider keys required by the
+   current `MAIN`, `RESEARCH`, `VISION`, and `EMBEDDING` refs in
+   `src/ariel/models.py` plus any optional Discord/Google connector tokens.
 
    ```sh
    make dev-init                # copies .env.dev.example → .env.dev
-   $EDITOR .env.dev             # paste your OpenAI key, etc.
+   $EDITOR .env.dev             # paste provider keys, etc.
    ```
 
 2. Start the dev Postgres and run migrations.
@@ -72,14 +73,14 @@ without retyping the env var.
 ## Coexistence with prod
 
 Prod runs as four systemd units (`ariel-api`, `ariel-worker`, `ariel-discord`,
-`ariel-pubsub`) backed by `/etc/ariel/ariel.env` and the `ariel-postgres`
-container on `:5433`. Dev runs as foreground `make` targets backed by
+`ariel-pubsub`) backed by `/etc/ariel/ariel.env` and `postgresql.service`
+on `:5432`. Dev runs as foreground `make` targets backed by
 `.env.dev` and the `ariel-postgres-dev` container on `:5435`. Confirm both are
 healthy at once:
 
 ```sh
 systemctl is-active ariel-api ariel-worker ariel-discord ariel-pubsub
-make db-status         # ariel-postgres on :5433
+systemctl is-active postgresql
 make dev-status        # ariel-postgres-dev on :5435
 curl -fsS http://127.0.0.1:8000/v1/health  # prod
 curl -fsS http://127.0.0.1:8001/v1/health  # dev (only while `make dev-api` is running)
@@ -140,14 +141,14 @@ make dev-upgrade
 ```
 
 `dev-down` removes the container but preserves the volume; `dev-destroy`
-removes both. Neither touches the prod container.
+removes both. Neither touches the production database.
 
 ## Guarantees
 
 - `make dev-*` targets never read `.env.local`.
 - `make db-*` targets continue to operate against whatever `ARIEL_DATABASE_URL`
-  resolves to in `.env` + `.env.local` (which may be the prod container in a
-  local checkout). Do not run them while you want dev isolation — use
+  resolves to in `.env` + `.env.local` (which may be a production database in
+  a local checkout). Do not run them while you want dev isolation — use
   `make dev-*` instead.
 - The prod systemd units inherit no shell env, so a developer exporting
   `ARIEL_ENV_FILE=.env.dev` in their interactive shell cannot accidentally
@@ -155,10 +156,10 @@ removes both. Neither touches the prod container.
 
 ## Acceptance checklist
 
-- `docker ps` shows both `ariel-postgres` (prod, :5433) and
+- `systemctl is-active postgresql` returns `active`, and `docker ps` shows
   `ariel-postgres-dev` (dev, :5435) running.
 - `systemctl is-active ariel-api` returns `active` while `make dev-api` is
   also serving requests on `:8001`.
 - A write performed through the dev API only appears in the dev DB
-  (`psql -p 5435`), not the prod DB (`psql -p 5433`).
+  (`psql -p 5435`), not the prod DB (`psql -p 5432`).
 - `make verify` passes.

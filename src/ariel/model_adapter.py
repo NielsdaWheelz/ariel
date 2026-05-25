@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, Literal
@@ -114,11 +115,11 @@ class ModelAdapter:
                 provider=OpenAIProvider(api_key=s.openai_api_key, base_url=s.openai_base_url),
             )
         if ref.provider == "openrouter":
-            return OpenAIResponsesModel(
+            return OpenAIChatModel(
                 ref.model,
                 provider=OpenAIProvider(
                     api_key=s.openrouter_api_key,
-                    base_url=s.openai_base_url or "https://openrouter.ai/api/v1",
+                    base_url=s.openrouter_base_url or "https://openrouter.ai/api/v1",
                 ),
             )
         if ref.provider == "anthropic":
@@ -175,7 +176,10 @@ class ModelAdapter:
 
         function_tools = [
             ToolDefinition(
-                name=t.name, description=t.description, parameters_json_schema=t.parameters
+                name=t.name,
+                description=t.description,
+                parameters_json_schema=t.parameters,
+                strict=True,
             )
             for t in request.tools
         ]
@@ -200,7 +204,10 @@ class ModelAdapter:
             model_settings["thinking"] = request.reasoning.effort
 
         started_at = time.perf_counter()
-        raw = await model.request(request.messages, model_settings, params)
+        raw = await asyncio.wait_for(
+            model.request(request.messages, model_settings, params),
+            timeout=self._settings.model_timeout_seconds,
+        )
         duration_ms = int((time.perf_counter() - started_at) * 1000)
 
         return self._build_response(

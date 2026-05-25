@@ -13,7 +13,7 @@ These tests exercise the failure boundary against a real Postgres-backed
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
@@ -27,6 +27,8 @@ NOW = datetime(2026, 5, 20, 9, 0, tzinfo=UTC)
 
 def _enqueue_malformed_agency_event_task(
     session_factory: sessionmaker[Session],
+    *,
+    recurrence_seconds: int | None = None,
 ) -> str:
     """Insert a one-shot task whose supported dispatch arm raises."""
     with session_factory() as db:
@@ -38,7 +40,7 @@ def _enqueue_malformed_agency_event_task(
                 provider_write_receipt_id=None,
                 payload={},
                 attempts=0,
-                recurrence_seconds=None,
+                recurrence_seconds=recurrence_seconds,
                 run_after=NOW,
                 created_at=NOW,
                 updated_at=NOW,
@@ -117,3 +119,34 @@ def test_repeated_failures_eventually_delete_one_shot_task(
     assert error_count >= MAX_TASK_ATTEMPTS, (
         f"expected >= {MAX_TASK_ATTEMPTS} error log records across retries; got {error_count}"
     )
+
+
+def test_repeated_failures_rearm_recurring_task(
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
+    monkeypatch.setattr("ariel.worker.enqueue_due_memory_dream", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "ariel.worker.seed_provider_maintenance_tasks", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr("ariel.worker.seed_approval_expiry_task", lambda *_args, **_kwargs: None)
+    task_id = _enqueue_malformed_agency_event_task(session_factory, recurrence_seconds=60)
+
+    caplog.set_level(logging.ERROR, logger="ariel.worker")
+    for _ in range(MAX_TASK_ATTEMPTS):
+        with session_factory() as db:
+            with db.begin():
+                row = db.get(BackgroundTaskRecord, task_id)
+                assert row is not None
+                row.run_after = NOW
+        process_one_task(session_factory=session_factory)
+
+    with session_factory() as db:
+        task = db.get(BackgroundTaskRecord, task_id)
+
+    assert task is not None
+    assert task.attempts == 0
+    assert task.recurrence_seconds == 60
+    assert task.run_after == NOW + timedelta(seconds=60)

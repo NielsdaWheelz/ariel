@@ -27,6 +27,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ariel.action_runtime import (
@@ -48,6 +49,7 @@ from ariel.capture_ingress import CaptureIngressError, CaptureRecordRequest, rec
 from ariel.clock import utcnow
 from ariel.config import AppSettings
 from ariel.db import SchemaReadinessProbe
+from ariel.db_errors import is_serialization_failure, is_unique_constraint_failure
 from ariel.google_connector import (
     DefaultGoogleOAuthClient,
     DefaultGoogleWorkspaceProvider,
@@ -151,6 +153,8 @@ RotationReason = Literal["user_initiated", "threshold_turn_count", "threshold_ag
 AutoRotationReason = Literal["threshold_turn_count", "threshold_age"]
 
 _TAINT_LOOKBACK_TURNS = 12
+_AGENCY_EVENT_PERSISTENCE_ATTEMPTS = 3
+_AGENCY_EVENT_SOURCE_EXTERNAL_ID_CONSTRAINT = "uq_agency_event_source_external_id"
 
 _CONTEXT_SECTION_ORDER: tuple[str, ...] = (
     "policy_system_instructions",
@@ -911,7 +915,7 @@ def _tool_surface_facts(
         else 0
     )
     search_web_bound = settings.search_web_api_key is not None
-    web_extract_bound = settings.web_extract_provider_endpoint is not None or search_web_bound
+    web_extract_bound = settings.jina_api_key is not None
     return {
         "google": {
             "connected": connector is not None
@@ -928,9 +932,10 @@ def _tool_surface_facts(
             "agency": agency_configured,
             "web_extract": web_extract_bound,
             "search_web": search_web_bound,
-            "search_news": search_web_bound,
             "maps": settings.maps_api_key is not None,
-            "weather": settings.weather_provider_mode == "dev"
+            "weather": (
+                settings.deployment_mode != "production" and settings.weather_provider_mode == "dev"
+            )
             or settings.weather_production_api_key is not None,
         },
     }
@@ -1495,6 +1500,7 @@ def _wake(
         output_mode="message",
         finding_mode="",
         prompt_version=MAIN_AGENT_PROMPT_VERSION,
+        model_ref=MAIN,
         budget_seconds=float(runtime.settings.main_turn_budget_seconds),
         max_model_calls=int(runtime.settings.agent_loop_max_model_calls),
         is_main_agent_loop=True,
@@ -1726,7 +1732,14 @@ def create_app(
                 run_sandbox.close()
             engine.dispose()
 
-    app = FastAPI(title="Ariel", lifespan=lifespan)
+    generated_docs_enabled = settings.deployment_mode != "production"
+    app = FastAPI(
+        title="Ariel",
+        lifespan=lifespan,
+        openapi_url="/openapi.json" if generated_docs_enabled else None,
+        docs_url="/docs" if generated_docs_enabled else None,
+        redoc_url="/redoc" if generated_docs_enabled else None,
+    )
     app.state.runtime = runtime
     app.state.engine = engine
     app.state.session_factory = session_factory
@@ -2012,73 +2025,91 @@ def create_app(
                 retryable=False,
             ) from exc
 
-        with session_factory() as db:
-            with db.begin():
-                existing_event = db.scalar(
-                    select(AgencyEventRecord)
-                    .where(
-                        AgencyEventRecord.source == agency_event_payload.source,
-                        AgencyEventRecord.external_event_id == agency_event_payload.event_id,
-                    )
-                    .limit(1)
-                )
-                stored_payload = agency_event_payload.model_dump()
-                if existing_event is not None:
-                    if (
-                        existing_event.event_type != agency_event_payload.event_type
-                        or existing_event.external_job_id != agency_event_payload.external_job_id
-                        or existing_event.payload != stored_payload
-                    ):
-                        raise ApiError(
-                            status_code=409,
-                            code="E_AGENCY_EVENT_CONFLICT",
-                            message="agency event id was reused with different payload",
-                            details={
-                                "source": agency_event_payload.source,
-                                "event_id": agency_event_payload.event_id,
-                            },
-                            retryable=False,
+        stored_payload = agency_event_payload.model_dump()
+        for attempt_index in range(_AGENCY_EVENT_PERSISTENCE_ATTEMPTS):
+            try:
+                with session_factory() as db:
+                    with db.begin():
+                        existing_event = db.scalar(
+                            select(AgencyEventRecord)
+                            .where(
+                                AgencyEventRecord.source == agency_event_payload.source,
+                                AgencyEventRecord.external_event_id
+                                == agency_event_payload.event_id,
+                            )
+                            .limit(1)
                         )
-                    return JSONResponse(
-                        status_code=202,
-                        content={
-                            "ok": True,
-                            "duplicate": True,
-                            "agency_event": serialize_agency_event(existing_event),
-                        },
-                    )
+                        if existing_event is not None:
+                            if (
+                                existing_event.event_type != agency_event_payload.event_type
+                                or existing_event.external_job_id
+                                != agency_event_payload.external_job_id
+                                or existing_event.payload != stored_payload
+                            ):
+                                raise ApiError(
+                                    status_code=409,
+                                    code="E_AGENCY_EVENT_CONFLICT",
+                                    message="agency event id was reused with different payload",
+                                    details={
+                                        "source": agency_event_payload.source,
+                                        "event_id": agency_event_payload.event_id,
+                                    },
+                                    retryable=False,
+                                )
+                            return JSONResponse(
+                                status_code=202,
+                                content={
+                                    "ok": True,
+                                    "duplicate": True,
+                                    "agency_event": serialize_agency_event(existing_event),
+                                },
+                            )
 
-                now = utcnow()
-                agency_event = AgencyEventRecord(
-                    id=new_id("age"),
-                    source=agency_event_payload.source,
-                    external_event_id=agency_event_payload.event_id,
-                    event_type=agency_event_payload.event_type,
-                    external_job_id=agency_event_payload.external_job_id,
-                    payload=stored_payload,
-                    status="accepted",
-                    error=None,
-                    created_at=now,
-                    received_at=now,
-                    processed_at=None,
-                )
-                db.add(agency_event)
-                db.flush()
-                task = enqueue_background_task(
-                    db,
-                    task_type="agency_event_received",
-                    payload={"agency_event_id": agency_event.id},
-                    now=now,
-                )
-                return JSONResponse(
-                    status_code=202,
-                    content={
-                        "ok": True,
-                        "duplicate": False,
-                        "agency_event": serialize_agency_event(agency_event),
-                        "task_id": task.id,
-                    },
-                )
+                        now = utcnow()
+                        agency_event = AgencyEventRecord(
+                            id=new_id("age"),
+                            source=agency_event_payload.source,
+                            external_event_id=agency_event_payload.event_id,
+                            event_type=agency_event_payload.event_type,
+                            external_job_id=agency_event_payload.external_job_id,
+                            payload=stored_payload,
+                            status="accepted",
+                            error=None,
+                            created_at=now,
+                            received_at=now,
+                            processed_at=None,
+                        )
+                        db.add(agency_event)
+                        db.flush()
+                        task = enqueue_background_task(
+                            db,
+                            task_type="agency_event_received",
+                            payload={"agency_event_id": agency_event.id},
+                            now=now,
+                        )
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                "ok": True,
+                                "duplicate": False,
+                                "agency_event": serialize_agency_event(agency_event),
+                                "task_id": task.id,
+                            },
+                        )
+            except IntegrityError as exc:
+                if not is_unique_constraint_failure(
+                    exc,
+                    _AGENCY_EVENT_SOURCE_EXTERNAL_ID_CONSTRAINT,
+                ):
+                    raise
+                if attempt_index == _AGENCY_EVENT_PERSISTENCE_ATTEMPTS - 1:
+                    raise
+            except DBAPIError as exc:
+                if not is_serialization_failure(exc):
+                    raise
+                if attempt_index == _AGENCY_EVENT_PERSISTENCE_ATTEMPTS - 1:
+                    raise
+        raise RuntimeError("agency event persistence retry exhausted")
 
     @app.post("/v1/sessions")
     def create_or_get_session() -> dict[str, Any]:

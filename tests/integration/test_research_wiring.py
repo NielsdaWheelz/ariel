@@ -45,6 +45,7 @@ from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
+    drain_task,
     empty_recall_response,
     is_memory_subsystem_call,
     run_function_calls,
@@ -881,3 +882,165 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
         assert wake_log.taint == "tainted"
         assert "Research run result" in wake_log.content
         assert "Paris is the capital of France." in wake_log.content
+
+
+class _ResearchEndToEndAdapter(FakeModelAdapter):
+    """The first non-memory call completes research; the second answers the wake."""
+
+    provider = "provider.research-e2e"
+    model = "model.research-e2e-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots: list[str] = []
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, messages=request.messages
+            )
+        self.snapshots.append(json.dumps(jsonable_encoder(request.messages)))
+        from tests.integration.responses_helpers import run_response  # noqa: PLC0415
+
+        if len(self.snapshots) == 1:
+            source = _FINDING_PROGRAM
+        else:
+            source = "agent.emit_message(text='Research completion delivered.')\n"
+        return run_response(
+            source=source,
+            provider=self.provider,
+            model=self.model,
+            provider_response_id=f"resp_research_e2e_{len(self.snapshots)}",
+            input_tokens=3,
+            output_tokens=2,
+        )
+
+
+def test_research_investigate_run_program_worker_drains_research_and_completion_wake_end_to_end(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``research_run`` row created by the syscall is drained by the worker,
+    then its generated completion wake is drained into the main-agent context."""
+
+    _stub_memory_retriever(monkeypatch)
+    current_now = {"value": NOW}
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: current_now["value"])
+    monkeypatch.setattr("ariel.app.utcnow", lambda: current_now["value"])
+    adapter = _ResearchEndToEndAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        session_response = client.get("/v1/sessions/active")
+        assert session_response.status_code == 200
+        session_id = session_response.json()["session"]["id"]
+        with session_factory() as db:
+            with db.begin():
+                turn = TurnRecord(
+                    id="trn_research_e2e",
+                    session_id=session_id,
+                    user_message="research this for me",
+                    assistant_message=None,
+                    status="in_progress",
+                    created_at=NOW - timedelta(minutes=5),
+                    updated_at=NOW - timedelta(minutes=5),
+                )
+                db.add(turn)
+                ctx = run_function_calls(
+                    db=db,
+                    session_id=session_id,
+                    turn=turn,
+                    function_calls_raw=[
+                        {
+                            "call_id": "call_research_e2e",
+                            "capability_id": "cap.research.investigate",
+                            "input": {
+                                "question": "What is the capital of France?",
+                                "mode": "web",
+                            },
+                            "influenced_by_untrusted_content": False,
+                        }
+                    ],
+                    approval_ttl_seconds=300,
+                    approval_actor_id="usr_research_e2e",
+                    add_event=lambda _event_type, _payload: None,
+                    now_fn=lambda: NOW,
+                    new_id_fn=lambda prefix: f"{prefix}_research_e2e",
+                    allowed_capability_ids=["cap.research.investigate"],
+                    runtime_provenance=RuntimeProvenance(status="clean"),
+                )
+                turn.status = "completed"
+                turn.assistant_message = "research queued"
+                turn.updated_at = NOW - timedelta(minutes=4)
+
+        assert ctx.blocked_reasons == []
+        assert len(ctx.inline_results) == 1
+        output = ctx.inline_results[0]["output"]
+        assert output["status"] == "queued"
+        research_task_id = output["research_id"]
+        drain_task(client, research_task_id)
+
+        with session_factory() as db:
+            completion_wake = db.scalar(
+                select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
+            )
+            assert completion_wake is not None
+            completion_wake_id = completion_wake.id
+            assert completion_wake.payload["session_id"] == session_id
+            assert completion_wake.payload["research_finding"]["summary"] == "France is in Europe."
+
+        current_now["value"] = NOW + timedelta(minutes=1)
+        drain_task(client, completion_wake_id)
+
+    assert len(adapter.snapshots) == 2
+    assert "What is the capital of France?" in adapter.snapshots[0]
+    assert "Research run result" in adapter.snapshots[1]
+    assert "France is in Europe." in adapter.snapshots[1]
+    with session_factory() as db:
+        assert db.get(BackgroundTaskRecord, research_task_id) is None
+        assert db.get(BackgroundTaskRecord, completion_wake_id) is None
+        recorded_turns = db.scalars(
+            select(TurnRecord)
+            .where(TurnRecord.session_id == session_id)
+            .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+        ).all()
+        research_turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "research"))
+        assert research_turn is not None
+        assert research_turn.status == "completed"
+        completion_turn = db.scalar(
+            select(TurnRecord)
+            .where(
+                TurnRecord.session_id == session_id,
+                TurnRecord.kind == "agent_turn",
+                TurnRecord.assistant_message == "Research completion delivered.",
+            )
+            .order_by(TurnRecord.created_at.desc())
+        )
+        assert completion_turn is not None, [
+            {
+                "id": turn.id,
+                "kind": turn.kind,
+                "status": turn.status,
+                "user_message": turn.user_message,
+                "assistant_message": turn.assistant_message,
+                "created_at": turn.created_at.isoformat(),
+            }
+            for turn in recorded_turns
+        ]
+        assert completion_turn.status == "completed"
+        assert completion_turn.assistant_message == "Research completion delivered."
+        completion_wake_log = db.scalar(
+            select(MemoryLogRecord).where(
+                MemoryLogRecord.kind == "proactive_trigger",
+                MemoryLogRecord.turn_id == completion_turn.id,
+            )
+        )
+        assert completion_wake_log is not None
+        assert completion_wake_log.taint == "tainted"
+        assert "Research run result" in completion_wake_log.content
+        assert "France is in Europe." in completion_wake_log.content

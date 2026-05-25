@@ -18,10 +18,39 @@ from ariel.persistence import MEMORY_EMBEDDING_DIMENSIONS
 
 STRONG_LOCAL_AUTH_TOKEN = "test_local_auth_token_0123456789abcdef"
 CONNECTOR_KEYRING = '{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}'
+MODEL_PROVIDER_SETTINGS = {
+    "openai_api_key": "openai-key",
+    "anthropic_api_key": "anthropic-key",
+    "google_api_key": "google-key",
+    "openrouter_api_key": "openrouter-key",
+}
 
 
 def _app_settings_without_env_files() -> AppSettings:
     return cast(Any, AppSettings)(_env_file=None)
+
+
+def _set_model_provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("ARIEL_ANTHROPIC_API_KEY", "anthropic-key")
+    monkeypatch.setenv("ARIEL_GOOGLE_API_KEY", "google-key")
+    monkeypatch.setenv("ARIEL_OPENROUTER_API_KEY", "openrouter-key")
+
+
+def _set_required_production_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ARIEL_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", STRONG_LOCAL_AUTH_TOKEN)
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com")
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_OAUTH_REDIRECT_URI",
+        "https://ariel.example.com/v1/connectors/google/callback",
+    )
+    monkeypatch.setenv("ARIEL_AGENCY_SOCKET_PATH", "/tmp/agencyd.sock")
+    monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "/opt/ariel,/opt/agency")
+    _set_model_provider_env(monkeypatch)
 
 
 def test_agency_runtime_binding_requires_reachable_daemon(
@@ -71,7 +100,7 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
             [
                 "ARIEL_DATABASE_URL=postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
                 "ARIEL_BIND_PORT=8123",
-                "ARIEL_MODEL_NAME=env-file-model",
+                "ARIEL_MODEL_REASONING_EFFORT=low",
             ]
         ),
         encoding="utf-8",
@@ -90,7 +119,7 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
                 "print(json.dumps({\n"
                 "    'database_url': settings.database_url,\n"
                 "    'bind_port': settings.bind_port,\n"
-                "    'model_name': settings.model_name,\n"
+                "    'model_reasoning_effort': settings.model_reasoning_effort,\n"
                 "}))\n"
             ),
         ],
@@ -104,8 +133,31 @@ def test_app_settings_honors_ariel_env_file_override(tmp_path: Path) -> None:
     assert json.loads(result.stdout) == {
         "database_url": "postgresql+psycopg://dev-user:dev-pass@localhost/dev-db",
         "bind_port": 8123,
-        "model_name": "env-file-model",
+        "model_reasoning_effort": "low",
     }
+
+
+@pytest.mark.uses_real_env_files
+def test_app_settings_rejects_missing_ariel_env_file_override(tmp_path: Path) -> None:
+    missing_env_file = tmp_path / "missing.env"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("ARIEL_")}
+    env["ARIEL_ENV_FILE"] = str(missing_env_file)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from ariel.config import AppSettings\nAppSettings()\n",
+        ],
+        check=False,
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "ARIEL_ENV_FILE points to missing env file" in result.stderr
 
 
 def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,6 +168,30 @@ def test_create_app_uses_ariel_database_url_env(monkeypatch: pytest.MonkeyPatch)
     app = create_app()
     try:
         assert str(app.state.engine.url) == "postgresql+psycopg://env-user:***@localhost/env-db"
+    finally:
+        app.state.engine.dispose()
+
+
+def test_create_app_disables_generated_docs_routes_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ARIEL_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", "test-local-auth-token-1234567890abcdef")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-test-secret")
+    monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", '{"v1":"AAAAAAAAAAAAAAAAAAAAAA"}')
+    monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.test")
+    _set_model_provider_env(monkeypatch)
+    monkeypatch.setenv(
+        "ARIEL_GOOGLE_OAUTH_REDIRECT_URI",
+        "https://ariel.example.test/v1/connectors/google/callback",
+    )
+    monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "/opt/ariel")
+
+    app = create_app(database_url="postgresql+psycopg://test:test@localhost/ariel_doc_check")
+    try:
+        paths = {getattr(route, "path", "") for route in app.routes}
+        assert {"/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}.isdisjoint(paths)
     finally:
         app.state.engine.dispose()
 
@@ -185,6 +261,7 @@ def test_production_rejects_unauthenticated_local_api() -> None:
                 "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
                 "connector_encryption_secret": "prod-connector-secret",
                 "connector_encryption_keys": CONNECTOR_KEYRING,
+                **MODEL_PROVIDER_SETTINGS,
             }
         )
 
@@ -198,6 +275,7 @@ def test_production_rejects_dev_connector_encryption_secret() -> None:
                 "local_auth_token": STRONG_LOCAL_AUTH_TOKEN,
                 "connector_encryption_secret": "dev-local-connector-secret",
                 "connector_encryption_keys": CONNECTOR_KEYRING,
+                **MODEL_PROVIDER_SETTINGS,
             }
         )
 
@@ -210,7 +288,31 @@ def test_production_requires_connector_keyring() -> None:
             local_auth_required=True,
             local_auth_token=STRONG_LOCAL_AUTH_TOKEN,
             connector_encryption_secret="prod-connector-secret",
+            **MODEL_PROVIDER_SETTINGS,
         )
+
+
+def test_production_requires_current_model_provider_keys() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        cast(Any, AppSettings)(
+            _env_file=None,
+            deployment_mode="production",
+            local_auth_required=True,
+            local_auth_token=STRONG_LOCAL_AUTH_TOKEN,
+            connector_encryption_secret="prod-connector-secret",
+            connector_encryption_keys=CONNECTOR_KEYRING,
+            public_webhook_base_url="https://ariel.example.com",
+            google_oauth_redirect_uri="https://ariel.example.com/v1/connectors/google/callback",
+            agency_allowed_repo_roots="/opt/ariel,/opt/agency",
+        )
+
+    message = str(exc_info.value)
+    assert "current model provider keys" in message
+    assert "ARIEL_GOOGLE_API_KEY" in message
+    assert "ARIEL_OPENAI_API_KEY" in message
+    assert "ARIEL_OPENROUTER_API_KEY" in message
+    assert "ARIEL_ANTHROPIC_API_KEY" not in message
+    assert "ARIEL_CLOUDFLARE_API_TOKEN" not in message
 
 
 def test_local_auth_rejects_weak_tokens() -> None:
@@ -273,6 +375,7 @@ def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.Monke
         ("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "0"),
         ("ARIEL_MAX_RESPONSE_TOKENS", "0"),
         ("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0"),
+        ("ARIEL_MODEL_TIMEOUT_SECONDS", "0"),
         ("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "0"),
         ("ARIEL_AGENT_LOOP_LIVE_ROUNDS", "0"),
         ("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "0"),
@@ -348,8 +451,7 @@ def test_provider_runtime_settings_default_to_production_values() -> None:
     assert settings.search_brave_base_url == "https://api.search.brave.com/res/v1"
     assert settings.search_web_timeout_seconds == 8.0
     assert settings.search_web_api_key is None
-    assert settings.search_news_timeout_seconds == 8.0
-    assert settings.web_extract_provider_endpoint is None
+    assert settings.jina_api_key is None
     assert settings.web_extract_timeout_seconds == 10.0
     assert settings.web_extract_max_retries == 2
     assert settings.maps_api_key is None
@@ -367,8 +469,7 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ARIEL_SEARCH_BRAVE_BASE_URL", "https://search.example.test/res/v1")
     monkeypatch.setenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS", "3.5")
     monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "search-key")
-    monkeypatch.setenv("ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS", "4.5")
-    monkeypatch.setenv("ARIEL_WEB_EXTRACT_PROVIDER_ENDPOINT", "https://extract.example.test")
+    monkeypatch.setenv("ARIEL_JINA_API_KEY", "jina-key")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS", "5.5")
     monkeypatch.setenv("ARIEL_WEB_EXTRACT_MAX_RETRIES", "4")
     monkeypatch.setenv("ARIEL_MAPS_API_KEY", "maps-key")
@@ -386,8 +487,7 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.search_brave_base_url == "https://search.example.test/res/v1"
     assert settings.search_web_timeout_seconds == 3.5
     assert settings.search_web_api_key == "search-key"
-    assert settings.search_news_timeout_seconds == 4.5
-    assert settings.web_extract_provider_endpoint == "https://extract.example.test"
+    assert settings.jina_api_key == "jina-key"
     assert settings.web_extract_timeout_seconds == 5.5
     assert settings.web_extract_max_retries == 4
     assert settings.maps_api_key == "maps-key"
@@ -399,6 +499,64 @@ def test_provider_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch
     assert settings.weather_dev_endpoint == "https://wttr.example.test"
     assert settings.weather_dev_timeout_seconds == 8.5
     assert settings.weather_default_location == "Austin, TX"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value"),
+    [
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "http://api.search.brave.com/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://user:pass@api.search.brave.com/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://127.0.0.1/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://10.0.0.10/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://localhost/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://api.search.brave.com:8443/res/v1"),
+        ("ARIEL_SEARCH_BRAVE_BASE_URL", "https://api.search.brave.com/res/v1?debug=1"),
+        ("ARIEL_WEATHER_PRODUCTION_ENDPOINT", "http://api.tomorrow.io/v4/weather/forecast"),
+        ("ARIEL_WEATHER_DEV_ENDPOINT", "https://wttr.local"),
+    ],
+)
+def test_provider_endpoint_settings_reject_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValidationError):
+        _app_settings_without_env_files()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value", "match"),
+    [
+        (
+            "ARIEL_WEATHER_PROVIDER_MODE",
+            "dev",
+            "weather_provider_mode=dev is not allowed in production",
+        ),
+        (
+            "ARIEL_SEARCH_BRAVE_BASE_URL",
+            "https://search.example.test/res/v1",
+            "search_brave_base_url must use",
+        ),
+        (
+            "ARIEL_WEATHER_PRODUCTION_ENDPOINT",
+            "https://weather.example.test",
+            "weather_production_endpoint must use",
+        ),
+    ],
+)
+def test_production_rejects_dev_weather_and_custom_provider_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    value: str,
+    match: str,
+) -> None:
+    _set_required_production_env(monkeypatch)
+    monkeypatch.setenv(env_name, value)
+
+    with pytest.raises(ValidationError, match=match):
+        _app_settings_without_env_files()
 
 
 def test_attachment_scanner_mode_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,7 +580,6 @@ def test_attachment_scanner_mode_rejects_unknown_env_value(
     "env_name",
     [
         "ARIEL_SEARCH_WEB_TIMEOUT_SECONDS",
-        "ARIEL_SEARCH_NEWS_TIMEOUT_SECONDS",
         "ARIEL_WEB_EXTRACT_TIMEOUT_SECONDS",
         "ARIEL_MAPS_TIMEOUT_SECONDS",
         "ARIEL_WEATHER_PRODUCTION_TIMEOUT_SECONDS",
@@ -529,6 +686,7 @@ def test_production_requires_public_webhook_base_url(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ARIEL_LOCAL_AUTH_TOKEN", STRONG_LOCAL_AUTH_TOKEN)
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
+    _set_model_provider_env(monkeypatch)
 
     with pytest.raises(ValidationError, match="public_webhook_base_url is required in production"):
         _app_settings_without_env_files()
@@ -626,6 +784,7 @@ def test_production_requires_google_redirect_to_match_public_webhook_base(
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com")
+    _set_model_provider_env(monkeypatch)
     monkeypatch.setenv("ARIEL_GOOGLE_OAUTH_REDIRECT_URI", "https://other.example.com/callback")
     monkeypatch.setenv("ARIEL_AGENCY_SOCKET_PATH", "/tmp/agencyd.sock")
     monkeypatch.setenv("ARIEL_AGENCY_ALLOWED_REPO_ROOTS", "/opt/ariel,/opt/agency")
@@ -643,6 +802,7 @@ def test_production_requires_absolute_agency_socket_and_roots(
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_SECRET", "prod-not-default")
     monkeypatch.setenv("ARIEL_CONNECTOR_ENCRYPTION_KEYS", CONNECTOR_KEYRING)
     monkeypatch.setenv("ARIEL_PUBLIC_WEBHOOK_BASE_URL", "https://ariel.example.com")
+    _set_model_provider_env(monkeypatch)
     monkeypatch.setenv(
         "ARIEL_GOOGLE_OAUTH_REDIRECT_URI",
         "https://ariel.example.com/v1/connectors/google/callback",

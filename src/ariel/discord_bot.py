@@ -10,6 +10,7 @@ from discord.ext import commands
 import httpx
 
 from .config import AppSettings
+from .discord_actions import is_ariel_custom_id, parse_approval_custom_id
 
 _log = logging.getLogger(__name__)
 
@@ -20,9 +21,6 @@ class DiscordBotConfigError(Exception):
 
 class ArielDiscordError(Exception):
     pass
-
-
-_APPROVAL_CUSTOM_ID_PREFIX = "ariel:approval:"
 
 
 def format_discord_message(message: str) -> str:
@@ -314,7 +312,7 @@ class ArielDiscordBot(commands.Bot):
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         data = interaction.data
         custom_id = data.get("custom_id") if isinstance(data, dict) else None
-        if not isinstance(custom_id, str) or not _is_ariel_custom_id(custom_id):
+        if not isinstance(custom_id, str) or not is_ariel_custom_id(custom_id):
             return
         if interaction.response.is_done():
             return
@@ -414,18 +412,17 @@ class ArielDiscordBot(commands.Bot):
         interaction: discord.Interaction,
         custom_id: str,
     ) -> None:
-        if custom_id.startswith(_APPROVAL_CUSTOM_ID_PREFIX):
-            decision_and_ref = custom_id.removeprefix(_APPROVAL_CUSTOM_ID_PREFIX)
-            decision, separator, approval_ref = decision_and_ref.partition(":")
-            if separator and decision in {"approve", "deny"} and approval_ref:
-                await _edit_with_approval_decision(
-                    interaction=interaction,
-                    ariel_base_url=self.ariel_base_url,
-                    ariel_auth_token=self.ariel_auth_token,
-                    approval_ref=approval_ref,
-                    decision=decision,
-                )
-                return
+        approval_action = parse_approval_custom_id(custom_id)
+        if approval_action is not None:
+            decision, approval_ref = approval_action
+            await _edit_with_approval_decision(
+                interaction=interaction,
+                ariel_base_url=self.ariel_base_url,
+                ariel_auth_token=self.ariel_auth_token,
+                approval_ref=approval_ref,
+                decision=decision,
+            )
+            return
         await interaction.response.send_message(
             "Ariel action failed: invalid Discord action id.",
             ephemeral=True,
@@ -556,10 +553,6 @@ def _format_jobs_for_discord(jobs: list[Any]) -> str:
     if len(lines) == 1:
         raise ArielDiscordError("Ariel returned an invalid jobs response.")
     return "\n".join(lines)
-
-
-def _is_ariel_custom_id(custom_id: str) -> bool:
-    return custom_id.startswith(_APPROVAL_CUSTOM_ID_PREFIX)
 
 
 def _discord_context_for_message(

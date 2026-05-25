@@ -51,7 +51,7 @@ from .agent_loop import LoopConfig, ResearchFinding, run_agent_loop
 from .capability_registry import (
     RESEARCH_MEMORIES_CAPABILITY_IDS,
     RESEARCH_PERSONAL_CAPABILITY_IDS,
-    RESEARCH_WEB_CAPABILITY_IDS,
+    configured_research_web_capability_ids,
     run_callable_name_for_capability_id,
     run_callable_signature,
 )
@@ -59,6 +59,7 @@ from .clock import utcnow
 from .config import AppSettings
 from .google_connector import GoogleConnectorRuntime
 from .ids import new_id
+from .models import RESEARCH
 from .persistence import EventRecord, TurnRecord
 from .research_modes import ResearchMode
 from .run_runtime import ScratchEntry, run_tool_definitions
@@ -357,7 +358,7 @@ def run_research(
 
     match mode:
         case "web":
-            allowed_capability_ids = RESEARCH_WEB_CAPABILITY_IDS
+            allowed_capability_ids = configured_research_web_capability_ids(settings)
         case "personal":
             allowed_capability_ids = RESEARCH_PERSONAL_CAPABILITY_IDS
         case "memories":
@@ -437,6 +438,7 @@ def run_research(
         output_mode="finding",
         finding_mode=mode,
         prompt_version=RESEARCH_PROMPT_VERSION,
+        model_ref=RESEARCH,
         budget_seconds=float(settings.research_run_budget_seconds),
         max_model_calls=int(settings.agent_loop_max_model_calls),
         is_main_agent_loop=False,

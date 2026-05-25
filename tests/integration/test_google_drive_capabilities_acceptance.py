@@ -14,7 +14,12 @@ from ariel.google_connector import (
     GoogleWorkspaceProvider,
 )
 from tests.integration.app_helpers import create_test_app
-from ariel.persistence import ArtifactRecord, ProviderWriteReceiptRecord
+from ariel.persistence import (
+    ArtifactRecord,
+    GoogleConnectorEventRecord,
+    GoogleOAuthStateRecord,
+    ProviderWriteReceiptRecord,
+)
 from tests.integration.responses_helpers import (
     FakeModelAdapter,
     empty_recall_response,
@@ -37,7 +42,9 @@ GOOGLE_DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 GOOGLE_DRIVE_SHARE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GOOGLE_GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GOOGLE_GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GOOGLE_CALENDAR_WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+GOOGLE_CALENDAR_FREEBUSY_SCOPE = "https://www.googleapis.com/auth/calendar.freebusy"
 GOOGLE_OPENID_SCOPE = "openid"
 GOOGLE_USERINFO_EMAIL_SCOPE = "https://www.googleapis.com/auth/userinfo.email"
 GOOGLE_USERINFO_PROFILE_SCOPE = "https://www.googleapis.com/auth/userinfo.profile"
@@ -821,6 +828,183 @@ def test_drive_reconnect_intent_is_capability_scoped_and_least_privilege(
             assert GOOGLE_USERINFO_PROFILE_SCOPE in scopes
 
 
+@pytest.mark.parametrize(
+    ("capability_intent", "expected_scope"),
+    [
+        ("cap.calendar.list", GOOGLE_CALENDAR_READ_SCOPE),
+        ("cap.calendar.list_calendars", GOOGLE_CALENDAR_READ_SCOPE),
+        ("cap.calendar.propose_slots", GOOGLE_CALENDAR_FREEBUSY_SCOPE),
+        ("cap.email.search", GOOGLE_GMAIL_READ_SCOPE),
+        ("cap.email.read", GOOGLE_GMAIL_READ_SCOPE),
+        ("cap.calendar.create_event", GOOGLE_CALENDAR_WRITE_SCOPE),
+        ("cap.calendar.update_event", GOOGLE_CALENDAR_WRITE_SCOPE),
+        ("cap.calendar.respond_to_event", GOOGLE_CALENDAR_WRITE_SCOPE),
+        ("cap.email.draft", GOOGLE_GMAIL_COMPOSE_SCOPE),
+        ("cap.email.send", GOOGLE_GMAIL_SEND_SCOPE),
+        ("cap.email.archive", GOOGLE_GMAIL_MODIFY_SCOPE),
+        ("cap.email.trash", GOOGLE_GMAIL_MODIFY_SCOPE),
+        ("cap.email.labels.modify", GOOGLE_GMAIL_MODIFY_SCOPE),
+        ("cap.email.undo", GOOGLE_GMAIL_MODIFY_SCOPE),
+        ("cap.drive.search", GOOGLE_DRIVE_METADATA_READ_SCOPE),
+        ("cap.drive.read", GOOGLE_DRIVE_READ_SCOPE),
+        ("cap.drive.share", GOOGLE_DRIVE_SHARE_SCOPE),
+    ],
+)
+def test_smoke_unblock_reconnect_intents_request_expected_scope(
+    postgres_url: str,
+    capability_intent: str,
+    expected_scope: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-read-only": FakeTokenBundle(
+                account_subject="sub_smoke_scope",
+                account_email="smoke-scope@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_smoke_read_only",
+                refresh_token="tok_refresh_smoke_read_only",
+            )
+        }
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-read-only")
+
+        reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": capability_intent},
+        )
+
+    assert reconnect.status_code == 200
+    requested_scopes = set(reconnect.json()["oauth"]["requested_scopes"])
+    assert {
+        GOOGLE_CALENDAR_READ_SCOPE,
+        GOOGLE_GMAIL_READ_SCOPE,
+        GOOGLE_OPENID_SCOPE,
+        GOOGLE_USERINFO_EMAIL_SCOPE,
+        GOOGLE_USERINFO_PROFILE_SCOPE,
+        expected_scope,
+    }.issubset(requested_scopes)
+    assert reconnect.json()["oauth"]["capability_intent"] == capability_intent
+    assert reconnect.json()["oauth"]["capability_intents"] == [capability_intent]
+
+
+def test_smoke_unblock_reconnect_accepts_comma_separated_intents_in_one_call(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-read-only": FakeTokenBundle(
+                account_subject="sub_smoke_bundle",
+                account_email="smoke-bundle@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_smoke_bundle",
+                refresh_token="tok_refresh_smoke_bundle",
+            )
+        }
+    )
+    bundle_intents = [
+        "cap.calendar.propose_slots",
+        "cap.calendar.create_event",
+        "cap.email.draft",
+        "cap.email.send",
+        "cap.email.archive",
+        "cap.drive.search",
+        "cap.drive.read",
+        "cap.drive.share",
+    ]
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-read-only")
+
+        reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": ",".join(bundle_intents)},
+        )
+        reconnect_events = client.get("/v1/connectors/google/events")
+
+    assert reconnect.status_code == 200
+    assert reconnect_events.status_code == 200
+    body = reconnect.json()
+    requested_scopes = set(body["oauth"]["requested_scopes"])
+    assert {
+        GOOGLE_CALENDAR_READ_SCOPE,
+        GOOGLE_GMAIL_READ_SCOPE,
+        GOOGLE_OPENID_SCOPE,
+        GOOGLE_USERINFO_EMAIL_SCOPE,
+        GOOGLE_USERINFO_PROFILE_SCOPE,
+        GOOGLE_CALENDAR_FREEBUSY_SCOPE,
+        GOOGLE_CALENDAR_WRITE_SCOPE,
+        GOOGLE_GMAIL_COMPOSE_SCOPE,
+        GOOGLE_GMAIL_SEND_SCOPE,
+        GOOGLE_GMAIL_MODIFY_SCOPE,
+        GOOGLE_DRIVE_METADATA_READ_SCOPE,
+        GOOGLE_DRIVE_READ_SCOPE,
+        GOOGLE_DRIVE_SHARE_SCOPE,
+    }.issubset(requested_scopes)
+    assert body["oauth"]["capability_intent"] == ",".join(bundle_intents)
+    assert body["oauth"]["capability_intents"] == bundle_intents
+    reconnect_started = next(
+        event
+        for event in reconnect_events.json()["events"]
+        if event["event_type"] == "evt.connector.google.reconnect.started"
+    )
+    reconnect_started_payload = reconnect_started["payload"]
+    assert reconnect_started_payload["capability_intent"] == ",".join(bundle_intents)
+    assert reconnect_started_payload["capability_intents"] == bundle_intents
+    assert set(reconnect_started_payload["requested_scopes"]) == requested_scopes
+
+
+def test_smoke_unblock_reconnect_rejects_any_invalid_intent_in_comma_list(
+    postgres_url: str,
+) -> None:
+    oauth_client = FakeGoogleOAuthClient(
+        tokens_by_code={
+            "connect-read-only": FakeTokenBundle(
+                account_subject="sub_smoke_invalid",
+                account_email="smoke-invalid@example.com",
+                granted_scopes=[GOOGLE_CALENDAR_READ_SCOPE, GOOGLE_GMAIL_READ_SCOPE],
+                access_token="tok_access_smoke_invalid",
+                refresh_token="tok_refresh_smoke_invalid",
+            )
+        }
+    )
+    with _build_client(postgres_url, ActionProposalAdapter()) as client:
+        _bind_google_fakes(
+            client,
+            oauth_client=oauth_client,
+            workspace_provider=FakeGoogleWorkspaceProvider(),
+        )
+        _connect_google(client, code="connect-read-only")
+        session_factory = cast(Any, client.app).state.session_factory
+        with session_factory() as db:
+            oauth_states_before = len(db.scalars(select(GoogleOAuthStateRecord)).all())
+            connector_events_before = len(db.scalars(select(GoogleConnectorEventRecord)).all())
+
+        reconnect = client.post(
+            "/v1/connectors/google/reconnect",
+            params={"capability_intent": "cap.email.send,cap.bogus.intent"},
+        )
+        with session_factory() as db:
+            oauth_states_after = len(db.scalars(select(GoogleOAuthStateRecord)).all())
+            connector_events_after = len(db.scalars(select(GoogleConnectorEventRecord)).all())
+
+    assert reconnect.status_code == 400
+    body = reconnect.json()
+    assert body["error"]["code"] == "E_CONNECTOR_RECONNECT_INVALID_INTENT"
+    assert body["error"]["details"]["reason"] == ("unsupported capability intent: cap.bogus.intent")
+    assert oauth_states_after == oauth_states_before
+    assert connector_events_after == connector_events_before
+
+
 def test_drive_share_is_approval_gated_exact_payload_and_exactly_once(
     postgres_url: str,
 ) -> None:
@@ -1102,6 +1286,21 @@ def test_drive_auth_scope_failures_are_typed_and_recoverable(
 
 
 @pytest.mark.parametrize(
+    ("message", "call", "expected_capability_id"),
+    [
+        (
+            "find risk register",
+            {"name": "drive.search", "input": {"query": "risk register"}},
+            "cap.drive.search",
+        ),
+        (
+            "read risk register",
+            {"name": "drive.read", "input": {"file_id": "drv_risk_register"}},
+            "cap.drive.read",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     ("provider_error", "expected_class", "expected_hint"),
     [
         ("google_upstream_timeout", "provider_timeout", "retry"),
@@ -1111,35 +1310,37 @@ def test_drive_auth_scope_failures_are_typed_and_recoverable(
 )
 def test_drive_provider_failures_are_typed_and_recoverable(
     postgres_url: str,
+    message: str,
+    call: dict[str, Any],
+    expected_capability_id: str,
     provider_error: str,
     expected_class: str,
     expected_hint: str,
 ) -> None:
     adapter = ActionProposalAdapter(
-        run_calls_by_message={
-            "find risk register": [{"name": "drive.search", "input": {"query": "risk register"}}]
-        },
+        run_calls_by_message={message: [call]},
         assistant_text_by_message={
-            "find risk register": f"{expected_class}: {expected_hint}.",
+            message: f"{expected_class}: {expected_hint}.",
         },
     )
     oauth_client = FakeGoogleOAuthClient(
         tokens_by_code={
-            "connect-drive-search": FakeTokenBundle(
-                account_subject="sub_drive_search",
-                account_email="drive-search@example.com",
+            "connect-drive": FakeTokenBundle(
+                account_subject="sub_drive",
+                account_email="drive@example.com",
                 granted_scopes=[
                     GOOGLE_CALENDAR_READ_SCOPE,
                     GOOGLE_GMAIL_READ_SCOPE,
                     GOOGLE_DRIVE_METADATA_READ_SCOPE,
+                    GOOGLE_DRIVE_READ_SCOPE,
                 ],
-                access_token="tok_access_drive_search",
-                refresh_token="tok_refresh_drive_search",
+                access_token="tok_access_drive",
+                refresh_token="tok_refresh_drive",
             )
         }
     )
     workspace_provider = FakeGoogleWorkspaceProvider(
-        provider_error_by_capability={"cap.drive.search": provider_error}
+        provider_error_by_capability={expected_capability_id: provider_error}
     )
     with _build_client(postgres_url, adapter) as client:
         _bind_google_fakes(
@@ -1147,14 +1348,17 @@ def test_drive_provider_failures_are_typed_and_recoverable(
             oauth_client=oauth_client,
             workspace_provider=workspace_provider,
         )
-        _connect_google(client, code="connect-drive-search")
+        _connect_google(client, code="connect-drive")
         session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="find risk register")
+        post_message_and_drain(client, session_id, message=message)
         turn_data = _turn_data(client, session_id)
         attempt = _surface_attempt(turn_data)
+        assert attempt["proposal"]["capability_id"] == expected_capability_id
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_class
+        assert attempt["execution"]["output"] is None
+        assert _turn_sources(client, turn_data["id"]) == []
 
         message = turn_data["assistant_message"].lower()
         assert expected_class in message

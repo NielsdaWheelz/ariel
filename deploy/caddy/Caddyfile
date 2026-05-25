@@ -1,8 +1,5 @@
 {
 	email niels@trysolid.com
-	servers {
-		trusted_proxies static private_ranges
-	}
 }
 
 ariel.nielseriknandal.com {
@@ -28,11 +25,19 @@ ariel.nielseriknandal.com {
 		-Server
 	}
 
-	handle /v1/providers/google/events {
+	@googleProviderEvents {
+		method POST
+		path /v1/providers/google/events
+	}
+	handle @googleProviderEvents {
 		reverse_proxy 127.0.0.1:8000
 	}
 
-	handle /v1/connectors/google/callback {
+	@googleConnectorCallback {
+		method GET
+		path /v1/connectors/google/callback
+	}
+	handle @googleConnectorCallback {
 		reverse_proxy 127.0.0.1:8000
 	}
 
