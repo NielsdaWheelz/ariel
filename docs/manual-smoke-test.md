@@ -77,9 +77,12 @@ directly; do not put it in `/etc/ariel/ariel.env`.
 | `ARIEL_CLOUDFLARE_ACCOUNT_ID` | no | Cloudflare Workers AI provider | Account id encoded into the Workers AI base URL; required when using the Cloudflare provider. |
 | `ARIEL_MODEL_TIMEOUT_SECONDS` | no | Model/audio calls | Model adapter calls and direct audio transcription time out within this bound; normal smoke turn completes. |
 | `ARIEL_MAX_RESPONSE_TOKENS` | no | Agent loop | Overlong output is rejected with bounded failure. |
-| `ARIEL_MAIN_TURN_BUDGET_SECONDS` | no | Agent loop | Budget exhaustion test completes gracefully. |
+| `ARIEL_TURN_BUDGET_SECONDS_SOFT` | no | Agent loop | Soft-budget wrap-up nudge fires once on overrun. |
+| `ARIEL_TURN_BUDGET_SECONDS_HARD` | no | Agent loop | Hard budget cold-stops the main loop as a safety net. |
+| `ARIEL_TURN_MAX_MODEL_CALLS_SOFT` | no | Agent loop | Soft-budget wrap-up nudge fires on model-call overrun. |
+| `ARIEL_TURN_MAX_MODEL_CALLS_HARD` | no | Agent loop | Hard model-call cap cold-stops the main loop. |
 | `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` | no | Research runtime | Research run timeout test or bounded manual research check. |
-| `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` | no | Agent loop | Backstop exhaustion test completes gracefully. |
+| `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` | no | Subagent loops | Backstop exhaustion for research / memory subagent loops. |
 | `ARIEL_AGENT_LOOP_LIVE_ROUNDS` | no | Agent loop | Prompt-context tests verify live window behavior. |
 | `ARIEL_RECENT_EVENTS_TOKEN_BUDGET` | no | Conversational continuity | Recent-events block render test stays under budget. |
 | `ARIEL_RECENT_EVENTS_MAX_ROWS` | no | Conversational continuity | Recent-events query respects row cap. |
@@ -249,7 +252,10 @@ the owning feature still needs its own live smoke row.
 | `ARIEL_JINA_API_KEY` | `passed` | `passed` | Validator/inventory guards track this key; redacted current env load: present; live `web.extract` Jina Reader smoke passed. |
 | `ARIEL_LOCAL_AUTH_REQUIRED` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present; protected-route auth smokes prove enforcement. |
 | `ARIEL_LOCAL_AUTH_TOKEN` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present; authenticated loopback smokes use it without printing it. |
-| `ARIEL_MAIN_TURN_BUDGET_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_TURN_BUDGET_SECONDS_SOFT` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_TURN_BUDGET_SECONDS_HARD` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_TURN_MAX_MODEL_CALLS_SOFT` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_TURN_MAX_MODEL_CALLS_HARD` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
 | `ARIEL_MAPS_API_KEY` | `passed` | `passed` | Validator/inventory guards track this key; redacted current env load: present; live Maps directions and places smokes passed. |
 | `ARIEL_MAPS_TIMEOUT_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
 | `ARIEL_MAX_RESPONSE_TOKENS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |

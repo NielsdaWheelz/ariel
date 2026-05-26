@@ -634,7 +634,8 @@ def test_provider_sync_wake_budget_exhaustion_stays_silent(
 ) -> None:
     _stub_memory_retriever(monkeypatch)
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "1")
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     monkeypatch.setenv("ARIEL_DISCORD_BOT_TOKEN", "test-bot-token")
     monkeypatch.setenv("ARIEL_DISCORD_CHANNEL_ID", "987654321")
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)

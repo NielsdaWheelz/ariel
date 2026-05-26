@@ -1522,8 +1522,10 @@ def _wake(
         finding_mode="",
         prompt_version=MAIN_AGENT_PROMPT_VERSION,
         model_ref=MAIN,
-        budget_seconds=float(runtime.settings.main_turn_budget_seconds),
-        max_model_calls=int(runtime.settings.agent_loop_max_model_calls),
+        budget_seconds_soft=float(runtime.settings.turn_budget_seconds_soft),
+        budget_seconds_hard=float(runtime.settings.turn_budget_seconds_hard),
+        max_model_calls_soft=int(runtime.settings.turn_max_model_calls_soft),
+        max_model_calls_hard=int(runtime.settings.turn_max_model_calls_hard),
         is_main_agent_loop=True,
         record_judgments=True,
         judgment_type="model_output",
@@ -1787,7 +1789,10 @@ def create_app(
     app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
     app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
     app.state.max_response_tokens = settings.max_response_tokens
-    app.state.main_turn_budget_seconds = settings.main_turn_budget_seconds
+    app.state.turn_budget_seconds_soft = settings.turn_budget_seconds_soft
+    app.state.turn_budget_seconds_hard = settings.turn_budget_seconds_hard
+    app.state.turn_max_model_calls_soft = settings.turn_max_model_calls_soft
+    app.state.turn_max_model_calls_hard = settings.turn_max_model_calls_hard
     app.state.agent_loop_max_model_calls = settings.agent_loop_max_model_calls
     app.state.approval_ttl_seconds = settings.approval_ttl_seconds
     app.state.approval_actor_id = settings.approval_actor_id

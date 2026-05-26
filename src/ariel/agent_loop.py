@@ -140,10 +140,18 @@ class LoopConfig:
         Recorded with any ``ai_judgments`` row the loop writes.
     model_ref:
         The concrete model role this loop calls.
-    budget_seconds:
-        Wall-clock budget for the loop.
-    max_model_calls:
-        Backstop on the number of model calls before graceful exhaustion.
+    budget_seconds_soft:
+        Wall-clock soft budget. When crossed, the loop injects a one-shot
+        wrap-up nudge asking the model to emit a final message and stop
+        starting new tool chains. Set equal to ``budget_seconds_hard`` to
+        disable the nudge (subagent loops do this — they cold-stop instead).
+    budget_seconds_hard:
+        Wall-clock hard budget. When crossed, the loop returns
+        ``budget_exhausted`` immediately as a safety net.
+    max_model_calls_soft:
+        Model-call soft cap. When crossed, the same wrap-up nudge fires.
+    max_model_calls_hard:
+        Model-call hard cap. Hard exhaustion as a safety net.
     is_main_agent_loop:
         Passed through to ``execute_run_program``; main-agent loops reject
         subsystem-only outputs and append clean program rounds to memory.
@@ -183,8 +191,10 @@ class LoopConfig:
     finding_mode: str
     prompt_version: str
     model_ref: ModelRef
-    budget_seconds: float
-    max_model_calls: int
+    budget_seconds_soft: float
+    budget_seconds_hard: float
+    max_model_calls_soft: int
+    max_model_calls_hard: int
     is_main_agent_loop: bool
     record_judgments: bool
     judgment_type: Literal["memory_recall", "memory_encode", "memory_dream", "model_output"] | None
@@ -283,6 +293,7 @@ def run_agent_loop(
 
     loop_started_at = time.perf_counter()
     budget_item_index: int | None = None
+    wrap_up_nudge_injected = False
 
     # The stable prefix length — messages present before the loop started
     # (system prompts, user message, etc.).  Round eviction never touches these.
@@ -315,15 +326,32 @@ def run_agent_loop(
     while True:
         # --- Budget and backstop checks ---
         elapsed_s = time.perf_counter() - loop_started_at
-        if elapsed_s > cfg.budget_seconds or model_call_count > cfg.max_model_calls:
+        if elapsed_s > cfg.budget_seconds_hard or model_call_count > cfg.max_model_calls_hard:
             return _budget_exhausted_result(
                 model_call_count=model_call_count,
                 created_action_attempt_count=created_action_attempt_count,
                 final_runtime_provenance=final_runtime_provenance,
             )
 
+        # Soft budget: inject the wrap-up nudge once, then let the model decide.
+        # Subagent loops have soft == hard and skip this branch.
+        if not wrap_up_nudge_injected and (
+            elapsed_s > cfg.budget_seconds_soft or model_call_count > cfg.max_model_calls_soft
+        ):
+            messages.append(_system_message(_WRAP_UP_NUDGE_TEXT))
+            add_event(
+                "evt.agent.wrap_up_nudged",
+                {
+                    "elapsed_seconds": elapsed_s,
+                    "model_call_count": model_call_count,
+                    "soft_budget_seconds": cfg.budget_seconds_soft,
+                    "soft_max_model_calls": cfg.max_model_calls_soft,
+                },
+            )
+            wrap_up_nudge_injected = True
+
         # Remaining-budget signal: replace the previous round's message in-place.
-        remaining_s = max(0.0, cfg.budget_seconds - elapsed_s)
+        remaining_s = max(0.0, cfg.budget_seconds_hard - elapsed_s)
         budget_line = _system_message(f"remaining budget: {remaining_s:.0f}s")
         if budget_item_index is None:
             messages.append(budget_line)
@@ -943,6 +971,15 @@ _PREMATURE_SYNTHESIS_NUDGE = (
     "loop dropped it and the user did not see it. Take another round: fetch "
     "the data again and, if it needs model synthesis, carry the relevant facts "
     "forward with agent.emit_value before answering in a later round."
+)
+
+
+_WRAP_UP_NUDGE_TEXT = (
+    "You are past your soft turn budget. Wrap up now: emit one "
+    "agent.emit_message to the user with what you have — partial results, "
+    "what you tried, and what remains. Do not start new long tool chains or "
+    "new research investigations. If more work is genuinely needed, name it "
+    "as a follow-up in your wrap-up message; do not silently continue."
 )
 
 

@@ -288,7 +288,8 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
     # Generous budget and backstop so wall-clock / call-count rails do not
     # fire — the semantic stuck rail must be the one that halts the loop.
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     adapter = _WhitespaceVariantFindingAdapter()
@@ -360,7 +361,8 @@ def test_main_loop_budget_exhaustion_uses_canned_line_without_summary_call(
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
     # Tiny budget — wall-clock rail trips quickly. The fake perf_counter
     # advances 0.1s per call so the budget check fires on the next round.
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "0.001")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "0.001")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "0.001")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     counter = {"seconds": 0.0}
@@ -457,7 +459,8 @@ def test_emit_value_carries_read_facts_to_next_round_context(
     """A round must use ``agent.emit_value`` to carry read facts forward."""
 
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     adapter = _SyscallThenMessageAdapter()
@@ -574,7 +577,8 @@ def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a
     """
 
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     adapter = _PrematureSynthesisAdapter()
@@ -714,7 +718,8 @@ def test_failed_program_preserves_action_attempt_status_without_output_echo(
     """Failed-program recovery sees attempt status, not read payloads."""
 
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "20000")
-    monkeypatch.setenv("ARIEL_MAIN_TURN_BUDGET_SECONDS", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
+    monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     monkeypatch.setenv("ARIEL_AGENT_LOOP_MAX_MODEL_CALLS", "100")
 
     adapter = _SearchThenRaiseAdapter()
