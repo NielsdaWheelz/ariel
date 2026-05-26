@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from ariel.app import create_app
 from ariel.model_adapter import ModelAdapter, ModelCall, ModelResponse
+from ariel.persistence import MemoryLogRecord
 from tests.fake_sandbox import FakeSandboxRuntime
 from tests.integration.app_helpers import create_test_app
 from tests.integration.responses_helpers import (
@@ -16,6 +18,7 @@ from tests.integration.responses_helpers import (
     last_user_message,
     post_message_and_drain,
     responses_run_message,
+    responses_with_run_calls,
 )
 
 
@@ -250,3 +253,81 @@ def test_restart_preserves_history_and_appends_turns(postgres_url: str) -> None:
             "before restart",
             "after restart",
         ]
+
+
+class _FinishSilentAdapter(FakeModelAdapter):
+    provider = "provider.silent-finish"
+    model = "model.silent-finish-v1"
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, messages=request.messages
+            )
+        return responses_with_run_calls(
+            calls=[{"name": "agent.finish_silent", "input": {"reason": "routine newsletter"}}],
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_silent_finish",
+        )
+
+
+def test_silent_finish_emits_finished_silent_with_reason_and_skips_assistant_emitted(
+    postgres_url: str,
+) -> None:
+    """A turn whose program calls ``agent.finish_silent`` emits one
+    ``evt.agent.finished_silent`` carrying the reason, never emits
+    ``evt.assistant.emitted``, and writes no ``assistant_message`` row to
+    ``memory_log``."""
+    adapter = _FinishSilentAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        turn = post_message_and_drain(client, message="stay quiet please")
+        events = _timeline(client)["turns"][0]["events"]
+        with cast(Any, client.app).state.runtime.session_factory() as db:
+            assistant_log_rows = db.scalars(
+                select(MemoryLogRecord).where(
+                    MemoryLogRecord.kind == "assistant_message",
+                    MemoryLogRecord.turn_id == turn.id,
+                )
+            ).all()
+
+    assert turn.status == "completed"
+    assert turn.assistant_message == ""
+
+    finished_silent = [e for e in events if e["event_type"] == "evt.agent.finished_silent"]
+    assert len(finished_silent) == 1
+    assert finished_silent[0]["payload"] == {"reason": "routine newsletter"}
+    assert [e for e in events if e["event_type"] == "evt.assistant.emitted"] == []
+    assert len([e for e in events if e["event_type"] == "evt.turn.completed"]) == 1
+    assert assistant_log_rows == []
+
+
+def test_real_message_emits_assistant_emitted_and_writes_memory_log_row(
+    postgres_url: str,
+) -> None:
+    """A turn whose program emits a non-empty message keeps the legacy
+    contract: one ``evt.assistant.emitted`` carrying the text, no
+    ``evt.agent.finished_silent``, and one ``assistant_message`` row in
+    ``memory_log`` for the turn."""
+    adapter = DeterministicModelAdapter()
+    with _build_client(postgres_url, adapter) as client:
+        turn = post_message_and_drain(client, message="speak up")
+        events = _timeline(client)["turns"][0]["events"]
+        with cast(Any, client.app).state.runtime.session_factory() as db:
+            assistant_log_rows = db.scalars(
+                select(MemoryLogRecord).where(
+                    MemoryLogRecord.kind == "assistant_message",
+                    MemoryLogRecord.turn_id == turn.id,
+                )
+            ).all()
+
+    expected_text = "assistant::speak up"
+    assert turn.status == "completed"
+    assert turn.assistant_message == expected_text
+
+    assistant_emitted = [e for e in events if e["event_type"] == "evt.assistant.emitted"]
+    assert len(assistant_emitted) == 1
+    assert assistant_emitted[0]["payload"]["message"] == expected_text
+    assert [e for e in events if e["event_type"] == "evt.agent.finished_silent"] == []
+    assert len(assistant_log_rows) == 1
+    assert assistant_log_rows[0].content == expected_text

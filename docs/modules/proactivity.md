@@ -30,7 +30,9 @@ thing that distinguishes a proactive wake from a user turn.
 
 A proactive wake is a normal turn. It receives the same `run` tool and the same
 memory faculties — the retriever and rememberer run as on any turn. A wake may
-finish with `agent.finish_silent`, producing no delivery. Every wake is
+finish with `agent.finish_silent`, producing no delivery; that finalization
+emits `evt.agent.finished_silent` with the reason, so operators can query
+proactive silence directly (see [agent-loop.md](agent-loop.md)). Every wake is
 recorded as a turn.
 
 ## Triggers

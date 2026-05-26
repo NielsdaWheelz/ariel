@@ -243,6 +243,11 @@ class LoopResult:
     created_action_attempt_count: int
     awaiting_approval: ActionAttemptRecord | None
     runtime_provenance: RuntimeProvenance | None
+    # Free-form reason the program passed to ``agent.finish_silent``. Carried
+    # only for ``outcome == "silent"``; empty string otherwise. Surfaced on
+    # ``evt.agent.finished_silent`` so the agent's silent-finish judgment is
+    # auditable from the event log without scraping run-program source.
+    silent_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +839,7 @@ def run_agent_loop(
                         created_action_attempt_count=created_action_attempt_count,
                         awaiting_approval=None,
                         runtime_provenance=final_runtime_provenance,
+                        silent_reason=run_program_result.silent_reason,
                     )
             case _:
                 assert_never(cfg.output_mode)

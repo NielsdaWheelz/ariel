@@ -1429,12 +1429,14 @@ def _wake(
                 **exhausted_response,
                 "assistant_text": "",
                 "assistant_silent": True,
+                "silent_reason": loop_result.silent_reason,
             }
         case "budget_exhausted" if wake_context.trigger_kind != "user_message":
             assistant_response = {
                 **exhausted_response,
                 "assistant_text": "",
                 "assistant_silent": True,
+                "silent_reason": "budget_exhausted_proactive",
             }
         case "budget_exhausted" | "finding" | "operations":
             assistant_response = exhausted_response
@@ -1483,25 +1485,36 @@ def _wake(
                 **assistant_response,
                 "assistant_text": "",
                 "assistant_silent": True,
+                "silent_reason": "stale_turn",
             }
         assistant_message = assistant_response["assistant_text"]
         turn.assistant_message = assistant_message
-        append_log_event(
-            db,
-            kind="assistant_message",
-            content=assistant_message,
-            turn_id=turn.id,
-            taint=runtime_provenance.status,
-            source_ref=turn.id,
-            adapter=runtime.model_adapter,
-            settings=runtime.settings,
-            now=utcnow(),
-            new_id_fn=new_id,
-        )
-
         turn.status = "completed"
         turn.updated_at = utcnow()
-        add_event("evt.assistant.emitted", {"message": assistant_message})
+        if assistant_response["assistant_silent"]:
+            # Distinct event for the agent's silent-finish judgment. Carries
+            # the reason so the audit trail explains why the agent stayed
+            # quiet without scraping run-program source out of memory_log.
+            # No assistant_message memory_log entry — empty content is not
+            # memory, and the agent_round row already captures the reasoning.
+            add_event(
+                "evt.agent.finished_silent",
+                {"reason": assistant_response["silent_reason"]},
+            )
+        else:
+            append_log_event(
+                db,
+                kind="assistant_message",
+                content=assistant_message,
+                turn_id=turn.id,
+                taint=runtime_provenance.status,
+                source_ref=turn.id,
+                adapter=runtime.model_adapter,
+                settings=runtime.settings,
+                now=utcnow(),
+                new_id_fn=new_id,
+            )
+            add_event("evt.assistant.emitted", {"message": assistant_message})
         add_event("evt.turn.completed", {})
 
     db.commit()

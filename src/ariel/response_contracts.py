@@ -36,6 +36,7 @@ SurfaceEventType = Literal[
     "evt.agent.output_not_applied",
     "evt.agent.premature_synthesis_rejected",
     "evt.agent.wrap_up_nudged",
+    "evt.agent.finished_silent",
     "evt.action.call_denied",
     "evt.action.proposed",
     "evt.action.policy_decided",
@@ -282,6 +283,12 @@ class SurfaceEventAgentWrapUpNudgedPayloadContract(BaseModel):
     model_call_count: int
     soft_budget_seconds: float
     soft_max_model_calls: int
+
+
+class SurfaceEventAgentFinishedSilentPayloadContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str
 
 
 class SurfaceEventActionProposedPayloadContract(BaseModel):
@@ -943,6 +950,12 @@ def _project_surface_event_payload(
         return _validate_contract(
             "surface_event_payload.evt.agent.wrap_up_nudged",
             SurfaceEventAgentWrapUpNudgedPayloadContract,
+            payload,
+        )
+    if event_type == "evt.agent.finished_silent":
+        return _validate_contract(
+            "surface_event_payload.evt.agent.finished_silent",
+            SurfaceEventAgentFinishedSilentPayloadContract,
             payload,
         )
     if event_type == "evt.action.proposed":

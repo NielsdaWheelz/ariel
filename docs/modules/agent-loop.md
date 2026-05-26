@@ -144,6 +144,15 @@ attempts, events, emitted artifacts — before continuing or ending the turn.
 There is no turn-spanning transaction; each transaction is one program long,
 seconds not minutes.
 
+`_wake` finalization branches on whether the assistant produced content
+(`app.py:~1494`). A non-empty message emits `evt.assistant.emitted` and writes
+an `assistant_message` `memory_log` row. A silent finish emits
+`evt.agent.finished_silent` with a `reason: str` — the `agent.finish_silent`
+argument, `"budget_exhausted_proactive"` when a proactive wake hits the hard
+cap, or `"stale_turn"` when a newer turn supersedes this one — and writes no
+`memory_log` row. Both sit alongside `evt.turn.completed` and are mutually
+exclusive per turn; the `agent_round` row carries the program source for trace.
+
 A failed program is **not rolled back**. Its syscall-trace audit — the
 `EventRecord` rows and the `action_attempts` ledger — is the audit spine and
 commits regardless. What a failed program does not get to keep: its staged

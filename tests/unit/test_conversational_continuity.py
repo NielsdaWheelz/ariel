@@ -47,6 +47,7 @@ def test_external_event_types_includes_state_changes() -> None:
         "evt.turn.completed",
         "evt.turn.failed",
         "evt.assistant.emitted",
+        "evt.agent.finished_silent",
         "evt.action.execution.succeeded",
         "evt.action.execution.failed",
         "evt.action.approval.requested",

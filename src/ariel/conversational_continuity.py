@@ -32,6 +32,7 @@ EXTERNAL_EVENT_TYPES: frozenset[str] = frozenset(
         "evt.turn.completed",
         "evt.turn.failed",
         "evt.assistant.emitted",
+        "evt.agent.finished_silent",
         "evt.action.execution.succeeded",
         "evt.action.execution.failed",
         "evt.action.approval.requested",
