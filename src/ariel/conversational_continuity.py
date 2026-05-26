@@ -143,8 +143,7 @@ def build_recent_events_block(
     lines: list[str] = []
     total_bytes = 0
     for row in rows:
-        raw_payload = row.payload if isinstance(row.payload, dict) else {}
-        payload_view = _compact_event_payload(raw_payload, cap=per_event_cap)
+        payload_view = _compact_event_payload(row.payload, cap=per_event_cap)
         line = json.dumps(
             {
                 "id": row.id,

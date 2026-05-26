@@ -427,39 +427,27 @@ class AppSettings(BaseSettings):
             raise ValueError("max_response_tokens must be >= 1")
         return value
 
-    @field_validator("turn_budget_seconds_soft")
+    @field_validator("turn_budget_seconds_soft", "turn_budget_seconds_hard")
     @classmethod
-    def _turn_budget_seconds_soft_must_be_positive(cls, value: float) -> float:
+    def _turn_budget_seconds_must_be_positive(cls, value: float) -> float:
         if value <= 0:
-            raise ValueError("turn_budget_seconds_soft must be > 0")
+            raise ValueError("turn budget seconds must be > 0")
         return value
 
-    @field_validator("turn_budget_seconds_hard")
+    @field_validator("turn_max_model_calls_soft", "turn_max_model_calls_hard")
     @classmethod
-    def _turn_budget_seconds_hard_must_exceed_soft(cls, value: float, info: Any) -> float:
-        soft = info.data.get("turn_budget_seconds_soft")
-        if value <= 0:
-            raise ValueError("turn_budget_seconds_hard must be > 0")
-        if soft is not None and value < soft:
+    def _turn_max_model_calls_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("turn max model calls must be >= 1")
+        return value
+
+    @model_validator(mode="after")
+    def _turn_budgets_hard_must_exceed_soft(self) -> AppSettings:
+        if self.turn_budget_seconds_hard < self.turn_budget_seconds_soft:
             raise ValueError("turn_budget_seconds_hard must be >= turn_budget_seconds_soft")
-        return value
-
-    @field_validator("turn_max_model_calls_soft")
-    @classmethod
-    def _turn_max_model_calls_soft_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("turn_max_model_calls_soft must be >= 1")
-        return value
-
-    @field_validator("turn_max_model_calls_hard")
-    @classmethod
-    def _turn_max_model_calls_hard_must_exceed_soft(cls, value: int, info: Any) -> int:
-        soft = info.data.get("turn_max_model_calls_soft")
-        if value < 1:
-            raise ValueError("turn_max_model_calls_hard must be >= 1")
-        if soft is not None and value < soft:
+        if self.turn_max_model_calls_hard < self.turn_max_model_calls_soft:
             raise ValueError("turn_max_model_calls_hard must be >= turn_max_model_calls_soft")
-        return value
+        return self
 
     @field_validator("research_run_budget_seconds")
     @classmethod

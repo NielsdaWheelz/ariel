@@ -39,7 +39,7 @@ PostgreSQL 16 schema rules, SQLAlchemy 2.0 query patterns, transaction boundarie
 - Do not add indexes speculatively. Add them when a query pattern on a high-volume table needs one.
 - Use database uniqueness for true schema-owned keys: primary keys and real local alternate keys.
 - Do not use unique constraints to encode application-level ownership invariants.
-- Partial unique indexes via `postgresql_where=` are fine for natural constraints (e.g., single active session).
+- Partial unique indexes via `postgresql_where=` are fine for natural constraints (e.g., a non-null idempotency key being unique).
 
 ## Check Constraints
 

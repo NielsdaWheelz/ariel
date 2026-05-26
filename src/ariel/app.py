@@ -144,6 +144,11 @@ PUBLIC_LOCAL_AUTH_BYPASS_ROUTES: frozenset[tuple[str, str]] = frozenset(
 )
 
 
+# Window for cross-turn taint propagation. Post session-abolition, taint flows
+# by recency: the last N globally-ordered turns are inspected for prior taint
+# markers when seeding a new turn's runtime provenance. 12 covers a typical
+# conversation arc on the operator's primary channel without scanning the full
+# durable history.
 _TAINT_LOOKBACK_TURNS = 12
 _AGENCY_EVENT_PERSISTENCE_ATTEMPTS = 3
 _AGENCY_EVENT_SOURCE_EXTERNAL_ID_CONSTRAINT = "uq_agency_event_source_external_id"
@@ -467,8 +472,8 @@ def _build_initial_messages(
             push_system(rendered)
 
     # Recent external events — the agent's anchor for "what just happened" across
-    # the session. Built by build_recent_events_block; absent (None) when the log
-    # is empty (first turn of a new session).
+    # recent turns. Built by build_recent_events_block; absent (None) when the log
+    # is empty (first wake on a fresh durable store).
     recent_events_text = context_bundle.get("recent_events_text")
     if isinstance(recent_events_text, str) and recent_events_text:
         push_system(recent_events_text)

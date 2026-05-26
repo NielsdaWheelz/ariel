@@ -41,6 +41,10 @@ def _repair_tool_args(
     tool_name: str,
     decode_exc: json.JSONDecodeError,
 ) -> dict[str, Any]:
+    # Defense-in-depth: some upstream model providers occasionally emit raw
+    # newlines inside tool-arg JSON strings, producing JSONDecodeError. We try
+    # json_repair once before failing the round. Remove when no provider in
+    # the MAIN/RESEARCH path has produced this regression for a full release.
     base_error: dict[str, Any] = {
         "tool": tool_name,
         "error": str(decode_exc),

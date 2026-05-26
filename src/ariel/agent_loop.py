@@ -333,7 +333,10 @@ def run_agent_loop(
             )
 
         # Soft budget: inject the wrap-up nudge once, then let the model decide.
-        # Subagent loops have soft == hard and skip this branch.
+        # Subagent loops have soft == hard and skip this branch. The nudge is
+        # a resource-budget rail (ai-first.md §"Service-Based Determinism") —
+        # it tells the model the budget is closing and bounds what counts as a
+        # graceful end; the model still owns whether and how to wrap up.
         if not wrap_up_nudge_injected and (
             elapsed_s > cfg.budget_seconds_soft or model_call_count > cfg.max_model_calls_soft
         ):

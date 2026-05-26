@@ -928,8 +928,6 @@ def test_manual_smoke_capability_preconditions_reflect_registry_metadata() -> No
             assert "Memory runtime configured" in preconditions, capability_id
         if capability_id == "cap.attachment.read":
             assert "attachment refs" in preconditions, capability_id
-        if capability_id == "cap.proactive.schedule":
-            assert "Active session" in preconditions, capability_id
         if capability_id == "cap.research.investigate":
             assert "Research mode" in preconditions, capability_id
             assert "bounded non-poll question" in preconditions, capability_id

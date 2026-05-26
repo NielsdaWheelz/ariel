@@ -11,6 +11,13 @@ The agent loop follows [../ai-first.md](../ai-first.md): the model owns every
 judgment within a turn; deterministic code owns the rails — the sandbox, the
 syscall boundary, the budget, stuck-detection, commit, and delivery.
 
+Turns and events are globally scoped. The `sessions` and `session_rotations`
+tables and all session-scoped FKs were abolished in the conversational-continuity
+cutover; no auto-rotation, no `session_id` on any table. Cross-turn queries are
+recency-bounded (e.g. the recent-events block in every wake's initial context)
+or correlated by `turn_id` / canonical capability IDs surfaced through the events
+log. See [../conversational-continuity-cutover.md](../conversational-continuity-cutover.md).
+
 ## The run-program loop
 
 The model's entire tool surface is one tool, `run`: it authors a Python `run`

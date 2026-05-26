@@ -31,7 +31,7 @@ thing that distinguishes a proactive wake from a user turn.
 A proactive wake is a normal turn. It receives the same `run` tool and the same
 memory faculties — the retriever and rememberer run as on any turn. A wake may
 finish with `agent.finish_silent`, producing no delivery. Every wake is
-recorded as a session turn.
+recorded as a turn.
 
 ## Triggers
 
@@ -153,7 +153,7 @@ message to the user's Discord channel over the Discord REST API
 `discord_notification_timeout_seconds`). A wake that originates from a Discord
 message posts as a reply to it; a wake without one posts to the default channel.
 A wake that ends without emitting is not delivered. There is no `notifications`
-table: Discord is the record of what was sent, and every wake is a session turn.
+table: Discord is the record of what was sent, and every wake is a turn.
 
 ## Autonomous action
 

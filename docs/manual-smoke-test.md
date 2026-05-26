@@ -441,7 +441,7 @@ and `shared_content`.
 | Home-guild attachment read request | Accepted with an explicit content intent. | API turn includes attachment refs, no raw Discord CDN URL is model-visible, and `fail_closed` read returns a typed scan result unless a clean cached blob or extraction exists. |
 | Origin reply routing | Worker sends assistant output to the Discord origin when an origin message exists. | DM and guild-origin turns reply to their origin message/channel and do not fall back to the default channel. |
 | Default notification delivery | Worker sends no-origin notifications to `ARIEL_DISCORD_CHANNEL_ID`. | A controlled no-origin notification appears in the configured default channel. |
-| `/status` | Deterministic operational status. | Command returns health-ok, active session, and recent job counts. |
+| `/status` | Deterministic operational status. | Command returns health-ok and recent job counts. |
 | `/jobs` | Deterministic job list. | Command returns recent Agency jobs. |
 | `/capture` | Deterministic capture submission. | Capture row appears; capture ingress does not enqueue background work. |
 | Wrong-user slash command | Rejected ephemerally. | No API mutation is attempted. |
@@ -606,7 +606,7 @@ Eligibility is part of the smoke result:
 | `cap.memory.note.create` | `memory.note.create` | Memory runtime configured; controlled note content. | Creates a note. |
 | `cap.memory.note.edit` | `memory.note.edit` | Memory runtime configured; existing controlled note id. | Edits that note. |
 | `cap.memory.note.delete` | `memory.note.delete` | Memory runtime configured; existing controlled note id. | Deletes that note. |
-| `cap.proactive.schedule` | `proactive.schedule` | Active session; RFC3339 wake time; note content. | Schedules one `agent_wake` row. |
+| `cap.proactive.schedule` | `proactive.schedule` | RFC3339 wake time; note content. | Schedules one `agent_wake` row. |
 | `cap.research.investigate` | `research.investigate` | Research mode selected; bounded non-poll question. | Enqueues and completes a research run. |
 
 ### Capability Evidence Ledger
@@ -854,7 +854,7 @@ against this host in the current smoke pass.
 | --- | --- | --- |
 | `ariel-worker` | Drains or re-arms selected due `background_tasks` without blocking behind one provider sync. | Due rows disappear or re-arm; failures back off; no stale due rows or waiting advisory-lock backends remain. |
 | Direct `user_message` task | Runs the main agent for API and Discord-originated input. | Message task disappears, turn completes, idempotency outcome is recorded, and Discord origin routing is honored when present. |
-| Scheduled `agent_wake` | Runs the main agent loop. | Session turn appears and Discord notification is sent when targeted. |
+| Scheduled `agent_wake` | Runs the main agent loop. | A new turn appears and Discord notification is sent when targeted. |
 | Provider event ingest | Accepts Calendar webhook events and Gmail Pub/Sub notifications, then queues resource sync work. | `provider_events` and a follow-up `provider_sync_due` row are recorded; the later sync task owns `sync_runs` and cursor outcomes. |
 | Provider reconcile poll | Enqueues backstop sync work for connected Google cursors. | One-shot `provider_sync_due` rows appear and the recurring poll row re-arms; the later sync task owns cursor advancement. |
 | `research_run` | Runs bounded research and schedules a completion wake. | Research row is consumed, finding is recorded, and a completion `agent_wake` is enqueued. |
@@ -1009,18 +1009,8 @@ curl -sS -o /dev/null -w 'protected memory route status=%{http_code}\n' \
   http://127.0.0.1:8000/v1/memory/log
 curl -fsS "${auth[@]}" http://127.0.0.1:8000/ \
   | jq '{ok, surface, api_keys:(.api|keys)}'
-sid="$(curl -fsS "${auth[@]}" http://127.0.0.1:8000/v1/sessions/active \
-  | jq -r '.session.id')"
-post_sid="$(curl -fsS "${auth[@]}" -X POST http://127.0.0.1:8000/v1/sessions \
-  | jq -r '.session.id')"
-[[ "$post_sid" == "$sid" ]] || {
-  echo "POST /v1/sessions returned $post_sid, expected $sid"
-  exit 1
-}
-curl -fsS "${auth[@]}" "http://127.0.0.1:8000/v1/sessions/$sid/events" \
-  | jq '{ok, session_id, turns:(.turns|length)}'
-curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/sessions/rotations?limit=5' \
-  | jq '{ok, count:(.rotations|length)}'
+curl -fsS "${auth[@]}" http://127.0.0.1:8000/v1/events \
+  | jq '{ok, turns:(.turns|length)}'
 curl -fsS "${auth[@]}" http://127.0.0.1:8000/v1/connectors/google \
   | jq '{ok, status:.connector.status, readiness:.connector.readiness, account_identity_present:(.connector.account_email != null), granted_scope_count:(.connector.granted_scopes|length), last_error_code:.connector.last_error_code}'
 curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/connectors/google/events?limit=5' \
@@ -1059,7 +1049,6 @@ from ariel.persistence import (
     JobEventRecord,
     JobRecord,
     ProviderWriteReceiptRecord,
-    SessionRecord,
     TurnRecord,
 )
 
@@ -1067,7 +1056,6 @@ database_url = os.environ["ARIEL_DATABASE_URL"]
 suffix = uuid.uuid4().hex[:20]
 now = datetime.now(UTC)
 ids = {
-    "session": f"ses_ms_{suffix}",
     "turn": f"trn_ms_{suffix}",
     "email_attempt": f"aat_em_{suffix}",
     "artifact_attempt": f"aat_ar_{suffix}",
@@ -1089,20 +1077,8 @@ if token := os.environ.get("ARIEL_LOCAL_AUTH_TOKEN"):
 try:
     with Session.begin() as db:
         db.add(
-            SessionRecord(
-                id=ids["session"],
-                is_active=False,
-                lifecycle_state="closed",
-                rotated_from_session_id=None,
-                rotation_reason=None,
-                created_at=now,
-                updated_at=now,
-            )
-        )
-        db.add(
             TurnRecord(
                 id=ids["turn"],
-                session_id=ids["session"],
                 user_message="manual smoke controlled route detail",
                 assistant_message="manual smoke controlled route detail",
                 status="completed",
@@ -1116,7 +1092,6 @@ try:
             [
                 ActionAttemptRecord(
                     id=ids["email_attempt"],
-                    session_id=ids["session"],
                     turn_id=ids["turn"],
                     proposal_index=1,
                     capability_id="cap.email.archive",
@@ -1136,7 +1111,6 @@ try:
                 ),
                 ActionAttemptRecord(
                     id=ids["artifact_attempt"],
-                    session_id=ids["session"],
                     turn_id=ids["turn"],
                     proposal_index=2,
                     capability_id="cap.web.extract",
@@ -1221,7 +1195,6 @@ try:
         db.add(
             ArtifactRecord(
                 id=ids["artifact"],
-                session_id=ids["session"],
                 turn_id=ids["turn"],
                 action_attempt_id=ids["artifact_attempt"],
                 artifact_type="retrieval_provenance",
@@ -1309,7 +1282,6 @@ finally:
             )
         )
         db.execute(delete(TurnRecord).where(TurnRecord.id == ids["turn"]))
-        db.execute(delete(SessionRecord).where(SessionRecord.id == ids["session"]))
 PY
 curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/memory/log?limit=5' \
   | jq '{ok, count:(.log|length), items:[.log[] | {id, kind, created_at, taint}]}'
@@ -1473,7 +1445,7 @@ curl -fsS "${auth[@]}" -X POST http://127.0.0.1:8000/v1/captures/record \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: manual-smoke-capture' \
   -d '{"kind":"text","text":"manual smoke capture","note":"http api smoke","source":{"app":"manual-smoke"}}' \
-  | jq '{ok, capture_id:.capture.id, session_id:.capture.effective_session_id, turn_id:.capture.turn_id}'
+  | jq '{ok, capture_id:.capture.id, turn_id:.capture.turn_id}'
 ```
 
 ```sh

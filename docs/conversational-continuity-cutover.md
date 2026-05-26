@@ -48,7 +48,7 @@ IDs.
 Consequence: when the user references something from a prior turn ("delete
 both", "what was that", "send it to her"), the agent has no anchor. Its
 only recovery is `memory.search` (fuzzy) or re-running tool reads, which
-is non-deterministic, slow, and often never converges.
+is non-deterministic, slow, and does not reliably converge.
 
 Two compounding budget issues amplify the symptom:
 

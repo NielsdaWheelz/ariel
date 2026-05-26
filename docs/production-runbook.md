@@ -510,10 +510,10 @@ curl -fsS "${auth[@]}" 'http://127.0.0.1:8000/v1/discord-messages?limit=5' \
   | jq '{ok, count:(.discord_messages|length), ids:[.discord_messages[].id]}'
 ```
 
-A proactive wake leaves no proactive-specific record: it is a session turn like
-any other. Inspect a wake's output and the messages it sent through the normal
-session and timeline routes (`/v1/sessions/{session_id}/events`); a scheduled
-wake is an `agent_wake` row on `background_tasks` until it fires.
+A proactive wake leaves no proactive-specific record: it is a turn like any
+other. Inspect a wake's output and the messages it sent through the timeline
+route (`GET /v1/events`); a scheduled wake is an `agent_wake` row on
+`background_tasks` until it fires.
 
 Force sync when replaying or diagnosing a specific source. A sync that finds new
 data enqueues an `agent_wake` row.
