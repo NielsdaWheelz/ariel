@@ -81,7 +81,6 @@ class AttachmentContentRuntime:
         self,
         *,
         db: Session,
-        session_id: str,
         turn_id: str,
         discord_context: dict[str, Any],
         attachment_sources: list[dict[str, Any]],
@@ -100,7 +99,6 @@ class AttachmentContentRuntime:
             existing = db.scalar(
                 select(AttachmentSourceRecord)
                 .where(
-                    AttachmentSourceRecord.session_id == session_id,
                     AttachmentSourceRecord.turn_id == turn_id,
                     AttachmentSourceRecord.attachment_ref == attachment_ref,
                 )
@@ -119,7 +117,6 @@ class AttachmentContentRuntime:
             db.add(
                 AttachmentSourceRecord(
                     id=new_id_fn("ats"),
-                    session_id=session_id,
                     turn_id=turn_id,
                     source_transport="discord",
                     source_message_id=message_id,
@@ -149,7 +146,6 @@ class AttachmentContentRuntime:
         self,
         *,
         db: Session,
-        session_id: str,
         turn_id: str,
         normalized_input: dict[str, Any],
         now_fn: Callable[[], datetime],
@@ -161,7 +157,6 @@ class AttachmentContentRuntime:
         source = db.scalar(
             select(AttachmentSourceRecord)
             .where(
-                AttachmentSourceRecord.session_id == session_id,
                 AttachmentSourceRecord.turn_id == turn_id,
                 AttachmentSourceRecord.attachment_ref == attachment_ref,
             )

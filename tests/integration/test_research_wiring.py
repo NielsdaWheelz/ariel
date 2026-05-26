@@ -5,7 +5,7 @@ to the research loop and its finding back to the main agent:
 
 1. the ``action_runtime`` execute branch — a ``research.investigate`` syscall
    runs inline, writes a ``research_run`` ``background_tasks`` row carrying
-   ``{question, mode, session_id}`` (CONTRACT A), and returns
+   ``{question, mode}`` (CONTRACT A), and returns
    ``{status: "queued", research_id}``;
 2. the worker ``research_run`` arm — it drives ``run_research`` and enqueues a
    completion ``agent_wake`` carrying the finding (CONTRACT B);
@@ -37,7 +37,6 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     EventRecord,
     MemoryLogRecord,
-    SessionRecord,
     TurnRecord,
     enqueue_background_task,
 )
@@ -61,29 +60,12 @@ def _stub_memory_retriever(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
 
 
-def _seed_active_session(session_factory: sessionmaker[Session], session_id: str) -> None:
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                SessionRecord(
-                    id=session_id,
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-
-
-def _seed_turn(session_factory: sessionmaker[Session], *, session_id: str, turn_id: str) -> None:
+def _seed_turn(session_factory: sessionmaker[Session], *, turn_id: str) -> None:
     with session_factory() as db:
         with db.begin():
             db.add(
                 TurnRecord(
                     id=turn_id,
-                    session_id=session_id,
                     user_message="look into that for me",
                     assistant_message=None,
                     status="in_progress",
@@ -105,12 +87,11 @@ def test_research_investigate_syscall_enqueues_a_research_run_task(
 ) -> None:
     """A ``cap.research.investigate`` call runs inline — no durable execution
     queue — and writes exactly one ``research_run`` ``background_tasks`` row
-    whose payload carries the question, the mode, and the originating
-    ``session_id`` (CONTRACT A). The syscall returns ``{status: "queued",
-    research_id}`` — the ``research_task_start_v1`` output."""
+    whose payload carries the question and the mode (CONTRACT A). The syscall
+    returns ``{status: "queued", research_id}`` — the
+    ``research_task_start_v1`` output."""
 
-    _seed_active_session(session_factory, "ses_res")
-    _seed_turn(session_factory, session_id="ses_res", turn_id="trn_res")
+    _seed_turn(session_factory, turn_id="trn_res")
 
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
@@ -119,7 +100,6 @@ def test_research_investigate_syscall_enqueues_a_research_run_task(
             assert turn is not None
             ctx = run_function_calls(
                 db=db,
-                session_id="ses_res",
                 turn=turn,
                 function_calls_raw=[
                     {
@@ -155,11 +135,10 @@ def test_research_investigate_syscall_enqueues_a_research_run_task(
         assert len(research_tasks) == 1
         task = research_tasks[0]
         assert task.id == research_id
-        # CONTRACT A: question, mode, and the originating session_id.
+        # CONTRACT A: question and mode.
         assert task.payload == {
             "question": "What changed in the API this week?",
             "mode": mode,
-            "session_id": "ses_res",
         }
         # An immediate task: run_after is now, no recurrence.
         assert task.run_after == NOW
@@ -180,8 +159,7 @@ def test_research_investigate_syscall_rejects_a_bad_mode(
     """An invalid ``mode`` fails the syscall closed: the call is blocked, no
     ``research_run`` row is written, and the program sees a failure."""
 
-    _seed_active_session(session_factory, "ses_resbad")
-    _seed_turn(session_factory, session_id="ses_resbad", turn_id="trn_resbad")
+    _seed_turn(session_factory, turn_id="trn_resbad")
 
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
@@ -190,7 +168,6 @@ def test_research_investigate_syscall_rejects_a_bad_mode(
             assert turn is not None
             ctx = run_function_calls(
                 db=db,
-                session_id="ses_resbad",
                 turn=turn,
                 function_calls_raw=[
                     {
@@ -222,8 +199,7 @@ def test_research_investigate_queue_defect_rolls_back_instead_of_failing_action(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _seed_active_session(session_factory, "ses_resdefect")
-    _seed_turn(session_factory, session_id="ses_resdefect", turn_id="trn_resdefect")
+    _seed_turn(session_factory, turn_id="trn_resdefect")
 
     def fail_enqueue(*_args: Any, **_kwargs: Any) -> BackgroundTaskRecord:
         raise RuntimeError("queue bug")
@@ -237,7 +213,6 @@ def test_research_investigate_queue_defect_rolls_back_instead_of_failing_action(
                 assert turn is not None
                 run_function_calls(
                     db=db,
-                    session_id="ses_resdefect",
                     turn=turn,
                     function_calls_raw=[
                         {
@@ -336,9 +311,6 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -348,7 +320,6 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
                     payload={
                         "question": "What is the capital of France?",
                         "mode": "web",
-                        "session_id": session_id,
                     },
                     now=NOW - timedelta(minutes=1),
                 )
@@ -385,14 +356,13 @@ def test_worker_research_run_arm_runs_research_and_enqueues_completion_wake(
             assert research_turn.status == "completed"
             assert research_turn.user_message == "What is the capital of France?"
             assert research_turn.assistant_message == "France is in Europe."
-            # CONTRACT B: a completion agent_wake carries the full finding plus
-            # the originating session_id, distinguishable from a plain note wake.
+            # CONTRACT B: a completion agent_wake carries the full finding,
+            # distinguishable from a plain note wake.
             wake_tasks = db.scalars(
                 select(BackgroundTaskRecord).where(BackgroundTaskRecord.task_type == "agent_wake")
             ).all()
             assert len(wake_tasks) == 1
             payload = wake_tasks[0].payload
-            assert payload["session_id"] == session_id
             assert "note" not in payload
             finding = payload["research_finding"]
             assert finding["question"] == "What is the capital of France?"
@@ -434,9 +404,6 @@ def test_worker_research_run_replay_uses_completed_research_turn_without_model_c
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -446,7 +413,6 @@ def test_worker_research_run_replay_uses_completed_research_turn_without_model_c
                     payload={
                         "question": "What is the capital of France?",
                         "mode": "web",
-                        "session_id": session_id,
                     },
                     now=NOW - timedelta(minutes=5),
                     run_after=NOW - timedelta(minutes=1),
@@ -455,7 +421,6 @@ def test_worker_research_run_replay_uses_completed_research_turn_without_model_c
                 db.add(
                     TurnRecord(
                         id="trn_research_replay_done",
-                        session_id=session_id,
                         user_message="What is the capital of France?",
                         assistant_message="France is in Europe.",
                         status="completed",
@@ -468,7 +433,6 @@ def test_worker_research_run_replay_uses_completed_research_turn_without_model_c
                 db.add(
                     EventRecord(
                         id="evn_research_replay_finding",
-                        session_id=session_id,
                         turn_id="trn_research_replay_done",
                         sequence=1,
                         event_type="evt.research.finding_emitted",
@@ -502,7 +466,6 @@ def test_worker_research_run_replay_uses_completed_research_turn_without_model_c
                 db.add(
                     EventRecord(
                         id="evn_research_replay_completed",
-                        session_id=session_id,
                         turn_id="trn_research_replay_done",
                         sequence=2,
                         event_type="evt.turn.completed",
@@ -547,9 +510,6 @@ def test_worker_research_run_replay_fails_interrupted_turn_without_model_call(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -559,7 +519,6 @@ def test_worker_research_run_replay_fails_interrupted_turn_without_model_call(
                     payload={
                         "question": "What is the capital of France?",
                         "mode": "web",
-                        "session_id": session_id,
                     },
                     now=NOW - timedelta(minutes=5),
                     run_after=NOW - timedelta(minutes=1),
@@ -568,7 +527,6 @@ def test_worker_research_run_replay_fails_interrupted_turn_without_model_call(
                 db.add(
                     TurnRecord(
                         id="trn_research_replay_interrupted",
-                        session_id=session_id,
                         user_message="What is the capital of France?",
                         assistant_message=None,
                         status="in_progress",
@@ -581,7 +539,6 @@ def test_worker_research_run_replay_fails_interrupted_turn_without_model_call(
                 db.add(
                     EventRecord(
                         id="evn_research_replay_started",
-                        session_id=session_id,
                         turn_id="trn_research_replay_interrupted",
                         sequence=1,
                         event_type="evt.research.started",
@@ -647,9 +604,6 @@ def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -659,7 +613,6 @@ def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
                     payload={
                         "question": "What is the capital of France?",
                         "mode": "web",
-                        "session_id": session_id,
                     },
                     now=NOW - timedelta(minutes=5),
                     run_after=NOW - timedelta(minutes=1),
@@ -668,7 +621,6 @@ def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
                 db.add(
                     TurnRecord(
                         id="trn_research_replay_corrupt",
-                        session_id=session_id,
                         user_message="What is the capital of France?",
                         assistant_message="France is in Europe.",
                         status="completed",
@@ -681,7 +633,6 @@ def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
                 db.add(
                     EventRecord(
                         id="evn_research_replay_corrupt",
-                        session_id=session_id,
                         turn_id="trn_research_replay_corrupt",
                         sequence=1,
                         event_type="evt.research.finding_emitted",
@@ -701,61 +652,6 @@ def test_worker_research_run_replay_rejects_corrupt_terminal_finding(
             task = db.get(BackgroundTaskRecord, task_id)
             assert task is not None
             assert task.attempts == 1
-            assert (
-                db.scalars(
-                    select(BackgroundTaskRecord).where(
-                        BackgroundTaskRecord.task_type == "agent_wake"
-                    )
-                ).all()
-                == []
-            )
-
-
-def test_worker_research_run_arm_rejects_a_bad_payload(
-    postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A ``research_run`` row missing ``session_id`` is a bad shape: the arm
-    raises, the worker marks the row failed (attempts increments), and no
-    completion ``agent_wake`` is enqueued."""
-
-    _stub_memory_retriever(monkeypatch)
-    monkeypatch.setattr("ariel.worker.utcnow", lambda: NOW)
-    app = create_test_app(
-        database_url=postgres_url,
-        model_adapter=_ResearchRunAdapter(),
-        sandbox=FakeSandboxRuntime(),
-    )
-    with TestClient(app) as client:
-        runtime = client.app.state.runtime  # type: ignore[attr-defined]
-        session_factory = runtime.session_factory
-        with session_factory() as db:
-            with db.begin():
-                bad_task = enqueue_background_task(
-                    db,
-                    task_type="research_run",
-                    payload={"question": "no session here", "mode": "web"},
-                    now=NOW - timedelta(minutes=1),
-                )
-                bad_task_id = bad_task.id
-
-        for _ in range(6):
-            process_one_task(
-                session_factory=session_factory,
-                settings=runtime.settings,
-                runtime=runtime,
-            )
-            with session_factory() as db:
-                task = db.get(BackgroundTaskRecord, bad_task_id)
-            if task is not None and task.attempts > 0:
-                break
-
-        with session_factory() as db:
-            task = db.get(BackgroundTaskRecord, bad_task_id)
-            # The bad row failed and was retried (not deleted on success).
-            assert task is not None
-            assert task.attempts > 0
-            # No completion wake was enqueued for a bad research_run.
             assert (
                 db.scalars(
                     select(BackgroundTaskRecord).where(
@@ -815,9 +711,6 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -834,7 +727,6 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
                             "gaps": [],
                             "sources": [],
                         },
-                        "session_id": session_id,
                     },
                     now=NOW - timedelta(minutes=1),
                 )
@@ -866,7 +758,7 @@ def test_worker_completion_wake_renders_finding_into_main_agent_context(
         # and the agent answered from the finding.
         turn = db.scalar(
             select(TurnRecord)
-            .where(TurnRecord.session_id == session_id, TurnRecord.kind == "agent_turn")
+            .where(TurnRecord.kind == "agent_turn")
             .order_by(TurnRecord.created_at.desc())
         )
         assert turn is not None
@@ -936,14 +828,10 @@ def test_research_investigate_run_program_worker_drains_research_and_completion_
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
         with session_factory() as db:
             with db.begin():
                 turn = TurnRecord(
                     id="trn_research_e2e",
-                    session_id=session_id,
                     user_message="research this for me",
                     assistant_message=None,
                     status="in_progress",
@@ -953,7 +841,6 @@ def test_research_investigate_run_program_worker_drains_research_and_completion_
                 db.add(turn)
                 ctx = run_function_calls(
                     db=db,
-                    session_id=session_id,
                     turn=turn,
                     function_calls_raw=[
                         {
@@ -991,7 +878,6 @@ def test_research_investigate_run_program_worker_drains_research_and_completion_
             )
             assert completion_wake is not None
             completion_wake_id = completion_wake.id
-            assert completion_wake.payload["session_id"] == session_id
             assert completion_wake.payload["research_finding"]["summary"] == "France is in Europe."
 
         current_now["value"] = NOW + timedelta(minutes=1)
@@ -1005,9 +891,7 @@ def test_research_investigate_run_program_worker_drains_research_and_completion_
         assert db.get(BackgroundTaskRecord, research_task_id) is None
         assert db.get(BackgroundTaskRecord, completion_wake_id) is None
         recorded_turns = db.scalars(
-            select(TurnRecord)
-            .where(TurnRecord.session_id == session_id)
-            .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+            select(TurnRecord).order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
         ).all()
         research_turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "research"))
         assert research_turn is not None
@@ -1015,7 +899,6 @@ def test_research_investigate_run_program_worker_drains_research_and_completion_
         completion_turn = db.scalar(
             select(TurnRecord)
             .where(
-                TurnRecord.session_id == session_id,
                 TurnRecord.kind == "agent_turn",
                 TurnRecord.assistant_message == "Research completion delivered.",
             )

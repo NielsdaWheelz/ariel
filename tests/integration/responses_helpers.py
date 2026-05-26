@@ -37,7 +37,6 @@ from ariel.worker import process_one_task
 
 def post_message_and_drain(
     client: TestClient,
-    session_id: str,
     *,
     message: str,
     headers: dict[str, str] | None = None,
@@ -48,20 +47,17 @@ def post_message_and_drain(
 
     Use this in every test that sends a user message: POST → assert 202 →
     drain until the specific task_id is gone → return TurnRecord. The caller
-    reads turn outcome and events from the TurnRecord or from GET
-    /v1/sessions/{id}/events.
+    reads turn outcome and events from the TurnRecord or from GET /v1/events.
 
     Loops process_one_task until the specific task is consumed, so maintenance
     tasks processed ahead of the user_message task do not cause a stale read.
-    Queries TurnRecord without filtering by session_id so rotation tests work
-    correctly (the new session's turn is still found).
     """
     posted_at = utcnow()
     body: dict[str, Any] = {"message": message}
     if json_extra:
         body.update(json_extra)
     resp = client.post(
-        f"/v1/sessions/{session_id}/message",
+        "/v1/messages",
         json=body,
         headers=headers or {},
     )
@@ -112,7 +108,6 @@ def drain_task(client: TestClient, task_id: str) -> None:
 def run_function_calls(
     *,
     db: Session,
-    session_id: str,
     turn: TurnRecord,
     function_calls_raw: list[dict[str, Any]],
     approval_ttl_seconds: int,
@@ -147,7 +142,6 @@ def run_function_calls(
             function_call_raw=function_call_raw,
             db=db,
             session_factory=session_factory,
-            session_id=session_id,
             turn=turn,
             approval_ttl_seconds=approval_ttl_seconds,
             approval_actor_id=approval_actor_id,

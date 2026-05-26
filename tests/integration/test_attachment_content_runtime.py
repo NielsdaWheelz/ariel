@@ -16,12 +16,11 @@ from ariel.attachment_content import AttachmentContentRuntime, AttachmentScanner
 from ariel.ids import new_id
 from ariel.model_adapter import ModelCall, ModelResponse, TokenUsage
 from ariel.models import VISION
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.persistence import TurnRecord
 from tests.integration.responses_helpers import FakeModelAdapter
 
 
 NOW = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
-SESSION_ID = "ses_attachment_runtime"
 TURN_ID = "trn_attachment_runtime"
 ATTACHMENT_REF = "discord:131415"
 DOWNLOAD_URL = "https://cdn.discordapp.com/attachments/report.txt"
@@ -145,18 +144,8 @@ def _seed_turn_and_source(
     download_url: str = DOWNLOAD_URL,
 ) -> None:
     db.add(
-        SessionRecord(
-            id=SESSION_ID,
-            is_active=True,
-            lifecycle_state="active",
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    )
-    db.add(
         TurnRecord(
             id=TURN_ID,
-            session_id=SESSION_ID,
             user_message="please summarize this",
             assistant_message=None,
             status="in_progress",
@@ -167,7 +156,6 @@ def _seed_turn_and_source(
     db.flush()
     runtime.record_discord_sources(
         db=db,
-        session_id=SESSION_ID,
         turn_id=TURN_ID,
         discord_context={
             "message_id": 789,
@@ -199,7 +187,6 @@ def _execute_read(
 ) -> dict[str, Any]:
     result = runtime.execute_read(
         db=db,
-        session_id=SESSION_ID,
         turn_id=TURN_ID,
         normalized_input={"attachment_ref": ATTACHMENT_REF, "intent": "summarize"},
         now_fn=lambda: now,

@@ -527,14 +527,8 @@ def _bind_google_fakes(
     _worker_module.build_google_runtime = _worker_build_google_runtime
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -642,10 +636,9 @@ def test_drive_search_and_read_execute_inline_with_retrieval_citations(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-drive-read")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="find launch plan")
-        search_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="find launch plan")
+        search_turn_data = _turn_data(client)
         search_attempt = _surface_attempt(search_turn_data)
         assert search_attempt["proposal"]["capability_id"] == "cap.drive.search"
         assert search_attempt["policy"]["decision"] == "allow_inline"
@@ -659,8 +652,8 @@ def test_drive_search_and_read_execute_inline_with_retrieval_citations(
         assert "[1]" in search_turn_data["assistant_message"]
         assert len(_turn_sources(client, search_turn_data["id"])) == 1
 
-        post_message_and_drain(client, session_id, message="read launch plan")
-        read_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="read launch plan")
+        read_turn_data = _turn_data(client)
         read_attempt = _surface_attempt(read_turn_data)
         assert read_attempt["proposal"]["capability_id"] == "cap.drive.read"
         assert read_attempt["policy"]["decision"] == "allow_inline"
@@ -743,10 +736,9 @@ def test_drive_read_typed_outcomes_are_explicit_and_recoverable(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-drive-read")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message=message)
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message=message)
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1047,10 +1039,9 @@ def test_drive_share_is_approval_gated_exact_payload_and_exactly_once(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-drive-share")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="share launch plan")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="share launch plan")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.drive.share"
         assert attempt["policy"]["decision"] == "requires_approval"
@@ -1072,7 +1063,7 @@ def test_drive_share_is_approval_gated_exact_payload_and_exactly_once(
         assert replay.status_code == 409
         assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
         latest_attempt = _surface_attempt(latest_turn)
@@ -1159,10 +1150,9 @@ def test_drive_share_denial_blocks_the_provider_write(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-drive-share")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="share launch plan")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="share launch plan")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "requires_approval"
 
@@ -1256,10 +1246,9 @@ def test_drive_auth_scope_failures_are_typed_and_recoverable(
         )
         if connect_code is not None:
             _connect_google(client, code=connect_code)
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="read planning doc")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="read planning doc")
+        turn_data = _turn_data(client)
 
         rendered_message = turn_data["assistant_message"].lower()
         assert expected_class in rendered_message
@@ -1349,10 +1338,9 @@ def test_drive_provider_failures_are_typed_and_recoverable(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-drive")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message=message)
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message=message)
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == expected_capability_id
         assert attempt["execution"]["status"] == "failed"

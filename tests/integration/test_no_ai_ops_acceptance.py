@@ -38,7 +38,6 @@ class NoAiOpsAdapter(FakeModelAdapter):
 @dataclass(frozen=True)
 class CaptureStorageRow:
     turn_id: str
-    effective_session_id: str
     normalized_turn_input: str
 
 
@@ -97,8 +96,7 @@ def _capture_storage_row(client: TestClient, capture_id: str) -> CaptureStorageR
             row = (
                 db.execute(
                     text(
-                        "SELECT turn_id, effective_session_id, normalized_turn_input "
-                        "FROM captures WHERE id = :capture_id"
+                        "SELECT turn_id, normalized_turn_input FROM captures WHERE id = :capture_id"
                     ),
                     {"capture_id": capture_id},
                 )
@@ -107,7 +105,6 @@ def _capture_storage_row(client: TestClient, capture_id: str) -> CaptureStorageR
             )
     return CaptureStorageRow(
         turn_id=str(row["turn_id"]),
-        effective_session_id=str(row["effective_session_id"]),
         normalized_turn_input=str(row["normalized_turn_input"]),
     )
 
@@ -254,21 +251,19 @@ def test_capture_record_creates_durable_capture_without_model(postgres_url: str)
         assert capture["id"].startswith("cpt_")
         assert capture["kind"] == "text"
         assert capture["idempotency_key"] == "capture-record-001"
-        assert isinstance(capture["effective_session_id"], str)
         assert isinstance(capture["turn_id"], str)
         assert "terminal_state" not in capture
         assert "ingest_failure" not in capture
 
         row = _capture_storage_row(client, capture["id"])
         assert row.turn_id == capture["turn_id"]
-        assert row.effective_session_id == capture["effective_session_id"]
         assert "capture ingress" in row.normalized_turn_input
         capture_columns = _capture_columns(client)
         assert "original_payload" not in capture_columns
         assert "terminal_state" not in capture_columns
         assert "ingest_error_code" not in capture_columns
 
-        timeline = client.get(f"/v1/sessions/{capture['effective_session_id']}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         turn = timeline.json()["turns"][0]
         assert turn["id"] == capture["turn_id"]

@@ -25,8 +25,8 @@ from tests.integration.responses_helpers import (
 from tests.fake_sandbox import FakeSandboxRuntime
 
 
-def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _timeline(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     return resp.json()
 
@@ -93,13 +93,11 @@ def _patch_discord_attachment_download(
 
 def _post_report_attachment_read_request(
     client: TestClient,
-    session_id: str,
     *,
     guild_id: int | None = 123,
 ) -> Any:
     return post_message_and_drain(
         client,
-        session_id,
         message="please summarize this",
         json_extra={
             "discord": {
@@ -237,11 +235,8 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
 ) -> None:
     adapter = NoVisibleResponseAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-
         turn = post_message_and_drain(
             client,
-            session_id,
             message="noted",
             json_extra={
                 "discord": {
@@ -278,7 +273,7 @@ def test_no_visible_response_operation_completes_turn_without_visible_reply(
         assert turn.assistant_message == ""
         assert turn.status == "completed"
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         assert turn_data["assistant_message"] == ""
         assert turn_data["surface_action_lifecycle"] == []
@@ -351,10 +346,8 @@ def test_discord_attachment_only_message_does_not_blind_read_or_expose_raw_url(
     adapter = NoVisibleResponseAdapter()
     raw_url = "https://cdn.discordapp.com/attachments/photo.png"
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(
             client,
-            session_id,
             message="What would you like me to do with the attachment(s)?",
             json_extra={
                 "discord": {
@@ -381,7 +374,7 @@ def test_discord_attachment_only_message_does_not_blind_read_or_expose_raw_url(
         assert turn.assistant_message == ""
         assert turn.status == "completed"
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         assert turn_data["surface_action_lifecycle"] == []
 
@@ -418,10 +411,8 @@ def test_discord_dm_attachment_only_message_does_not_blind_read_or_expose_raw_ur
     adapter = NoVisibleResponseAdapter()
     raw_url = "https://cdn.discordapp.com/attachments/photo.png"
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(
             client,
-            session_id,
             message="What would you like me to do with the attachment(s)?",
             json_extra={
                 "discord": {
@@ -448,7 +439,7 @@ def test_discord_dm_attachment_only_message_does_not_blind_read_or_expose_raw_ur
         assert turn.assistant_message == ""
         assert turn.status == "completed"
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         model_payload = json.dumps(jsonable_encoder(adapter.messages_seen), sort_keys=True)
         durable_payload = json.dumps(turn_data, sort_keys=True)
@@ -477,10 +468,8 @@ def test_discord_attachment_content_is_referenced_without_raw_cdn_url(
 ) -> None:
     adapter = CapturingAttachmentAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(
             client,
-            session_id,
             message="please summarize this",
             json_extra={
                 "discord": {
@@ -528,12 +517,11 @@ def test_discord_attachment_read_tool_reads_text_attachment(
 
     adapter = AttachmentReadAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = _post_report_attachment_read_request(client, session_id)
+        turn = _post_report_attachment_read_request(client)
 
         assert turn.assistant_message == "attachment content: quarterly revenue increased [1]"
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         lifecycle = turn_data["surface_action_lifecycle"]
         assert lifecycle[0]["proposal"]["capability_id"] == "cap.attachment.read"
@@ -561,10 +549,9 @@ def test_discord_attachment_read_fail_closed_returns_typed_scan_failure(
 
     adapter = AttachmentReadAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        _post_report_attachment_read_request(client, session_id)
+        _post_report_attachment_read_request(client)
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         lifecycle = turn_data["surface_action_lifecycle"]
         assert lifecycle[0]["proposal"]["capability_id"] == "cap.attachment.read"
@@ -617,10 +604,9 @@ def test_discord_dm_attachment_read_fail_closed_returns_typed_scan_failure(
 
     adapter = AttachmentReadAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        _post_report_attachment_read_request(client, session_id, guild_id=None)
+        _post_report_attachment_read_request(client, guild_id=None)
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         execution = turn_data["surface_action_lifecycle"][0]["execution"]
         output = execution["output"]
@@ -655,9 +641,8 @@ def test_discord_dm_attachment_read_fail_closed_returns_typed_scan_failure(
 def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str) -> None:
     adapter = DiscordStatusAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         for message in ("msg-a", "msg-b"):
-            post_message_and_drain(client, session_id, message=message)
+            post_message_and_drain(client, message=message)
 
         surface = client.get("/")
         assert surface.status_code == 200
@@ -665,12 +650,10 @@ def test_root_serves_discord_primary_status_not_phone_surface(postgres_url: str)
         root_payload = surface.json()
         assert root_payload["ok"] is True
         assert root_payload["surface"] == "discord"
-        assert root_payload["api"]["active_session"] == "/v1/sessions/active"
         assert "Discord" in root_payload["message"]
         assert "chat-form" not in surface.text
-        assert "/v1/sessions/${sessionId}/events" not in surface.text
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turns = timeline["turns"]
         assert [turn["user_message"] for turn in turns] == ["msg-a", "msg-b"]
         assert turns[0]["events"][0]["event_type"] == "evt.turn.started"

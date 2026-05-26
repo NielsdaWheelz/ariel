@@ -15,7 +15,7 @@ from .action_runtime import (
     RuntimeProvenance,
     process_action_execution_task,
     process_provider_write_reconcile_due,
-    reconcile_expired_approvals_for_session,
+    reconcile_expired_approvals,
 )
 from .app import (
     Runtime,
@@ -43,11 +43,9 @@ from .persistence import (
     JobEventRecord,
     JobRecord,
     ProviderWatchChannelRecord,
-    SessionRecord,
     SyncCursorRecord,
     TurnIdempotencyRecord,
     enqueue_background_task,
-    get_or_create_active_session,
 )
 from .memory import enqueue_due_memory_dream, run_rememberer
 from .redaction import safe_failure_reason
@@ -482,18 +480,11 @@ def process_one_task(
             case "agent_wake":
                 if runtime is None:
                     raise RuntimeError("agent_wake task requires a configured runtime")
-                research_session_id, wake_context = _agent_wake_context(task_payload)
+                wake_context = _agent_wake_context(task_payload)
                 with session_factory() as db:
-                    # A research-completion wake targets the session that
-                    # dispatched the run; every other proactive wake uses the
-                    # active session.
-                    request_session_id = (
-                        research_session_id or get_or_create_active_session(db, now=utcnow()).id
-                    )
                     outcome = _wake(
                         runtime=runtime,
                         db=db,
-                        request_session_id=request_session_id,
                         wake_context=wake_context,
                         source_background_task_id=task_id,
                         google_runtime=build_google_runtime(runtime.settings),
@@ -507,9 +498,8 @@ def process_one_task(
             case "user_message":
                 if runtime is None:
                     raise RuntimeError("user_message task requires a configured runtime")
-                session_id = _payload_text(task_payload, "session_id")
                 message = _payload_text(task_payload, "message")
-                if session_id is None or message is None:
+                if message is None:
                     raise RuntimeError("user_message task payload invalid")
                 raw_discord_context = task_payload.get("discord_context")
                 discord_context_for_wake = (
@@ -520,7 +510,6 @@ def process_one_task(
                     outcome = _wake(
                         runtime=runtime,
                         db=db,
-                        request_session_id=session_id,
                         wake_context=WakeContext(
                             trigger_kind="user_message",
                             prompt_text=message,
@@ -570,7 +559,7 @@ def process_one_task(
                     new_id_fn=new_id,
                 )
             case "expire_approvals":
-                _expire_approvals(session_factory=session_factory, task_payload=task_payload)
+                _expire_approvals(session_factory=session_factory)
             case "provider_event_received":
                 process_provider_event_received(
                     session_factory=session_factory,
@@ -591,12 +580,10 @@ def process_one_task(
                 note = _payload_text(task_payload, "note")
                 if not note:
                     raise RuntimeError("memory_encode task missing note")
-                session_id = _payload_text(task_payload, "session_id")
                 run_rememberer(
                     trigger="encode",
                     sandbox=_require_sandbox(runtime),
                     session_factory=runtime.session_factory,
-                    session_id=session_id,
                     settings=runtime.settings,
                     model_adapter=runtime.model_adapter,
                     google_runtime=build_google_runtime(runtime.settings),
@@ -618,7 +605,6 @@ def process_one_task(
                     trigger="dream",
                     sandbox=_require_sandbox(runtime),
                     session_factory=runtime.session_factory,
-                    session_id=None,
                     settings=runtime.settings,
                     model_adapter=runtime.model_adapter,
                     google_runtime=build_google_runtime(runtime.settings),
@@ -770,27 +756,21 @@ def _parse_research_finding(raw: dict[str, Any]) -> ResearchFinding:
     )
 
 
-def _agent_wake_context(task_payload: dict[str, Any]) -> tuple[str | None, WakeContext]:
+def _agent_wake_context(task_payload: dict[str, Any]) -> WakeContext:
     """Build the ``WakeContext`` for an ``agent_wake`` task.
 
     Three shapes reach this arm. A research-completion wake carries a
-    ``research_finding`` object and the ``session_id`` that dispatched the run:
-    the finding is rendered into the prompt as a clearly-attributed block and the
-    wake is carried with tainted ``ingress_provenance`` — the finding's text is
-    model-authored over untrusted content, so a prompt-injected finding cannot
-    authorize an unapproved action. A provider-sync wake carries bounded
-    provider evidence and is tainted for the same reason. A plain wake carries
-    a ``note`` and keeps the untainted ``scheduled_task`` path unchanged.
-    Returns the target session id (the carried session for a research completion,
-    ``None`` for other wakes — the caller resolves the active session) and the
-    context."""
+    ``research_finding`` object: the finding is rendered into the prompt as a
+    clearly-attributed block and the wake is carried with tainted
+    ``ingress_provenance`` — the finding's text is model-authored over untrusted
+    content, so a prompt-injected finding cannot authorize an unapproved
+    action. A provider-sync wake carries bounded provider evidence and is
+    tainted for the same reason. A plain wake carries a ``note`` and keeps the
+    untainted ``scheduled_task`` path unchanged."""
     raw_finding = task_payload.get("research_finding")
     if isinstance(raw_finding, dict):
         finding = _parse_research_finding(raw_finding)
-        session_id = _payload_text(task_payload, "session_id")
-        if session_id is None:
-            raise RuntimeError("agent_wake research_finding task missing session_id")
-        return session_id, WakeContext(
+        return WakeContext(
             trigger_kind="research_completion",
             prompt_text=render_finding(finding),
             discord_context=None,
@@ -809,7 +789,7 @@ def _agent_wake_context(task_payload: dict[str, Any]) -> tuple[str | None, WakeC
     kind = _payload_text(task_payload, "kind")
     if kind == "provider_sync_review":
         prompt_text, provenance_evidence = _provider_sync_review_context(task_payload)
-        return None, WakeContext(
+        return WakeContext(
             trigger_kind="provider_sync",
             prompt_text=prompt_text,
             discord_context=None,
@@ -824,7 +804,7 @@ def _agent_wake_context(task_payload: dict[str, Any]) -> tuple[str | None, WakeC
     note = _payload_text(task_payload, "note")
     if note is None:
         raise RuntimeError("agent_wake task missing note")
-    return None, WakeContext(
+    return WakeContext(
         trigger_kind="scheduled_task",
         prompt_text=note,
         discord_context=None,
@@ -976,18 +956,16 @@ def _process_research_run(
     task_payload: dict[str, Any],
 ) -> None:
     """Run one ``research_run`` task: drive ``run_research`` in the worker, then
-    enqueue a completion ``agent_wake`` carrying the finding back to the session
-    that dispatched the run.
+    enqueue a completion ``agent_wake`` carrying the finding back to the agent.
 
-    ``question``, ``mode``, and ``session_id`` are validated inside the arm —
-    a bad shape raises so the task-failure path marks the row failed, mirroring
+    ``question`` and ``mode`` are validated inside the arm — a bad shape raises
+    so the task-failure path marks the row failed, mirroring
     ``case "user_message":``. ``run_research`` records the run as a
     ``kind="research"`` ``TurnRecord`` and never raises; its typed
     ``ResearchFinding`` becomes the completion wake's payload."""
     question = _payload_text(task_payload, "question")
     payload_mode = _payload_text(task_payload, "mode")
-    session_id = _payload_text(task_payload, "session_id")
-    if question is None or payload_mode is None or session_id is None:
+    if question is None or payload_mode is None:
         raise RuntimeError("research_run task payload invalid")
     mode: ResearchMode
     match payload_mode:
@@ -1004,7 +982,6 @@ def _process_research_run(
             settings=runtime.settings,
             model_adapter=runtime.model_adapter,
             google_runtime=build_google_runtime(runtime.settings),
-            session_id=session_id,
             question=question,
             mode=mode,
             now_fn=utcnow,
@@ -1026,7 +1003,6 @@ def _process_research_run(
                         "gaps": finding.gaps,
                         "sources": finding.sources,
                     },
-                    "session_id": session_id,
                 },
                 now=utcnow(),
                 idempotency_key=f"research_completion:{task_id}",
@@ -1159,27 +1135,14 @@ def _process_agency_event_received(
 def _expire_approvals(
     *,
     session_factory: sessionmaker[Session],
-    task_payload: dict[str, Any],
 ) -> None:
-    session_id = _payload_text(task_payload, "session_id")
     with session_factory() as db:
         with db.begin():
-            if session_id is not None:
-                reconcile_expired_approvals_for_session(
-                    db=db,
-                    session_id=session_id,
-                    now_fn=utcnow,
-                    new_id_fn=new_id,
-                )
-                return
-            session_ids = db.scalars(select(SessionRecord.id)).all()
-            for existing_session_id in session_ids:
-                reconcile_expired_approvals_for_session(
-                    db=db,
-                    session_id=existing_session_id,
-                    now_fn=utcnow,
-                    new_id_fn=new_id,
-                )
+            reconcile_expired_approvals(
+                db=db,
+                now_fn=utcnow,
+                new_id_fn=new_id,
+            )
 
 
 if __name__ == "__main__":

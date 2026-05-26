@@ -623,7 +623,6 @@ def _append_action_execution_event(
 ) -> None:
     append_turn_event(
         db=db,
-        session_id=action_attempt.session_id,
         turn_id=action_attempt.turn_id,
         sequence=next_turn_event_sequence(db=db, turn_id=action_attempt.turn_id),
         event_type=event_type,
@@ -671,7 +670,6 @@ def _execute_memory_capability(
     session_factory: sessionmaker[Session],
     capability_id: str,
     normalized_input: dict[str, Any],
-    session_id: str,
     turn: TurnRecord | None = None,
     caller_db: Session | None = None,
     now_fn: Callable[[], datetime],
@@ -730,7 +728,6 @@ def _execute_memory_capability(
             sandbox=sandbox,
             db=caller_db,
             session_factory=session_factory,
-            session_id=session_id,
             turn=turn,
             settings=settings,
             model_adapter=model_adapter,
@@ -754,7 +751,6 @@ def _execute_memory_capability(
                 task_id = enqueue_memory_encode(
                     db,
                     note=str(normalized_input["note"]),
-                    session_id=session_id,
                     now=now_fn(),
                 )
         return {"status": "queued", "encode_id": task_id}
@@ -797,7 +793,6 @@ def _execute_memory_capability(
                         "created_at": to_rfc3339(log_row.created_at),
                         "content": log_row.content,
                         "taint": log_row.taint,
-                        "session_id": log_row.session_id,
                         "turn_id": log_row.turn_id,
                     }
                 note_row = read_note(db, entry_id)
@@ -889,15 +884,13 @@ def _execute_research_capability(
     db: Session,
     capability_id: str,
     normalized_input: dict[str, Any],
-    session_id: str,
     now_fn: Callable[[], datetime],
 ) -> dict[str, Any]:
     """Run one research syscall. ``cap.research.investigate`` writes an immediate
     ``research_run`` row to ``background_tasks``: ``payload`` carries the AI-authored
-    ``question``, the ``mode`` whitelist selector, and the originating ``session_id``
-    the completion wake returns to. The run-callable returns the task identity so
-    the main agent can acknowledge the dispatch and end its turn; the research run
-    itself executes in the worker."""
+    ``question`` and the ``mode`` whitelist selector. The run-callable returns the
+    task identity so the main agent can acknowledge the dispatch and end its turn;
+    the research run itself executes in the worker."""
     if capability_id != "cap.research.investigate":
         raise RuntimeError("unknown_research_capability")
     task = enqueue_background_task(
@@ -906,7 +899,6 @@ def _execute_research_capability(
         payload={
             "question": str(normalized_input["question"]),
             "mode": str(normalized_input["mode"]),
-            "session_id": session_id,
         },
         now=now_fn(),
     )
@@ -1443,7 +1435,6 @@ def _extract_search_source_candidates(
 def _persist_retrieval_artifacts(
     *,
     db: Session,
-    session_id: str,
     turn_id: str,
     action_attempt: ActionAttemptRecord,
     capability_id: str,
@@ -1456,7 +1447,6 @@ def _persist_retrieval_artifacts(
         now = now_fn()
         artifact = ArtifactRecord(
             id=new_id_fn("art"),
-            session_id=session_id,
             turn_id=turn_id,
             action_attempt_id=action_attempt.id,
             artifact_type="retrieval_provenance",
@@ -2185,12 +2175,7 @@ def _provider_write_authority_payload(
         if not instruction_turn_id:
             return None, "provider_user_instruction_ref_invalid"
         instruction_turn = db.scalar(
-            select(TurnRecord)
-            .where(
-                TurnRecord.id == instruction_turn_id,
-                TurnRecord.session_id == action_attempt.session_id,
-            )
-            .limit(1)
+            select(TurnRecord).where(TurnRecord.id == instruction_turn_id).limit(1)
         )
         if instruction_turn is None:
             return None, "provider_user_instruction_not_found"
@@ -2203,7 +2188,6 @@ def _provider_write_authority_payload(
         **authority,
         "turn_id": instruction_turn_id or action_attempt.turn_id,
         "action_turn_id": action_attempt.turn_id,
-        "session_id": action_attempt.session_id,
     }
     approval_ref = _latest_approval_ref(db, action_attempt_id=action_attempt.id)
     if approval_ref is not None:
@@ -2277,7 +2261,6 @@ def _record_provider_write_receipt(
             response_payload["authority"] = {
                 "approval_ref": approval_ref,
                 "action_turn_id": action_attempt.turn_id,
-                "session_id": action_attempt.session_id,
             }
     provider_object_ids = _provider_write_object_ids(
         normalized_input=normalized_input,
@@ -3191,7 +3174,6 @@ def process_one_call(
     function_call_raw: Any,
     db: Session,
     session_factory: sessionmaker[Session] | None,
-    session_id: str,
     turn: TurnRecord,
     approval_ttl_seconds: int,
     approval_actor_id: str,
@@ -3305,7 +3287,6 @@ def process_one_call(
     )
     action_attempt = ActionAttemptRecord(
         id=new_id_fn("aat"),
-        session_id=session_id,
         turn_id=turn.id,
         proposal_index=function_call_index,
         capability_id=capability_id,
@@ -3504,7 +3485,6 @@ def process_one_call(
         approval_request = ApprovalRequestRecord(
             id=new_id_fn("apr"),
             action_attempt_id=action_attempt.id,
-            session_id=session_id,
             turn_id=turn.id,
             actor_id=approval_actor_id,
             status="pending",
@@ -3823,7 +3803,6 @@ def process_one_call(
             capability_id=capability_id,
             normalized_input=evaluation.normalized_input,
             action_attempt=action_attempt,
-            session_id=session_id,
             turn_id=turn.id,
             now_fn=now_fn,
             new_id_fn=new_id_fn,
@@ -3831,7 +3810,6 @@ def process_one_call(
     elif is_attachment_capability_call and attachment_runtime is not None:
         execution_result = attachment_runtime.execute_read(
             db=db,
-            session_id=session_id,
             turn_id=turn.id,
             normalized_input=evaluation.normalized_input,
             now_fn=now_fn,
@@ -3859,7 +3837,6 @@ def process_one_call(
                 session_factory=session_factory,
                 capability_id=capability_id,
                 normalized_input=evaluation.normalized_input,
-                session_id=session_id,
                 turn=turn,
                 caller_db=db,
                 now_fn=now_fn,
@@ -3910,7 +3887,6 @@ def process_one_call(
             db=db,
             capability_id=capability_id,
             normalized_input=evaluation.normalized_input,
-            session_id=session_id,
             now_fn=now_fn,
         )
         execution_result = ExecutionResult(
@@ -4059,7 +4035,6 @@ def process_one_call(
                 if candidates:
                     persisted_sources = _persist_retrieval_artifacts(
                         db=db,
-                        session_id=session_id,
                         turn_id=turn.id,
                         action_attempt=action_attempt,
                         capability_id=capability_id,
@@ -4128,10 +4103,7 @@ def _mark_approval_expired(
     if approval.action_attempt_id != action_attempt.id:
         msg = "approval/action attempt mismatch during expiry reconciliation"
         raise RuntimeError(msg)
-    if (
-        approval.session_id != action_attempt.session_id
-        or approval.turn_id != action_attempt.turn_id
-    ):
+    if approval.turn_id != action_attempt.turn_id:
         msg = "approval/action attempt scope mismatch during expiry reconciliation"
         raise RuntimeError(msg)
 
@@ -4146,7 +4118,6 @@ def _mark_approval_expired(
 
     append_turn_event(
         db=db,
-        session_id=approval.session_id,
         turn_id=approval.turn_id,
         sequence=next_turn_event_sequence(db=db, turn_id=approval.turn_id),
         event_type="evt.action.approval.expired",
@@ -4160,10 +4131,9 @@ def _mark_approval_expired(
     )
 
 
-def reconcile_expired_approvals_for_session(
+def reconcile_expired_approvals(
     *,
     db: Session,
-    session_id: str,
     now_fn: Callable[[], datetime],
     new_id_fn: Callable[[str], str],
 ) -> int:
@@ -4171,7 +4141,6 @@ def reconcile_expired_approvals_for_session(
     approvals = db.scalars(
         select(ApprovalRequestRecord)
         .where(
-            ApprovalRequestRecord.session_id == session_id,
             ApprovalRequestRecord.status == "pending",
             ApprovalRequestRecord.expires_at < now,
         )
@@ -4298,7 +4267,6 @@ def resolve_approval_decision(
         sequence += 1
         append_turn_event(
             db=db,
-            session_id=approval.session_id,
             turn_id=approval.turn_id,
             sequence=sequence,
             event_type=event_type,
@@ -4944,7 +4912,6 @@ def process_action_execution_task(
                         session_factory=session_factory,
                         capability_id=action_attempt.capability_id,
                         normalized_input=normalized_input,
-                        session_id=action_attempt.session_id,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
                         settings=settings,
@@ -5010,7 +4977,6 @@ def process_action_execution_task(
                     db=db,
                     capability_id=action_attempt.capability_id,
                     normalized_input=normalized_input,
-                    session_id=action_attempt.session_id,
                     now_fn=now_fn,
                 )
                 action_attempt.status = "succeeded"
@@ -5677,7 +5643,6 @@ def process_action_execution_task(
                             started=result,
                             input_payload=normalized_input,
                             action_attempt=action_attempt,
-                            session_id=action_attempt.session_id,
                             turn_id=action_attempt.turn_id,
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,

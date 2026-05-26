@@ -12,7 +12,6 @@ def _capture_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": "cpt_1",
         "kind": "text",
-        "effective_session_id": "ses_1",
         "turn_id": "trn_1",
         "idempotency_key": None,
         "created_at": "2026-05-22T00:00:00Z",

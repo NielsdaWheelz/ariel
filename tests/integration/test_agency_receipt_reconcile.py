@@ -30,7 +30,6 @@ from ariel.persistence import (
     JobEventRecord,
     JobRecord,
     ProviderWriteReceiptRecord,
-    SessionRecord,
     TurnRecord,
 )
 from ariel.worker import process_one_task
@@ -149,20 +148,8 @@ def _seed_agency_run_approval(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_agency_run",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="turn_agency_run",
-                    session_id="ses_agency_run",
                     user_message="start agency job",
                     assistant_message=None,
                     status="in_progress",
@@ -174,7 +161,6 @@ def _seed_agency_run_approval(
             db.add(
                 ActionAttemptRecord(
                     id=action_id,
-                    session_id="ses_agency_run",
                     turn_id="turn_agency_run",
                     proposal_index=1,
                     capability_id=capability.capability_id,
@@ -197,7 +183,6 @@ def _seed_agency_run_approval(
                 ApprovalRequestRecord(
                     id=approval_id,
                     action_attempt_id=action_id,
-                    session_id="ses_agency_run",
                     turn_id="turn_agency_run",
                     actor_id=actor_id,
                     status="pending",
@@ -566,20 +551,8 @@ def _seed_request_pr_action(session_factory: sessionmaker[Session], *, action_id
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_agency",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="turn_agency",
-                    session_id="ses_agency",
                     user_message="request pr",
                     assistant_message=None,
                     status="in_progress",
@@ -591,7 +564,6 @@ def _seed_request_pr_action(session_factory: sessionmaker[Session], *, action_id
             db.add(
                 JobRecord(
                     id="job_1",
-                    session_id="ses_agency",
                     turn_id="turn_agency",
                     action_attempt_id=None,
                     source="agency.daemon",
@@ -612,7 +584,6 @@ def _seed_request_pr_action(session_factory: sessionmaker[Session], *, action_id
             db.add(
                 ActionAttemptRecord(
                     id=action_id,
-                    session_id="ses_agency",
                     turn_id="turn_agency",
                     proposal_index=1,
                     capability_id=capability.capability_id,

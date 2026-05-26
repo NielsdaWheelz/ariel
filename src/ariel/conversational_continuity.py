@@ -116,19 +116,16 @@ def _compact_event_payload(payload: dict[str, Any], *, cap: int) -> dict[str, An
 def build_recent_events_block(
     *,
     db: Session,
-    session_id: str,
     settings: AppSettings,
 ) -> str | None:
     """Render the recent-events system block. ``None`` when the log is empty.
 
-    Query is session-scoped during phases 1-4. The ``session_id`` filter is
-    dropped in phase 5 (session abolition) and queries become purely
-    recency-bounded.
+    Selection is purely recency-bounded: the most recent K externally-relevant
+    events globally, ordered chronologically. There is no session filter.
     """
     rows = (
         db.execute(
             select(EventRecord)
-            .where(EventRecord.session_id == session_id)
             .where(EventRecord.event_type.in_(tuple(EXTERNAL_EVENT_TYPES)))
             .order_by(EventRecord.created_at.desc(), EventRecord.sequence.desc())
             .limit(settings.recent_events_max_rows)

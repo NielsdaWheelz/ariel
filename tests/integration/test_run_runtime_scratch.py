@@ -11,7 +11,7 @@ from typing import Any
 
 from ariel.action_runtime import RuntimeProvenance
 from ariel.config import AppSettings
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.persistence import TurnRecord
 from ariel.run_runtime import (
     ScratchEntry,
     _SCRATCH_MAX_ENTRIES,
@@ -30,21 +30,9 @@ def _settings() -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
 
 
-def _turn(db: Any, *, session_id: str, turn_id: str) -> TurnRecord:
-    db.add(
-        SessionRecord(
-            id=session_id,
-            is_active=True,
-            lifecycle_state="active",
-            rotated_from_session_id=None,
-            rotation_reason=None,
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    )
+def _turn(db: Any, *, turn_id: str) -> TurnRecord:
     turn = TurnRecord(
         id=turn_id,
-        session_id=session_id,
         user_message="test",
         assistant_message=None,
         status="in_progress",
@@ -77,7 +65,6 @@ def _run(
         source=source,
         db=db,
         session_factory=session_factory,
-        session_id=turn.session_id,
         turn=turn,
         proposal_index_start=0,
         approval_ttl_seconds=300,
@@ -105,7 +92,7 @@ def test_scratch_set_and_get_round_trip(
     scratch: dict[str, ScratchEntry] = {}
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_rw", turn_id="trn_scratch_rw")
+            turn = _turn(db, turn_id="trn_scratch_rw")
             # Program 1: set a value.
             result1 = _run(
                 sandbox=sandbox,
@@ -145,7 +132,7 @@ def test_scratch_get_missing_key_returns_error(
     scratch: dict[str, ScratchEntry] = {}
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_missing", turn_id="trn_scratch_missing")
+            turn = _turn(db, turn_id="trn_scratch_missing")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -177,7 +164,7 @@ def test_scratch_set_taint_propagates_on_get(
     )
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_taint", turn_id="trn_scratch_taint")
+            turn = _turn(db, turn_id="trn_scratch_taint")
             # Set a value with tainted provenance.
             result1 = _run(
                 sandbox=sandbox,
@@ -225,7 +212,7 @@ def test_scratch_set_rejects_too_large_value(
     big_string = "x" * (_SCRATCH_MAX_VALUE_BYTES + 1)
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_big", turn_id="trn_scratch_big")
+            turn = _turn(db, turn_id="trn_scratch_big")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -248,7 +235,7 @@ def test_scratch_set_rejects_non_json_encodable_value(
     scratch: dict[str, ScratchEntry] = {}
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_nonjson", turn_id="trn_scratch_nonjson")
+            turn = _turn(db, turn_id="trn_scratch_nonjson")
             # Sets are not JSON-encodable; the program uses an inline set literal.
             result = _run(
                 sandbox=sandbox,
@@ -272,7 +259,7 @@ def test_scratch_set_rejects_invalid_key(
     scratch: dict[str, ScratchEntry] = {}
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_badkey", turn_id="trn_scratch_badkey")
+            turn = _turn(db, turn_id="trn_scratch_badkey")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -298,7 +285,7 @@ def test_scratch_store_full_rejects_excess_entries(
     }
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_full", turn_id="trn_scratch_full")
+            turn = _turn(db, turn_id="trn_scratch_full")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -327,7 +314,7 @@ def test_scratch_total_bytes_cap_rejects_excess(
     scratch: dict[str, ScratchEntry] = {"existing": ScratchEntry(value=big_value, provenance=None)}
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_scratch_total", turn_id="trn_scratch_total")
+            turn = _turn(db, turn_id="trn_scratch_total")
             result = _run(
                 sandbox=sandbox,
                 db=db,

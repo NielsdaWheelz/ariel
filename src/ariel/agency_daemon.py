@@ -176,7 +176,6 @@ class AgencyRuntime:
         capability_id: str,
         normalized_input: dict[str, Any],
         action_attempt: ActionAttemptRecord,
-        session_id: str,
         turn_id: str,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
@@ -193,7 +192,6 @@ class AgencyRuntime:
                         ),
                         input_payload=normalized_input,
                         action_attempt=action_attempt,
-                        session_id=session_id,
                         turn_id=turn_id,
                         now_fn=now_fn,
                         new_id_fn=new_id_fn,
@@ -285,7 +283,6 @@ class AgencyRuntime:
         started: dict[str, Any],
         input_payload: dict[str, Any],
         action_attempt: ActionAttemptRecord,
-        session_id: str,
         turn_id: str,
         now_fn: Callable[[], datetime],
         new_id_fn: Callable[[str], str],
@@ -315,7 +312,6 @@ class AgencyRuntime:
         if job is None:
             job = JobRecord(
                 id=new_id_fn("job"),
-                session_id=session_id,
                 turn_id=turn_id,
                 action_attempt_id=action_attempt.id,
                 source="agency.daemon",

@@ -108,14 +108,8 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -269,9 +263,8 @@ def test_web_extract_executes_inline_with_structured_output_citations_and_proven
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="extract url")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="extract url")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.web.extract"
         assert attempt["policy"]["decision"] == "allow_inline"
@@ -362,9 +355,8 @@ def test_url_safety_input_policy_fails_closed_before_provider_dispatch(
         },
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="unsafe url")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="unsafe url")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "deny"
         assert attempt["policy"]["reason"] == expected_error
@@ -428,9 +420,8 @@ def test_web_extract_egress_contract_failures_block_before_execute(
         assistant_text_by_message={"intent failure": expected_error},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="intent failure")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="intent failure")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert expected_error in (attempt["execution"]["error"] or "")
@@ -476,9 +467,8 @@ def test_non_allowlisted_egress_is_blocked_before_web_extract_execution(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="egress deny")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="egress deny")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
@@ -520,9 +510,8 @@ def test_transient_provider_failure_retries_are_bounded_and_single_outcome(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="retry extraction")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="retry extraction")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         assert attempt["execution"]["output"]["provider"]["attempt_count"] == 2
@@ -559,9 +548,8 @@ def test_provider_retry_exhaustion_fails_once_with_typed_error(
         assistant_text_by_message={"retry exhaustion": "provider_upstream_failure: retry later."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="retry exhaustion")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="retry exhaustion")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "provider_upstream_failure"
@@ -613,9 +601,8 @@ def test_typed_url_extraction_failures_are_actionable_and_auditable(
         assistant_text_by_message={"failing extraction": f"{expected_error}: {expected_hint}."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="failing extraction")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="failing extraction")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
@@ -651,9 +638,8 @@ def test_provider_malformed_final_url_is_fail_closed(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="malformed final url")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="malformed final url")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "provider_invalid_payload"
@@ -692,9 +678,8 @@ def test_provider_unsafe_final_url_is_fail_closed(
         assistant_text_by_message={"unsafe final url": "url_destination_unsafe: public URL only."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="unsafe final url")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="unsafe final url")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["policy"]["decision"] == "allow_inline"
         assert attempt["execution"]["status"] == "failed"
@@ -738,9 +723,8 @@ def test_public_ipv6_urls_remain_allowed_and_canonical(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="ipv6 extraction")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="ipv6 extraction")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -786,9 +770,8 @@ def test_large_pages_are_bounded_and_partial_disclosure_is_explicit(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="large extraction")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="large extraction")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -830,9 +813,8 @@ def test_web_extract_preserves_grounding_and_lifecycle_inspectability(
         },
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="mixed turn")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="mixed turn")
+        turn_data = _turn_data(client)
         message = turn_data["assistant_message"].lower()
         assert "[1]" in turn_data["assistant_message"]
         assert "fully certain without citing anything" not in message

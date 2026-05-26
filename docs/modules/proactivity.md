@@ -71,7 +71,7 @@ A row is `id`, `task_type`, `idempotency_key`, `provider_write_receipt_id`,
 `updated_at`. Plain note wakes carry an `agent_wake` payload with `note`.
 Provider-sync wakes carry `kind='provider_sync_review'`, sync metadata, and
 bounded changed-item evidence from normalized provider reads. Research-completion
-wakes carry `session_id` and a typed `research_finding`. The worker rejects any
+wakes carry a typed `research_finding`. The worker rejects any
 `agent_wake` payload that is none of these shapes.
 
 The single-threaded worker takes the earliest due row, dispatches by

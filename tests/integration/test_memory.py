@@ -40,11 +40,8 @@ from ariel.persistence import (
     EventRecord,
     MemoryLogRecord,
     MemoryNoteRecord,
-    SessionRecord,
-    SYSTEM_SESSION_ID,
     TurnRecord,
     enqueue_background_task,
-    ensure_system_session,
 )
 from ariel.worker import process_one_task
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -86,12 +83,6 @@ def _app(postgres_url: str, adapter: ModelAdapter, monkeypatch: pytest.MonkeyPat
     )
 
 
-def _session_id(client: TestClient) -> str:
-    r = client.get("/v1/sessions/active")
-    assert r.status_code == 200
-    return r.json()["session"]["id"]
-
-
 def _seed_executing_memory_action(
     session_factory: sessionmaker[Session],
     *,
@@ -104,20 +95,8 @@ def _seed_executing_memory_action(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_memory_action",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_memory_action",
-                    session_id="ses_memory_action",
                     user_message="memory action",
                     assistant_message=None,
                     status="in_progress",
@@ -128,7 +107,6 @@ def _seed_executing_memory_action(
             db.add(
                 ActionAttemptRecord(
                     id=action_attempt_id,
-                    session_id="ses_memory_action",
                     turn_id="trn_memory_action",
                     proposal_index=1,
                     capability_id=capability_id,
@@ -346,7 +324,6 @@ def test_schema_memory_log_append_only_update_raises(
         kind="user_message",
         content="original",
         embedding=None,
-        session_id=None,
         turn_id=None,
         taint="clean",
         source_ref=None,
@@ -373,7 +350,6 @@ def test_schema_memory_log_append_only_delete_raises(
         kind="user_message",
         content="to delete",
         embedding=None,
-        session_id=None,
         turn_id=None,
         taint="clean",
         source_ref=None,
@@ -433,8 +409,7 @@ def test_retriever_fires_preturn_and_injects_recall_context(
     """The main agent's context includes the ``recall_v1`` reconstruction."""
     adapter = _TwoPhaseAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
-        post_message_and_drain(client, sid, message="hello")
+        post_message_and_drain(client, message="hello")
 
     assert adapter.call_count >= 2, "expected retriever + main agent calls"
     rendered = json.dumps(jsonable_encoder(adapter.snapshots[1]))  # main-agent snapshot
@@ -447,9 +422,8 @@ def test_memory_recall_syscall_runs_retriever_inline(
 ) -> None:
     adapter = _MemoryRecallSyscallAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
-        turn = post_message_and_drain(client, sid, message="recall via syscall")
-        timeline = client.get(f"/v1/sessions/{sid}/events").json()
+        turn = post_message_and_drain(client, message="recall via syscall")
+        timeline = client.get("/v1/events").json()
 
     assert turn.assistant_message == "recall syscall ok"
     assert adapter.call_count == 4
@@ -477,8 +451,7 @@ def test_recall_failure_is_nonfatal(
     finding emitted), the main-agent turn still completes with the assistant message."""
     adapter = _FailingRetrieverAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
-        turn = post_message_and_drain(client, sid, message="ping")
+        turn = post_message_and_drain(client, message="ping")
     assert turn.status == "completed"
     assert turn.assistant_message == "hello"
 
@@ -491,9 +464,8 @@ def test_recall_contract_violation_is_typed_nonfatal(
     the retriever."""
     adapter = _InvalidRecallAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
-        turn = post_message_and_drain(client, sid, message="ping")
-        timeline = client.get(f"/v1/sessions/{sid}/events").json()
+        turn = post_message_and_drain(client, message="ping")
+        timeline = client.get("/v1/events").json()
 
     assert turn.status == "completed"
     assert turn.assistant_message == "hello"
@@ -517,9 +489,8 @@ def test_memory_remember_enqueues_memory_encode_task(
     ``memory_encode`` background task whose payload carries the note."""
     adapter = _RememberAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
         sf = _sf(client)
-        post_message_and_drain(client, sid, message="remember this")
+        post_message_and_drain(client, message="remember this")
         with sf() as db:
             tasks = db.scalars(
                 select(BackgroundTaskRecord).where(
@@ -537,9 +508,8 @@ def test_memory_remember_enqueues_and_worker_records_encode_turn(
 ) -> None:
     adapter = _RememberThenEncodeAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
         sf = _sf(client)
-        post_message_and_drain(client, sid, message="remember this")
+        post_message_and_drain(client, message="remember this")
         runtime = cast(Any, client.app).state.runtime
 
         with sf() as db:
@@ -678,8 +648,7 @@ def test_retriever_and_main_loop_action_attempts_do_not_collide(
     proposal_index)`` uniqueness."""
     adapter = _RetrieverSearchesThenMainSearchesAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
-        turn = post_message_and_drain(client, sid, message="ping")
+        turn = post_message_and_drain(client, message="ping")
     assert turn.status == "completed", f"turn status={turn.status!r}"
     assert turn.assistant_message == "hello"
 
@@ -707,7 +676,7 @@ def test_worker_accepts_memory_encode_and_memory_dream(
         runtime = cast(Any, client.app).state.runtime
         sf = runtime.session_factory
         for task_type, payload in [
-            ("memory_encode", {"note": "n", "session_id": None}),
+            ("memory_encode", {"note": "n"}),
             ("memory_dream", {}),
         ]:
             with sf() as db:
@@ -746,7 +715,6 @@ def test_worker_memory_task_replay_reuses_completed_turn_without_model_call(
         sf = runtime.session_factory
         with sf() as db:
             with db.begin():
-                ensure_system_session(db, now=NOW)
                 task = enqueue_background_task(
                     db,
                     task_type="memory_dream",
@@ -757,7 +725,6 @@ def test_worker_memory_task_replay_reuses_completed_turn_without_model_call(
                 db.add(
                     TurnRecord(
                         id="trn_memory_replay_done",
-                        session_id=SYSTEM_SESSION_ID,
                         user_message='{"note": null, "prompt_version": "memory-rememberer-dream-v3", "trigger": "dream"}',
                         assistant_message=None,
                         status="completed",
@@ -799,7 +766,6 @@ def test_worker_memory_task_replay_fails_interrupted_turn_without_model_call(
         sf = runtime.session_factory
         with sf() as db:
             with db.begin():
-                ensure_system_session(db, now=NOW)
                 task = enqueue_background_task(
                     db,
                     task_type="memory_dream",
@@ -810,7 +776,6 @@ def test_worker_memory_task_replay_fails_interrupted_turn_without_model_call(
                 db.add(
                     TurnRecord(
                         id="trn_memory_replay_interrupted",
-                        session_id=SYSTEM_SESSION_ID,
                         user_message='{"note": null, "prompt_version": "memory-rememberer-dream-v3", "trigger": "dream"}',
                         assistant_message=None,
                         status="in_progress",
@@ -894,16 +859,14 @@ def test_memory_log_accumulates_events_after_turn(
 ) -> None:
     """After one user-message turn, ``memory_log`` holds at least one each of
     ``user_message``, ``agent_round``, and ``assistant_message`` events, all
-    sharing the same ``session_id`` and ``turn_id``."""
+    sharing the same ``turn_id``."""
     adapter = _TwoPhaseAdapter()
     with TestClient(_app(postgres_url, adapter, monkeypatch)) as client:
-        sid = _session_id(client)
         sf = _sf(client)
-        turn = post_message_and_drain(client, sid, message="what day is it")
+        turn = post_message_and_drain(client, message="what day is it")
         with sf() as db:
             events = db.scalars(
                 select(MemoryLogRecord).where(
-                    MemoryLogRecord.session_id == sid,
                     MemoryLogRecord.turn_id == turn.id,
                 )
             ).all()
@@ -913,7 +876,6 @@ def test_memory_log_accumulates_events_after_turn(
     assert "agent_round" in kinds, f"got kinds={kinds}"
     assert "assistant_message" in kinds, f"got kinds={kinds}"
     for e in events:
-        assert e.session_id == sid
         assert e.turn_id == turn.id
 
 
@@ -1007,7 +969,6 @@ def test_memory_log_route_lists_operator_visible_log_rows(
                         kind="recall",
                         content="Remember the incident checklist.",
                         embedding=None,
-                        session_id=None,
                         turn_id=None,
                         taint="clean",
                         source_ref="manual-smoke",
@@ -1026,7 +987,6 @@ def test_memory_log_route_lists_operator_visible_log_rows(
                 "created_at": "2026-05-22T12:00:00Z",
                 "kind": "recall",
                 "content": "Remember the incident checklist.",
-                "session_id": None,
                 "turn_id": None,
                 "taint": "clean",
                 "source_ref": "manual-smoke",
@@ -1053,7 +1013,6 @@ def test_memory_log_append_only_via_sqlalchemy_session(
                 kind="assistant_message",
                 content="immutable",
                 embedding=None,
-                session_id=None,
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
@@ -1073,49 +1032,8 @@ def test_memory_log_append_only_via_sqlalchemy_session(
                 )
 
 
-def test_system_session_row_seeded_by_migration(
-    session_factory: sessionmaker[Session],
-) -> None:
-    """The ``ses_system`` singleton row is present after migrations, inactive,
-    and ``lifecycle_state='closed'`` (so it never collides with the partial
-    unique index ``ix_single_active_session``)."""
-    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord
-
-    with session_factory() as db:
-        system_session = db.get(SessionRecord, SYSTEM_SESSION_ID)
-    assert system_session is not None, "migration must seed ses_system"
-    assert system_session.is_active is False
-    assert system_session.lifecycle_state == "closed"
-    assert system_session.rotated_from_session_id is None
-    assert system_session.rotation_reason is None
-
-
-def test_ensure_system_session_is_idempotent(
-    session_factory: sessionmaker[Session],
-) -> None:
-    """``ensure_system_session`` returns the singleton id and never duplicates it.
-    Re-calling on a fresh DB and on a DB where the row already exists are both
-    no-ops; deleting the row and re-calling re-creates it (self-heal)."""
-    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, ensure_system_session
-
-    now = datetime.now(tz=UTC)
-
-    with session_factory() as db:
-        with db.begin():
-            sid = ensure_system_session(db, now=now)
-        assert sid == SYSTEM_SESSION_ID
-
-    with session_factory() as db:
-        with db.begin():
-            db.execute(text("DELETE FROM sessions WHERE id = :id"), {"id": SYSTEM_SESSION_ID})
-        with db.begin():
-            sid = ensure_system_session(db, now=now)
-        assert sid == SYSTEM_SESSION_ID
-        assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None
-
-
 # ===========================================================================
-# 14. run_rememberer(trigger="dream") with no user session inserts cleanly
+# 14. run_rememberer(trigger="dream") inserts cleanly on a fresh DB
 # ===========================================================================
 
 
@@ -1135,15 +1053,15 @@ class _DreamCompleteAdapter(FakeModelAdapter):
         return _run_response("agent.emit_done(summary='dreamt')\n", idx=self.call_count)
 
 
-def test_run_rememberer_dream_succeeds_with_no_user_session(
+def test_run_rememberer_dream_succeeds_on_fresh_db(
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A fresh DB with no user session accepts a ``dream`` run against the system session."""
+    """A fresh DB accepts a ``dream`` run."""
     from ariel.config import AppSettings
     from ariel.capability_registry import REMEMBERER_CAPABILITY_IDS
     from ariel.memory import run_rememberer
-    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
+    from ariel.persistence import TurnRecord
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
@@ -1152,17 +1070,10 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     try:
-        # No user session has ever existed — this is the production dream path.
-        with session_factory() as db:
-            assert (
-                db.scalar(select(SessionRecord).where(SessionRecord.is_active.is_(True))) is None
-            ), "fresh DB must have no active user session"
-
         run_rememberer(
             trigger="dream",
             sandbox=sandbox,
             session_factory=session_factory,
-            session_id=None,
             settings=settings,
             model_adapter=_DreamCompleteAdapter(),
             google_runtime=None,
@@ -1182,80 +1093,17 @@ def test_run_rememberer_dream_succeeds_with_no_user_session(
                 select(TurnRecord).where(TurnRecord.kind == "memory_dream")
             ).all()
         assert len(dream_turns) == 1, f"expected 1 memory_dream turn, got {len(dream_turns)}"
-        assert dream_turns[0].session_id == SYSTEM_SESSION_ID
         assert dream_turns[0].status == "completed"
     finally:
         sandbox.close()
 
 
-def test_run_rememberer_dream_self_heals_if_system_session_missing(
-    session_factory: sessionmaker[Session],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the system session row is wiped, ``run_rememberer(trigger='dream')``
-    re-creates it via ``ensure_system_session`` and completes — the loop is
-    not permanently broken by an operator wipe."""
-    from ariel.config import AppSettings
-    from ariel.capability_registry import REMEMBERER_CAPABILITY_IDS
-    from ariel.memory import run_rememberer
-    from ariel.persistence import SYSTEM_SESSION_ID, SessionRecord, TurnRecord
-
-    monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
-    monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
-    settings = AppSettings()
-
-    sandbox = FakeSandboxRuntime()
-    sandbox.start()
-    try:
-        # Wipe the system session row to simulate operator deletion.
-        with session_factory() as db:
-            with db.begin():
-                db.execute(
-                    text("DELETE FROM sessions WHERE id = :id"),
-                    {"id": SYSTEM_SESSION_ID},
-                )
-            assert db.get(SessionRecord, SYSTEM_SESSION_ID) is None
-
-        run_rememberer(
-            trigger="dream",
-            sandbox=sandbox,
-            session_factory=session_factory,
-            session_id=None,
-            settings=settings,
-            model_adapter=_DreamCompleteAdapter(),
-            google_runtime=None,
-            agency_runtime=None,
-            attachment_runtime=None,
-            note=None,
-            allowed_capability_ids=REMEMBERER_CAPABILITY_IDS,
-            approval_ttl_seconds=int(settings.approval_ttl_seconds),
-            approval_actor_id=str(settings.approval_actor_id),
-            add_event=lambda *_args, **_kwargs: None,
-            now_fn=lambda: datetime.now(tz=UTC),
-            new_id_fn=_new_id,
-        )
-
-        with session_factory() as db:
-            assert db.get(SessionRecord, SYSTEM_SESSION_ID) is not None, (
-                "self-heal must re-create ses_system"
-            )
-            dream_turns = db.scalars(
-                select(TurnRecord).where(TurnRecord.kind == "memory_dream")
-            ).all()
-        assert len(dream_turns) == 1
-        assert dream_turns[0].session_id == SYSTEM_SESSION_ID
-        assert dream_turns[0].status == "completed"
-    finally:
-        sandbox.close()
-
-
-def test_worker_memory_dream_task_inserts_turn_against_system_session(
+def test_worker_memory_dream_task_inserts_turn(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A queued ``memory_dream`` task runs cleanly on a fresh DB and attaches
-    the turn row to the system session."""
-    from ariel.persistence import SYSTEM_SESSION_ID, TurnRecord, enqueue_background_task
+    """A queued ``memory_dream`` task runs cleanly on a fresh DB."""
+    from ariel.persistence import TurnRecord, enqueue_background_task
 
     monkeypatch.setenv("ARIEL_OPENAI_API_KEY", "test-key")
     monkeypatch.setattr("ariel.memory.embed_text", lambda t, *, adapter, settings: None)
@@ -1279,9 +1127,6 @@ def test_worker_memory_dream_task_inserts_turn_against_system_session(
                 select(TurnRecord).where(TurnRecord.kind == "memory_dream")
             ).all()
         assert dream_turns, "memory_dream task must produce a memory_dream turn"
-        assert all(t.session_id == SYSTEM_SESSION_ID for t in dream_turns), (
-            "every memory_dream turn must reference the system session"
-        )
         # Status is the strong contract: if the FK insert had failed, the turn
         # row wouldn't exist; if the loop crashed mid-run, status would still
         # be 'in_progress'.
@@ -1336,7 +1181,6 @@ def test_append_log_event_skips_assistant_failure_messages(
                 db,
                 kind="assistant_message",
                 content=failure_text,
-                session_id=None,
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
@@ -1392,7 +1236,6 @@ def test_append_log_event_preserves_legitimate_assistant_messages(
                 db,
                 kind="assistant_message",
                 content=legitimate_text,
-                session_id=None,
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
@@ -1444,7 +1287,6 @@ def test_append_log_event_filter_applies_only_to_assistant_messages(
                     db,
                     kind=kind,  # type: ignore[arg-type]
                     content=failure_text,
-                    session_id=None,
                     turn_id=None,
                     taint="clean",
                     source_ref=None,
@@ -1486,7 +1328,6 @@ def test_append_log_event_records_pending_embedding_when_embedding_fails(
                 db,
                 kind="user_message",
                 content="project phoenix update",
-                session_id=None,
                 turn_id=None,
                 taint="clean",
                 source_ref=None,
@@ -1613,7 +1454,6 @@ def test_append_log_event_propagates_embedding_response_defect(
                     db,
                     kind="user_message",
                     content="project phoenix update",
-                    session_id=None,
                     turn_id=None,
                     taint="clean",
                     source_ref=None,
@@ -1653,7 +1493,6 @@ def _insert_log_row_directly(
                     kind=kind,
                     content=content,
                     embedding=None,
-                    session_id=None,
                     turn_id=None,
                     taint="clean",
                     source_ref=None,

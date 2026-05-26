@@ -43,7 +43,6 @@ from .persistence import (
     MemoryLogRecord,
     MemoryNoteRecord,
     TurnRecord,
-    ensure_system_session,
     enqueue_background_task,
     to_rfc3339,
 )
@@ -274,7 +273,6 @@ def append_log_event(
     *,
     kind: _LogKind,
     content: str,
-    session_id: str | None,
     turn_id: str | None,
     taint: Literal["clean", "tainted"],
     source_ref: str | None,
@@ -307,7 +305,6 @@ def append_log_event(
         kind=kind,
         content=content,
         embedding=embedding,
-        session_id=session_id,
         turn_id=turn_id,
         taint=taint,
         source_ref=source_ref,
@@ -363,7 +360,6 @@ def create_note(
         db,
         kind="note_create",
         content=content,
-        session_id=None,
         turn_id=None,
         taint=taint,
         source_ref=note.id,
@@ -405,7 +401,6 @@ def edit_note(
         db,
         kind="note_edit",
         content=content,
-        session_id=None,
         turn_id=None,
         taint=note_taint,
         source_ref=note.id,
@@ -439,7 +434,6 @@ def delete_note(
         db,
         kind="note_delete",
         content=note_id,
-        session_id=None,
         turn_id=None,
         taint=note_taint,
         source_ref=note_id,
@@ -579,7 +573,6 @@ def run_retriever(
     sandbox: RunSandbox,
     db: Session,
     session_factory: sessionmaker[Session],
-    session_id: str,
     turn: TurnRecord,
     settings: AppSettings,
     model_adapter: ModelAdapter,
@@ -668,7 +661,6 @@ def run_retriever(
         sandbox=sandbox,
         db=db,
         session_factory=session_factory,
-        session_id=session_id,
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,
@@ -747,7 +739,6 @@ def _complete_existing_rememberer_turn(
     db.add(
         EventRecord(
             id=new_id_fn("evn"),
-            session_id=turn.session_id,
             turn_id=turn.id,
             sequence=_next_memory_turn_event_sequence(db=db, turn_id=turn.id),
             event_type="evt.turn.failed",
@@ -765,7 +756,6 @@ def run_rememberer(
     trigger: Literal["encode", "dream"],
     sandbox: RunSandbox,
     session_factory: sessionmaker[Session],
-    session_id: str | None,
     settings: AppSettings,
     model_adapter: ModelAdapter,
     google_runtime: GoogleConnectorRuntime | None,
@@ -787,22 +777,8 @@ def run_rememberer(
     ``None``.  The loop applies note mutations via ``memory.note.*`` syscalls
     (which call ``create_note`` / ``edit_note`` / ``delete_note`` above, which
     also log the events).  Never raises.
-
-    A background run without a calling user session — every ``dream`` task,
-    and any ``encode`` enqueued before a user session existed — hangs its
-    ``TurnRecord`` (and any downstream ``ActionAttemptRecord`` / ``EventRecord``)
-    off the singleton system session row (``SYSTEM_SESSION_ID``). The row is
-    seeded by the ``system_session`` migration; we call
-    ``ensure_system_session`` defensively on every invocation so the loop
-    self-heals if the row was somehow wiped.
     """
     now = now_fn()
-    if session_id is None:
-        with session_factory() as bootstrap_db:
-            with bootstrap_db.begin():
-                effective_session_id = ensure_system_session(bootstrap_db, now=now)
-    else:
-        effective_session_id = session_id
 
     system_prompt = _REMEMBERER_ENCODE_PROMPT if trigger == "encode" else _REMEMBERER_DREAM_PROMPT
     prompt_version = (
@@ -837,7 +813,6 @@ def run_rememberer(
                     return
             turn = TurnRecord(
                 id=new_id_fn("trn"),
-                session_id=effective_session_id,
                 user_message=json.dumps(user_payload, sort_keys=True),
                 assistant_message=None,
                 status="in_progress",
@@ -925,7 +900,6 @@ def run_rememberer(
             sandbox=sandbox,
             db=loop_db,
             session_factory=session_factory,
-            session_id=effective_session_id,
             turn=loop_turn,
             settings=settings,
             model_adapter=model_adapter,
@@ -959,7 +933,6 @@ def enqueue_memory_encode(
     db: Session,
     *,
     note: str,
-    session_id: str | None,
     now: datetime,
 ) -> str:
     """Enqueue a ``memory_encode`` background task. Returns the task id."""
@@ -968,7 +941,7 @@ def enqueue_memory_encode(
         db,
         task_type="memory_encode",
         idempotency_key=f"memory_encode:{stable_id}",
-        payload={"note": note, "session_id": session_id},
+        payload={"note": note},
         now=now,
     )
     return task.id

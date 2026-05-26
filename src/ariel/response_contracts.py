@@ -14,16 +14,6 @@ class ResponseContractViolation(Exception):
         self.errors = errors
 
 
-class SurfaceSessionContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    is_active: bool
-    lifecycle_state: str
-    created_at: str
-    updated_at: str
-
-
 SurfaceEventType = Literal[
     "evt.turn.started",
     "evt.research.started",
@@ -523,7 +513,6 @@ class SurfaceTurnEnvelopeContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    session_id: str
     user_message: str
     assistant_message: str | None
     status: str
@@ -537,7 +526,6 @@ class SurfaceTurnContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    session_id: str
     user_message: str
     assistant_message: str | None
     status: str
@@ -580,7 +568,6 @@ class SurfaceCaptureContract(BaseModel):
 
     id: str
     kind: Literal["text", "url", "shared_content"]
-    effective_session_id: str
     turn_id: str
     idempotency_key: str | None
     created_at: str
@@ -591,7 +578,6 @@ class SurfaceMessageResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    session: SurfaceSessionContract
     turn: SurfaceTurnContract
     assistant: SurfaceAssistantContract
 
@@ -600,46 +586,7 @@ class SurfaceTimelineResponseContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ok: bool
-    session_id: str
     turns: list[SurfaceTurnContract]
-
-
-class SurfaceRotationContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    rotation_id: str
-    reason: str
-    rotated_from_session_id: str
-    idempotency_key: str | None
-    idempotent_replay: bool
-
-
-class SurfaceRotationResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    session: SurfaceSessionContract
-    rotation: SurfaceRotationContract
-
-
-class SurfaceRotationListItemContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    rotation_id: str
-    reason: str
-    rotated_from_session_id: str
-    rotated_to_session_id: str
-    idempotency_key: str | None
-    actor_id: str
-    trigger_snapshot: dict[str, Any]
-    created_at: str
-
-
-class SurfaceRotationListResponseContract(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    ok: bool
-    rotations: list[SurfaceRotationListItemContract]
 
 
 class SurfaceApprovalResponseContract(BaseModel):
@@ -872,11 +819,6 @@ def _validate_contract(
     except ValidationError as exc:
         raise ResponseContractViolation(contract=contract, errors=exc.errors()) from exc
     return validated.model_dump(mode="python")
-
-
-def _project_surface_session(raw_session: Any) -> dict[str, Any]:
-    session_payload = raw_session if isinstance(raw_session, dict) else {}
-    return _validate_contract("surface_session", SurfaceSessionContract, session_payload)
 
 
 def _project_surface_event_payload(
@@ -1138,7 +1080,6 @@ def _project_surface_turn(raw_turn: Any) -> dict[str, Any]:
         SurfaceTurnContract,
         {
             "id": validated_turn_envelope["id"],
-            "session_id": validated_turn_envelope["session_id"],
             "user_message": validated_turn_envelope["user_message"],
             "assistant_message": validated_turn_envelope["assistant_message"],
             "status": validated_turn_envelope["status"],
@@ -1159,7 +1100,6 @@ def _project_surface_capture(raw_capture: Any) -> dict[str, Any]:
 
 def build_surface_message_response(
     *,
-    session: Any,
     turn: Any,
     assistant_message: Any,
     assistant_sources: Any,
@@ -1171,7 +1111,6 @@ def build_surface_message_response(
         SurfaceMessageResponseContract,
         {
             "ok": True,
-            "session": _project_surface_session(session),
             "turn": _project_surface_turn(turn),
             "assistant": {
                 "message": assistant_message,
@@ -1193,46 +1132,14 @@ def build_surface_capture_record_response(*, capture: Any) -> dict[str, Any]:
     )
 
 
-def build_surface_timeline_response(*, session_id: Any, turns: Any) -> dict[str, Any]:
+def build_surface_timeline_response(*, turns: Any) -> dict[str, Any]:
     turns_payload = turns if isinstance(turns, list) else []
     return _validate_contract(
         "surface_timeline_response",
         SurfaceTimelineResponseContract,
         {
             "ok": True,
-            "session_id": session_id,
             "turns": [_project_surface_turn(raw_turn) for raw_turn in turns_payload],
-        },
-    )
-
-
-def build_surface_rotation_response(*, session: Any, rotation: Any) -> dict[str, Any]:
-    rotation_payload = rotation if isinstance(rotation, dict) else {}
-    return _validate_contract(
-        "surface_rotation_response",
-        SurfaceRotationResponseContract,
-        {
-            "ok": True,
-            "session": _project_surface_session(session),
-            "rotation": {
-                "rotation_id": rotation_payload.get("rotation_id"),
-                "reason": rotation_payload.get("reason"),
-                "rotated_from_session_id": rotation_payload.get("rotated_from_session_id"),
-                "idempotency_key": rotation_payload.get("idempotency_key"),
-                "idempotent_replay": rotation_payload.get("idempotent_replay"),
-            },
-        },
-    )
-
-
-def build_surface_rotation_list_response(*, rotations: Any) -> dict[str, Any]:
-    rotations_payload = rotations if isinstance(rotations, list) else []
-    return _validate_contract(
-        "surface_rotation_list_response",
-        SurfaceRotationListResponseContract,
-        {
-            "ok": True,
-            "rotations": rotations_payload,
         },
     )
 
@@ -1358,7 +1265,6 @@ class SurfaceMemoryLogItemContract(BaseModel):
         "research_finding",
     ]
     content: str
-    session_id: str | None
     turn_id: str | None
     taint: Literal["clean", "tainted"]
     source_ref: str | None

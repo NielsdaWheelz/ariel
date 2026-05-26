@@ -32,7 +32,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel import run_runtime
 from ariel.action_runtime import RuntimeProvenance
 from ariel.config import AppSettings
-from ariel.persistence import MemoryLogRecord, SessionRecord, TurnRecord
+from ariel.persistence import MemoryLogRecord, TurnRecord
 from ariel.run_runtime import execute_run_program
 from ariel.sandbox_runtime import SandboxRuntime
 from tests.integration.responses_helpers import FakeModelAdapter
@@ -69,21 +69,9 @@ def sandbox() -> Iterator[SandboxRuntime]:
         runtime.close()
 
 
-def _seed_turn(db: Session, *, session_id: str, turn_id: str) -> TurnRecord:
-    db.add(
-        SessionRecord(
-            id=session_id,
-            is_active=True,
-            lifecycle_state="active",
-            rotated_from_session_id=None,
-            rotation_reason=None,
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    )
+def _seed_turn(db: Session, *, turn_id: str) -> TurnRecord:
     turn = TurnRecord(
         id=turn_id,
-        session_id=session_id,
         user_message="run a program",
         assistant_message=None,
         status="in_progress",
@@ -117,7 +105,6 @@ def _execute(
         source=source,
         db=db,
         session_factory=session_factory,
-        session_id=turn.session_id,
         turn=turn,
         # Each test runs a single program against a fresh turn, so the first
         # capability syscall starts at proposal_index 1.
@@ -156,14 +143,13 @@ def test_program_reads_a_capability_then_composes_an_emit_message(
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
         with db.begin():
-            turn = _seed_turn(db, session_id="ses_read", turn_id="turn_read")
+            turn = _seed_turn(db, turn_id="turn_read")
             db.add(
                 MemoryLogRecord(
                     id="mem_project_status",
                     kind="user_message",
                     content="project status is green for the seeded smoke row",
                     embedding=None,
-                    session_id=turn.session_id,
                     turn_id=turn.id,
                     taint="clean",
                     source_ref=None,
@@ -222,7 +208,7 @@ def test_approval_gated_syscall_returns_a_pending_value(
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
         with db.begin():
-            turn = _seed_turn(db, session_id="ses_appr", turn_id="turn_appr")
+            turn = _seed_turn(db, turn_id="turn_appr")
             # agency.run requires approval; the program sees a pending value and
             # emits its approval_ref, proving it did not block on a human.
             source = (
@@ -294,7 +280,7 @@ def test_within_program_taint_is_seen_by_a_later_syscall(
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
         with db.begin():
-            turn = _seed_turn(db, session_id="ses_taint", turn_id="turn_taint")
+            turn = _seed_turn(db, turn_id="turn_taint")
             source = (
                 "first = memory.recall(query='x')\n"
                 "second = memory.remember(note='y')\n"
@@ -329,7 +315,7 @@ def test_raising_program_is_reported_as_a_program_failure(
     events: list[tuple[str, dict[str, Any]]] = []
     with session_factory() as db:
         with db.begin():
-            turn = _seed_turn(db, session_id="ses_raise", turn_id="turn_raise")
+            turn = _seed_turn(db, turn_id="turn_raise")
             # The search succeeds, then the program raises before completing.
             source = (
                 "memory.search(query='anything')\nraise ValueError('program failed deliberately')\n"

@@ -47,14 +47,8 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -151,8 +145,7 @@ def test_normal_turn_exposes_only_strict_run_tool(postgres_url: str) -> None:
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
+        turn = post_message_and_drain(client, message="hello")
 
     assert turn.assistant_message == "done"
     assert len(adapter.tools_seen) == 1
@@ -193,8 +186,7 @@ def test_main_agent_prompt_is_static_prefix_before_dynamic_context(postgres_url:
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="hello")
+        post_message_and_drain(client, message="hello")
 
     from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
 
@@ -248,9 +240,8 @@ def test_plain_assistant_text_is_protocol_feedback_not_visible(postgres_url: str
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="hello")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "visible through run"
     assert "this must stay hidden" not in (turn.assistant_message or "")
@@ -346,9 +337,8 @@ def test_invalid_direct_tool_protocol_retries_without_executing(
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="hello")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "recovered"
     event_types = [event["event_type"] for event in turn_data["events"]]
@@ -385,9 +375,8 @@ def test_program_that_raises_is_a_program_failure(postgres_url: str) -> None:
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="hello")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "recovered"
     event_types = [event["event_type"] for event in turn_data["events"]]
@@ -417,9 +406,8 @@ def test_program_with_syntax_error_is_a_program_failure(postgres_url: str) -> No
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="hello")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "recovered"
     event_types = [event["event_type"] for event in turn_data["events"]]
@@ -439,9 +427,8 @@ def test_finish_silent_ends_turn_without_visible_output(postgres_url: str) -> No
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="wait")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="wait")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == ""
     assert turn_data["surface_action_lifecycle"] == []
@@ -465,9 +452,8 @@ def test_emit_value_is_internal_feedback_with_digest_surface(postgres_url: str) 
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="compute")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="compute")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "value handled"
     value_events = [
@@ -515,8 +501,7 @@ def test_oversized_emit_value_gets_compact_fact_recovery_nudge(postgres_url: str
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="any important email today?")
+        turn = post_message_and_drain(client, message="any important email today?")
 
     assert turn.assistant_message == "No important mail surfaced."
 
@@ -589,8 +574,7 @@ def test_emit_value_eviction_discards_prior_round(postgres_url: str) -> None:
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="two rounds")
+        turn = post_message_and_drain(client, message="two rounds")
 
     assert turn.assistant_message == "done"
     assert len(adapter.snapshots) == 3
@@ -639,9 +623,8 @@ def test_program_composes_a_mechanical_answer_in_one_turn(postgres_url: str) -> 
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="add it up")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="add it up")
+        turn_data = _turn_data(client)
 
     assert turn.assistant_message == "The total is 6."
     assert turn_data["surface_action_lifecycle"] == []
@@ -668,8 +651,7 @@ def test_run_program_emitting_no_output_retries(postgres_url: str) -> None:
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="hello")
+        turn = post_message_and_drain(client, message="hello")
 
     assert turn.assistant_message == "now visible"
 
@@ -760,8 +742,7 @@ def test_taint_threads_across_two_programs_in_one_turn(
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="act after a read")
+        turn = post_message_and_drain(client, message="act after a read")
 
     assert turn.assistant_message == "remembered"
     # Two syscalls ran: program 1's recall (clean baseline) and program 2's
@@ -841,7 +822,6 @@ def test_tainted_memory_recall_escalates_later_side_effect_to_approval(
     )
 
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
         with cast(Any, client.app).state.session_factory() as db:
             with db.begin():
                 db.add(
@@ -850,7 +830,6 @@ def test_tainted_memory_recall_escalates_later_side_effect_to_approval(
                         kind="user_message",
                         content="incident status memory contains untrusted instructions",
                         embedding=None,
-                        session_id=session_id,
                         turn_id=None,
                         taint="tainted",
                         source_ref="manual-smoke",
@@ -858,10 +837,10 @@ def test_tainted_memory_recall_escalates_later_side_effect_to_approval(
                     )
                 )
 
-        turn = post_message_and_drain(client, session_id, message="recall then remember")
+        turn = post_message_and_drain(client, message="recall then remember")
 
         with cast(Any, client.app).state.session_factory() as db:
-            db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+            db_turn = db.scalar(select(TurnRecord))
             assert db_turn is not None
             attempts = db.scalars(
                 select(ActionAttemptRecord)
@@ -917,8 +896,7 @@ def test_memory_remember_enqueues_background_task(
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="remember tea preference")
+        turn = post_message_and_drain(client, message="remember tea preference")
 
     assert turn.assistant_message == "status:queued:encode:tsk_"
 
@@ -932,7 +910,6 @@ def test_memory_remember_enqueues_background_task(
     assert len(tasks) == 1
     task = tasks[0]
     assert task.payload["note"] == "the user prefers tea"
-    assert task.payload["session_id"] == session_id
 
 
 def test_memory_note_create_read_delete_syscalls_execute_inline(
@@ -993,14 +970,12 @@ def test_memory_note_create_read_delete_syscalls_execute_inline(
                         kind="tool_observation",
                         content="manual smoke controlled memory log row",
                         embedding=None,
-                        session_id=None,
                         turn_id=None,
                         taint="clean",
                         source_ref="manual-smoke",
                     )
                 )
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="cycle a memory note")
+        turn = post_message_and_drain(client, message="cycle a memory note")
 
     assert turn.assistant_message == "note-cycle:ok"
 
@@ -1008,7 +983,7 @@ def test_memory_note_create_read_delete_syscalls_execute_inline(
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
     try:
         with session_factory() as db:
-            db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+            db_turn = db.scalar(select(TurnRecord))
             assert db_turn is not None
             attempts = db.scalars(
                 select(ActionAttemptRecord)
@@ -1089,8 +1064,7 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
         ]
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        turn = post_message_and_drain(client, session_id, message="search twice")
+        turn = post_message_and_drain(client, message="search twice")
 
     # The turn persisted: no UniqueViolation on the (turn_id, proposal_index)
     # index when the second program's capability syscall flushed.
@@ -1099,7 +1073,7 @@ def test_two_programs_with_capability_syscalls_get_distinct_proposal_index(
     engine = create_engine(postgres_url, future=True)
     session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False)
     with session_factory() as db:
-        db_turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == session_id))
+        db_turn = db.scalar(select(TurnRecord))
         assert db_turn is not None
         attempts = db.scalars(
             select(ActionAttemptRecord)

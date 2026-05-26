@@ -36,7 +36,7 @@ from ariel.google_connector import (
     GoogleConnectorRecord,
     GoogleWorkspaceProvider,
 )
-from ariel.persistence import EventRecord, SessionRecord, TurnRecord
+from ariel.persistence import EventRecord, TurnRecord
 from ariel.research_runtime import ResearchFinding, run_research
 from ariel.secret_cipher import encrypt_secret
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -103,26 +103,8 @@ class SnapshotAdapter(FakeModelAdapter):
         return self.responses.pop(0)
 
 
-def _seed_session(session_factory: Any, session_id: str) -> None:
-    """Commit one active session so ``run_research``'s commits see the FK."""
-    with session_factory() as db:
-        with db.begin():
-            db.add(
-                SessionRecord(
-                    id=session_id,
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-
-
 def test_run_research_completed_returns_finding(session_factory: Any) -> None:
     """A run whose program calls agent.emit_finding returns a complete finding."""
-    _seed_session(session_factory, "ses_research_ok")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
@@ -137,7 +119,6 @@ def test_run_research_completed_returns_finding(session_factory: Any) -> None:
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_ok",
             question="What is the capital of France?",
             mode="web",
         )
@@ -163,7 +144,6 @@ def test_run_research_completed_returns_finding(session_factory: Any) -> None:
 
 def test_run_research_persists_research_kind_turn(session_factory: Any) -> None:
     """A complete run persists a TurnRecord with kind='research' and the summary."""
-    _seed_session(session_factory, "ses_research_turn")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
@@ -178,14 +158,13 @@ def test_run_research_persists_research_kind_turn(session_factory: Any) -> None:
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_turn",
             question="Question for the turn record.",
             mode="web",
         )
     sandbox.close()
 
     with session_factory() as db:
-        turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == "ses_research_turn"))
+        turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "research"))
     assert turn is not None
     assert turn.kind == "research"
     assert turn.status == "completed"
@@ -195,7 +174,6 @@ def test_run_research_persists_research_kind_turn(session_factory: Any) -> None:
 
 def test_run_research_continues_then_finishes(session_factory: Any) -> None:
     """A run may emit values over rounds, then finish with agent.emit_finding."""
-    _seed_session(session_factory, "ses_research_multi")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -216,7 +194,6 @@ def test_run_research_continues_then_finishes(session_factory: Any) -> None:
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_multi",
             question="A multi-round question.",
             mode="web",
         )
@@ -231,7 +208,6 @@ def test_run_research_continues_then_finishes(session_factory: Any) -> None:
 
 def test_run_research_exhausts_on_stuck_detection(session_factory: Any) -> None:
     """A run that emits a byte-identical program twice halts as partial."""
-    _seed_session(session_factory, "ses_research_stuck")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -250,7 +226,6 @@ def test_run_research_exhausts_on_stuck_detection(session_factory: Any) -> None:
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_stuck",
             question="A question that never converges.",
             mode="web",
         )
@@ -267,7 +242,6 @@ def test_run_research_exhausts_on_stuck_detection(session_factory: Any) -> None:
 
 def test_run_research_exhausts_on_model_call_backstop(session_factory: Any) -> None:
     """The model-call backstop ends a never-finishing run as partial."""
-    _seed_session(session_factory, "ses_research_backstop")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     # Each round emits a distinct value so stuck-detection never fires; the
@@ -291,7 +265,6 @@ def test_run_research_exhausts_on_model_call_backstop(session_factory: Any) -> N
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_backstop",
             question="A question with no finding.",
             mode="web",
         )
@@ -306,7 +279,6 @@ def test_run_research_exhausts_on_model_call_backstop(session_factory: Any) -> N
 
 def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: Any) -> None:
     """A web run's eligible callables are the web read capabilities, no personal."""
-    _seed_session(session_factory, "ses_research_web")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings(search_web_api_key="brave-key", jina_api_key="jina-key")
@@ -321,7 +293,6 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_web",
             question="A web-mode question.",
             mode="web",
         )
@@ -341,7 +312,6 @@ def test_run_research_web_mode_exposes_only_web_capabilities(session_factory: An
 
 
 def test_run_research_web_mode_omits_unconfigured_web_capabilities(session_factory: Any) -> None:
-    _seed_session(session_factory, "ses_research_web_unconfigured")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings(search_web_api_key=None, jina_api_key=None)
@@ -356,7 +326,6 @@ def test_run_research_web_mode_omits_unconfigured_web_capabilities(session_facto
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_web_unconfigured",
             question="A web-mode question without providers.",
             mode="web",
         )
@@ -371,7 +340,6 @@ def test_run_research_personal_mode_exposes_only_personal_capabilities(
     session_factory: Any,
 ) -> None:
     """A personal run's eligible callables are the personal read capabilities."""
-    _seed_session(session_factory, "ses_research_personal")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -386,7 +354,6 @@ def test_run_research_personal_mode_exposes_only_personal_capabilities(
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_personal",
             question="A personal-mode question.",
             mode="personal",
         )
@@ -410,7 +377,6 @@ def test_run_research_memories_mode_exposes_only_memory_capabilities(
     session_factory: Any,
 ) -> None:
     """A memories run's eligible callables are the memory read capabilities."""
-    _seed_session(session_factory, "ses_research_memories")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -425,7 +391,6 @@ def test_run_research_memories_mode_exposes_only_memory_capabilities(
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_memories",
             question="A memories-mode question.",
             mode="memories",
         )
@@ -450,7 +415,6 @@ def test_run_research_web_mode_program_cannot_call_personal_capability(
     reaching private data. This is the lethal-trifecta defense at the syscall
     surface: a web run cannot touch a personal capability even if steered to.
     """
-    _seed_session(session_factory, "ses_research_xmode")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -471,7 +435,6 @@ def test_run_research_web_mode_program_cannot_call_personal_capability(
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_xmode",
             question="A question steered at private data.",
             mode="web",
         )
@@ -506,7 +469,6 @@ def test_run_research_model_call_failure_returns_failed_finding(
             self.snapshots.append(list(request.messages))
             raise RuntimeError("model unavailable")
 
-    _seed_session(session_factory, "ses_research_fail")
     sandbox = FakeSandboxRuntime()
     sandbox.start()
     settings = _settings()
@@ -519,7 +481,6 @@ def test_run_research_model_call_failure_returns_failed_finding(
             settings=settings,
             model_adapter=adapter,
             google_runtime=build_google_runtime(settings),
-            session_id="ses_research_fail",
             question="A question whose model call fails.",
             mode="web",
         )
@@ -534,7 +495,7 @@ def test_run_research_model_call_failure_returns_failed_finding(
     assert len(adapter.snapshots) == 1
 
     with session_factory() as db:
-        turn = db.scalar(select(TurnRecord).where(TurnRecord.session_id == "ses_research_fail"))
+        turn = db.scalar(select(TurnRecord).where(TurnRecord.kind == "research"))
         assert turn is not None
         assert turn.status == "failed"
         model_failed = db.scalar(
@@ -706,7 +667,6 @@ def test_run_research_personal_mode_threads_google_runtime(
     fake provider — was threaded through to capability execution.
     """
     settings = _settings()
-    _seed_session(session_factory, "ses_research_grt")
     _seed_connected_google_connector(session_factory, now=NOW, settings=settings)
 
     sandbox = FakeSandboxRuntime()
@@ -729,7 +689,6 @@ def test_run_research_personal_mode_threads_google_runtime(
             settings=settings,
             model_adapter=adapter,
             google_runtime=google_runtime,
-            session_id="ses_research_grt",
             question="What is on my calendar today?",
             mode="personal",
             now_fn=lambda: NOW,

@@ -21,7 +21,6 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     EventRecord,
     MemoryLogRecord,
-    SessionRecord,
     TurnRecord,
     enqueue_background_task,
 )
@@ -65,20 +64,8 @@ def test_schedule_syscall_writes_an_agent_wake_background_task(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_sched",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_sched",
-                    session_id="ses_sched",
                     user_message="set a reminder",
                     assistant_message=None,
                     status="in_progress",
@@ -94,7 +81,6 @@ def test_schedule_syscall_writes_an_agent_wake_background_task(
             assert turn is not None
             ctx = run_function_calls(
                 db=db,
-                session_id="ses_sched",
                 turn=turn,
                 function_calls_raw=[
                     {
@@ -152,20 +138,8 @@ def test_schedule_syscall_rejects_a_malformed_when(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_bad",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_bad",
-                    session_id="ses_bad",
                     user_message="set a reminder",
                     assistant_message=None,
                     status="in_progress",
@@ -181,7 +155,6 @@ def test_schedule_syscall_rejects_a_malformed_when(
             assert turn is not None
             ctx = run_function_calls(
                 db=db,
-                session_id="ses_bad",
                 turn=turn,
                 function_calls_raw=[
                     {
@@ -216,20 +189,8 @@ def test_schedule_syscall_queue_defect_rolls_back_instead_of_failing_action(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_sched_defect",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_sched_defect",
-                    session_id="ses_sched_defect",
                     user_message="set a reminder",
                     assistant_message=None,
                     status="in_progress",
@@ -250,7 +211,6 @@ def test_schedule_syscall_queue_defect_rolls_back_instead_of_failing_action(
                 assert turn is not None
                 run_function_calls(
                     db=db,
-                    session_id="ses_sched_defect",
                     turn=turn,
                     function_calls_raw=[
                         {
@@ -296,20 +256,8 @@ def test_approved_schedule_queue_defect_retries_task_without_failing_action(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_sched_approved_defect",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_sched_approved_defect",
-                    session_id="ses_sched_approved_defect",
                     user_message="set a reminder",
                     assistant_message=None,
                     status="in_progress",
@@ -320,7 +268,6 @@ def test_approved_schedule_queue_defect_retries_task_without_failing_action(
             db.add(
                 ActionAttemptRecord(
                     id="aat_sched_approved_defect",
-                    session_id="ses_sched_approved_defect",
                     turn_id="trn_sched_approved_defect",
                     proposal_index=1,
                     capability_id=capability.capability_id,
@@ -731,14 +678,10 @@ def test_schedule_run_program_worker_drains_due_wake_end_to_end(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
         with session_factory() as db:
             with db.begin():
                 turn = TurnRecord(
                     id="trn_sched_e2e",
-                    session_id=session_id,
                     user_message="schedule this follow-up",
                     assistant_message=None,
                     status="in_progress",
@@ -748,7 +691,6 @@ def test_schedule_run_program_worker_drains_due_wake_end_to_end(
                 db.add(turn)
                 ctx = run_function_calls(
                     db=db,
-                    session_id=session_id,
                     turn=turn,
                     function_calls_raw=[
                         {
@@ -799,14 +741,13 @@ def test_schedule_run_program_worker_drains_due_wake_end_to_end(
         assert wake_log.taint == "clean"
 
 
-def test_worker_user_message_arm_invokes_wake_for_target_session(
+def test_worker_user_message_arm_invokes_wake(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A due ``user_message`` row targets the specified session: the worker builds a
-    ``user_message`` wake-context from the payload and calls ``_wake`` on exactly
-    the session_id supplied in the task — without creating or loading the active
-    session. The turn is recorded and the task deleted."""
+    """A due ``user_message`` row: the worker builds a ``user_message``
+    wake-context from the payload and calls ``_wake``. The turn is recorded
+    and the task deleted."""
 
     _stub_memory_retriever(monkeypatch)
     now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
@@ -821,18 +762,12 @@ def test_worker_user_message_arm_invokes_wake_for_target_session(
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
 
-        # Seed an active session through the public session endpoint.
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
-
         with session_factory() as db:
             with db.begin():
                 enqueue_background_task(
                     db,
                     task_type="user_message",
                     payload={
-                        "session_id": session_id,
                         "message": "what is on my calendar today?",
                         "discord_context": None,
                         "attachment_sources": None,
@@ -904,9 +839,6 @@ def test_worker_user_message_replay_reuses_committed_turn_without_model_call(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -914,7 +846,6 @@ def test_worker_user_message_replay_reuses_committed_turn_without_model_call(
                     db,
                     task_type="user_message",
                     payload={
-                        "session_id": session_id,
                         "message": "recover this turn exactly once",
                         "discord_context": None,
                         "attachment_sources": None,
@@ -995,9 +926,6 @@ def test_worker_user_message_replay_fails_interrupted_turn_without_model_call(
     with TestClient(app) as client:
         runtime = client.app.state.runtime  # type: ignore[attr-defined]
         session_factory = runtime.session_factory
-        session_response = client.get("/v1/sessions/active")
-        assert session_response.status_code == 200
-        session_id = session_response.json()["session"]["id"]
 
         with session_factory() as db:
             with db.begin():
@@ -1005,7 +933,6 @@ def test_worker_user_message_replay_fails_interrupted_turn_without_model_call(
                     db,
                     task_type="user_message",
                     payload={
-                        "session_id": session_id,
                         "message": "do not replay this interrupted turn",
                         "discord_context": None,
                         "attachment_sources": None,
@@ -1016,7 +943,6 @@ def test_worker_user_message_replay_fails_interrupted_turn_without_model_call(
                 task_id = task.id
                 turn = TurnRecord(
                     id="trn_interrupted_replay",
-                    session_id=session_id,
                     user_message="do not replay this interrupted turn",
                     assistant_message=None,
                     status="in_progress",
@@ -1028,7 +954,6 @@ def test_worker_user_message_replay_fails_interrupted_turn_without_model_call(
                 db.add(
                     EventRecord(
                         id="evn_interrupted_started",
-                        session_id=session_id,
                         turn_id=turn.id,
                         sequence=1,
                         event_type="evt.turn.started",

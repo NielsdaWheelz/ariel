@@ -10,29 +10,17 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from ariel.config import AppSettings
 from ariel.conversational_continuity import build_recent_events_block
-from ariel.persistence import EventRecord, SessionRecord, TurnRecord
+from ariel.persistence import EventRecord, TurnRecord
 
 
 def _utc(offset_seconds: int) -> datetime:
     return datetime(2026, 5, 25, 22, 0, 0, tzinfo=timezone.utc) + timedelta(seconds=offset_seconds)
 
 
-def _seed_session_and_turn(
-    db: Session, *, session_id: str, turn_id: str, user_message: str, created_offset: int
-) -> None:
-    db.add(
-        SessionRecord(
-            id=session_id,
-            is_active=True,
-            lifecycle_state="active",
-            created_at=_utc(created_offset),
-            updated_at=_utc(created_offset),
-        )
-    )
+def _seed_turn(db: Session, *, turn_id: str, user_message: str, created_offset: int) -> None:
     db.add(
         TurnRecord(
             id=turn_id,
-            session_id=session_id,
             user_message=user_message,
             status="completed",
             kind="agent_turn",
@@ -46,7 +34,6 @@ def _seed_event(
     db: Session,
     *,
     event_id: str,
-    session_id: str,
     turn_id: str,
     sequence: int,
     event_type: str,
@@ -56,7 +43,6 @@ def _seed_event(
     db.add(
         EventRecord(
             id=event_id,
-            session_id=session_id,
             turn_id=turn_id,
             sequence=sequence,
             event_type=event_type,
@@ -71,14 +57,12 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
 ) -> None:
     """The agent must see canonical message_ids from a prior provider-sync turn's
     cap.email.read tool outputs when later asked to act on those messages."""
-    session_id = "ses_recent_events_acceptance"
     prior_turn_id = "trn_provider_sync_prior"
     current_turn_id = "trn_user_message_current"
 
     with session_factory() as db:
-        _seed_session_and_turn(
+        _seed_turn(
             db,
-            session_id=session_id,
             turn_id=prior_turn_id,
             user_message="Provider sync wake: Google Gmail",
             created_offset=0,
@@ -86,7 +70,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_start",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=1,
             event_type="evt.turn.started",
@@ -99,7 +82,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_email_read_a",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=2,
             event_type="evt.action.execution.succeeded",
@@ -121,7 +103,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_email_read_b",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=3,
             event_type="evt.action.execution.succeeded",
@@ -143,7 +124,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_model_started_loop_trace",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=4,
             event_type="evt.model.started",
@@ -153,7 +133,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_assistant_emitted",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=5,
             event_type="evt.assistant.emitted",
@@ -165,7 +144,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t0_completed",
-            session_id=session_id,
             turn_id=prior_turn_id,
             sequence=6,
             event_type="evt.turn.completed",
@@ -176,7 +154,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         db.add(
             TurnRecord(
                 id=current_turn_id,
-                session_id=session_id,
                 user_message="try again (delete both)",
                 status="in_progress",
                 kind="agent_turn",
@@ -187,7 +164,6 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         _seed_event(
             db,
             event_id="evt_t1_start",
-            session_id=session_id,
             turn_id=current_turn_id,
             sequence=1,
             event_type="evt.turn.started",
@@ -196,7 +172,7 @@ def test_recent_events_block_surfaces_prior_turn_message_ids(
         )
         db.commit()
 
-        block = build_recent_events_block(db=db, session_id=session_id, settings=AppSettings())
+        block = build_recent_events_block(db=db, settings=AppSettings())
 
     assert block is not None
     assert block.startswith("recent_external_events")
@@ -216,9 +192,7 @@ def test_recent_events_block_returns_none_on_empty_log(
     session_factory: sessionmaker[Session],
 ) -> None:
     with session_factory() as db:
-        block = build_recent_events_block(
-            db=db, session_id="ses_does_not_exist", settings=AppSettings()
-        )
+        block = build_recent_events_block(db=db, settings=AppSettings())
     assert block is None
 
 
@@ -227,12 +201,10 @@ def test_recent_events_block_compacts_oversize_payload(
 ) -> None:
     """A succeeded event with a 10KB nested body is compacted; canonical IDs
     remain visible so the agent can re-fetch."""
-    session_id = "ses_compact_check"
     turn_id = "trn_compact"
     with session_factory() as db:
-        _seed_session_and_turn(
+        _seed_turn(
             db,
-            session_id=session_id,
             turn_id=turn_id,
             user_message="x",
             created_offset=0,
@@ -241,7 +213,6 @@ def test_recent_events_block_compacts_oversize_payload(
         _seed_event(
             db,
             event_id="evt_big",
-            session_id=session_id,
             turn_id=turn_id,
             sequence=1,
             event_type="evt.action.execution.succeeded",
@@ -260,7 +231,7 @@ def test_recent_events_block_compacts_oversize_payload(
         )
         db.commit()
 
-        block = build_recent_events_block(db=db, session_id=session_id, settings=AppSettings())
+        block = build_recent_events_block(db=db, settings=AppSettings())
 
     assert block is not None
     assert "msg_keep_me" in block

@@ -30,7 +30,6 @@ def _outcome(
 ) -> TurnExecutionOutcome:
     return TurnExecutionOutcome(
         turn_id="trn_test",
-        effective_session_id="ses_test",
         status_code=status_code,
         response_payload={
             "ok": True,
@@ -69,7 +68,6 @@ def _outcome_with_approvals(
         )
     return TurnExecutionOutcome(
         turn_id="trn_test",
-        effective_session_id="ses_test",
         status_code=200,
         response_payload={
             "ok": True,
@@ -183,7 +181,6 @@ def test_deliver_to_discord_non_200_outcome_does_not_post(
     _deliver_to_discord(
         outcome=TurnExecutionOutcome(
             turn_id="trn_test",
-            effective_session_id="ses_test",
             status_code=503,
             response_payload={"ok": False, "error": {"message": "model unavailable"}},
         ),

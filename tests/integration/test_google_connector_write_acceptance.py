@@ -391,14 +391,8 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -500,9 +494,8 @@ def test_write_scope_remediation_reconnect_is_capability_intent_driven_and_least
         )
         _connect_google(client, code="connect-read-only")
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="create kickoff event")
-        first_turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="create kickoff event")
+        first_turn = _turn_data(client)
         assert first_turn["surface_action_lifecycle"] == []
         assert "evt.action.execution.started" not in _event_types(first_turn)
 
@@ -525,8 +518,8 @@ def test_write_scope_remediation_reconnect_is_capability_intent_driven_and_least
         )
         assert reconnect_callback.status_code == 200
 
-        post_message_and_drain(client, session_id, message="create kickoff event")
-        second_turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="create kickoff event")
+        second_turn = _turn_data(client)
         second_approval_ref = _approval_ref(second_turn)
         approved = client.post(
             "/v1/approvals",
@@ -539,7 +532,7 @@ def test_write_scope_remediation_reconnect_is_capability_intent_driven_and_least
         assert approved.status_code == 200
         assert process_queued_action_execution(client, approved.json()) is True
 
-        timeline_after_success = client.get(f"/v1/sessions/{session_id}/events")
+        timeline_after_success = client.get("/v1/events")
         assert timeline_after_success.status_code == 200
         succeeded_attempt = _surface_attempt(timeline_after_success.json()["turns"][-1])
         assert succeeded_attempt["execution"]["status"] == "succeeded"
@@ -589,10 +582,9 @@ def test_calendar_create_requires_approval_and_executes_exactly_once(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-calendar-write")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="create launch review")
-        turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="create launch review")
+        turn = _turn_data(client)
         attempt = _surface_attempt(turn)
         assert attempt["policy"]["decision"] == "requires_approval"
         assert attempt["approval"]["status"] == "pending"
@@ -613,7 +605,7 @@ def test_calendar_create_requires_approval_and_executes_exactly_once(
         assert replay.status_code == 409
         assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
         latest_attempt = _surface_attempt(latest_turn)
@@ -685,10 +677,9 @@ def test_email_draft_queues_then_executes_as_draft_only_without_send_side_effect
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-compose")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="draft follow-up")
-        turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="draft follow-up")
+        turn = _turn_data(client)
         attempt = _surface_attempt(turn)
         assert attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert attempt["policy"]["decision"] == "requires_approval"
@@ -706,7 +697,7 @@ def test_email_draft_queues_then_executes_as_draft_only_without_send_side_effect
         assert approved.status_code == 200
         assert process_queued_action_execution(client, approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert attempt["execution"]["status"] == "succeeded"
@@ -768,10 +759,9 @@ def test_user_instruction_authority_requires_real_turn_id(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-compose")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="draft with slug authority")
-        turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="draft with slug authority")
+        turn = _turn_data(client)
         approved = client.post(
             "/v1/approvals",
             json={
@@ -783,7 +773,7 @@ def test_user_instruction_authority_requires_real_turn_id(
         assert approved.status_code == 200
         assert process_queued_action_execution(client, approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert attempt["execution"]["status"] == "failed"
@@ -833,10 +823,9 @@ def test_email_send_requires_approval_and_executes_exactly_once(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-send")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="send follow-up")
-        turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="send follow-up")
+        turn = _turn_data(client)
         attempt = _surface_attempt(turn)
         assert attempt["proposal"]["capability_id"] == "cap.email.send"
         assert attempt["policy"]["decision"] == "requires_approval"
@@ -858,7 +847,7 @@ def test_email_send_requires_approval_and_executes_exactly_once(
         assert replay.status_code == 409
         assert replay.json()["error"]["code"] == "E_APPROVAL_NOT_PENDING"
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
         latest_attempt = _surface_attempt(latest_turn)
@@ -927,10 +916,9 @@ def test_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-compose-send")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="draft note")
-        draft_turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="draft note")
+        draft_turn = _turn_data(client)
         draft_attempt = _surface_attempt(draft_turn)
         assert draft_attempt["proposal"]["capability_id"] == "cap.email.draft"
         assert draft_attempt["approval"]["status"] == "pending"
@@ -945,8 +933,8 @@ def test_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
         assert draft_approved.status_code == 200
         assert process_queued_action_execution(client, draft_approved.json()) is True
 
-        post_message_and_drain(client, session_id, message="send note")
-        send_turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="send note")
+        send_turn = _turn_data(client)
         send_attempt_pending = _surface_attempt(send_turn)
         assert send_attempt_pending["proposal"]["capability_id"] == "cap.email.send"
         assert send_attempt_pending["approval"]["status"] == "pending"
@@ -962,7 +950,7 @@ def test_draft_and_send_are_distinct_lifecycle_units_with_independent_histories(
         assert send_approved.status_code == 200
         assert process_queued_action_execution(client, send_approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         turns = timeline.json()["turns"]
         draft_turn_final = next(turn for turn in turns if turn["user_message"] == "draft note")
@@ -1116,9 +1104,8 @@ def test_write_paths_return_typed_auth_failures_with_recovery_guidance(
         if connect_code is not None:
             _connect_google(client, code=connect_code)
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="perform write")
-        turn = _turn_data(client, session_id)
+        post_message_and_drain(client, message="perform write")
+        turn = _turn_data(client)
 
         if requires_approval:
             approval_ref = _approval_ref(turn)
@@ -1137,7 +1124,7 @@ def test_write_paths_return_typed_auth_failures_with_recovery_guidance(
             assert expected_class in rendered_message
             assert "connect" in rendered_message
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         latest_turn = timeline.json()["turns"][-1]
         if expected_class == "not_connected":

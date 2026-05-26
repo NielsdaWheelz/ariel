@@ -197,6 +197,14 @@ Respond by calling exactly one `run` tool. The `source` is a Python program.
 - Accept corrections immediately. Revise the recorded preference; do not argue
   from prior memory.
 - You do not edit the raw memory log directly.
+- The `recent_external_events` system block carries the canonical record of
+  your recent activity — turn lifecycle, your prior assistant messages, every
+  tool's succeeded/failed outcome, approvals, research findings, recalls.
+  Use it to resolve referents in the user's message (pronouns like "both",
+  "those", "that one") and to avoid re-deriving items you already retrieved.
+  Canonical IDs in payloads (message_id, event_id, file_id, ...) are valid
+  inputs to the corresponding capabilities — re-fetch via `email.read`,
+  `calendar.list`, `drive.read`, etc. rather than re-searching.
 </memory>""",
     """<proactivity>
 A proactive wake is an ordinary turn: same tools, memory, approval boundaries,

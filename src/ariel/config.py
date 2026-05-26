@@ -130,8 +130,6 @@ class AppSettings(BaseSettings):
     # ``memory_embedding_dimensions`` is the DB column width invariant; the
     # actual provider/model are resolved by the EMBEDDING tier in the adapter.
     memory_embedding_dimensions: int = MEMORY_EMBEDDING_DIMENSIONS
-    auto_rotate_max_turns: int = 120
-    auto_rotate_max_age_seconds: int = 172800
     max_response_tokens: int = 12000
     turn_budget_seconds_soft: float = 600.0
     turn_budget_seconds_hard: float = 1800.0
@@ -420,20 +418,6 @@ class AppSettings(BaseSettings):
     def _memory_embedding_dimensions_must_match_schema(cls, value: int) -> int:
         if value != MEMORY_EMBEDDING_DIMENSIONS:
             raise ValueError(f"memory_embedding_dimensions must be {MEMORY_EMBEDDING_DIMENSIONS}")
-        return value
-
-    @field_validator("auto_rotate_max_turns")
-    @classmethod
-    def _auto_rotate_max_turns_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("auto_rotate_max_turns must be >= 1")
-        return value
-
-    @field_validator("auto_rotate_max_age_seconds")
-    @classmethod
-    def _auto_rotate_max_age_seconds_must_be_positive(cls, value: int) -> int:
-        if value < 1:
-            raise ValueError("auto_rotate_max_age_seconds must be >= 1")
         return value
 
     @field_validator("max_response_tokens")

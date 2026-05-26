@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ariel.action_runtime import (
     ActionRuntimeError,
     RuntimeProvenance,
-    reconcile_expired_approvals_for_session,
+    reconcile_expired_approvals,
     resolve_approval_decision,
 )
 from ariel.agency_daemon import AgencyDaemonClient, AgencyDaemonError, AgencyRuntime
@@ -86,15 +86,11 @@ from ariel.persistence import (
     ProviderWatchChannelRecord,
     ProviderWriteReceiptRecord,
     SubscriberHeartbeatRecord,
-    SessionRecord,
-    SessionRotationRecord,
     SyncCursorRecord,
     SyncRunRecord,
     TurnRecord,
     TurnIdempotencyRecord,
     enqueue_background_task,
-    get_or_create_active_session,
-    lock_active_session,
     serialize_agency_event,
     serialize_artifact,
     serialize_capture,
@@ -105,7 +101,6 @@ from ariel.persistence import (
     serialize_job,
     serialize_job_event,
     serialize_provider_event,
-    serialize_session,
     serialize_sync_cursor,
     serialize_sync_run,
     serialize_turn,
@@ -126,8 +121,6 @@ from ariel.response_contracts import (
     build_surface_memory_note_list_response,
     build_surface_message_response,
     build_surface_provider_event_list_response,
-    build_surface_rotation_list_response,
-    build_surface_rotation_response,
     build_surface_sync_cursor_list_response,
     build_surface_sync_run_list_response,
     build_surface_timeline_response,
@@ -150,8 +143,6 @@ PUBLIC_LOCAL_AUTH_BYPASS_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-RotationReason = Literal["user_initiated", "threshold_turn_count", "threshold_age"]
-AutoRotationReason = Literal["threshold_turn_count", "threshold_age"]
 
 _TAINT_LOOKBACK_TURNS = 12
 _AGENCY_EVENT_PERSISTENCE_ATTEMPTS = 3
@@ -641,19 +632,15 @@ def _normalize_idempotency_key(raw_key: str | None) -> str | None:
     return normalized
 
 
-def _message_idempotency_lock_id(*, session_id: str, idempotency_key: str) -> int:
-    digest = hashlib.sha256(
-        f"message-idempotency:{session_id}:{idempotency_key}".encode("utf-8")
-    ).digest()
+def _message_idempotency_lock_id(*, idempotency_key: str) -> int:
+    digest = hashlib.sha256(f"message-idempotency:{idempotency_key}".encode("utf-8")).digest()
     lock_value = int.from_bytes(digest[:8], byteorder="big", signed=False)
     if lock_value >= 2**63:
         lock_value -= 2**64
     return lock_value
 
 
-def _acquire_message_idempotency_lock(
-    db: Session, *, session_id: str, idempotency_key: str
-) -> None:
+def _acquire_message_idempotency_lock(db: Session, *, idempotency_key: str) -> None:
     bind = db.get_bind()
     # justify-service-invariant-check: Ariel persistence is PostgreSQL, and
     # message idempotency requires transaction-scoped advisory locks.
@@ -663,18 +650,12 @@ def _acquire_message_idempotency_lock(
         raise RuntimeError("message idempotency lock requires PostgreSQL")
     db.execute(
         text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {
-            "lock_id": _message_idempotency_lock_id(
-                session_id=session_id,
-                idempotency_key=idempotency_key,
-            )
-        },
+        {"lock_id": _message_idempotency_lock_id(idempotency_key=idempotency_key)},
     )
 
 
 def _message_request_hash(
     *,
-    session_id: str,
     message: str,
     discord_context: dict[str, Any] | None,
     attachment_sources: list[dict[str, Any]],
@@ -682,7 +663,6 @@ def _message_request_hash(
     encoded = json.dumps(
         {
             "mode": "message",
-            "session_id": session_id,
             "message": message,
             "discord_context": discord_context,
             "attachment_sources": attachment_sources,
@@ -694,15 +674,9 @@ def _message_request_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _message_task_idempotency_key(*, session_id: str, idempotency_key: str) -> str:
-    digest = hashlib.sha256(f"{session_id}:{idempotency_key}".encode("utf-8")).hexdigest()
-    return f"user_message:{digest}"
-
-
 @dataclass(slots=True, frozen=True)
 class TurnExecutionOutcome:
     turn_id: str
-    effective_session_id: str
     status_code: int
     response_payload: dict[str, Any]
 
@@ -757,121 +731,6 @@ def _relevant_artifacts_and_observations_context(
         .limit(_MAX_ARTIFACTS_IN_CONTEXT)
     ).all()
     return {"artifacts": [serialize_artifact(artifact) for artifact in artifacts]}
-
-
-def _rotate_active_session(
-    db: Session,
-    *,
-    reason: RotationReason,
-    idempotency_key: str | None,
-    actor_id: str,
-    trigger_snapshot: dict[str, Any] | None = None,
-) -> tuple[SessionRecord, SessionRotationRecord, bool]:
-    lock_active_session(db)
-
-    normalized_idempotency_key = _normalize_idempotency_key(idempotency_key)
-
-    if reason == "user_initiated" and isinstance(normalized_idempotency_key, str):
-        existing_rotation = db.scalar(
-            select(SessionRotationRecord)
-            .where(SessionRotationRecord.idempotency_key == normalized_idempotency_key)
-            .limit(1)
-        )
-        if existing_rotation is not None:
-            existing_session = db.scalar(
-                select(SessionRecord)
-                .where(SessionRecord.id == existing_rotation.rotated_to_session_id)
-                .limit(1)
-            )
-            if existing_session is not None:
-                return existing_session, existing_rotation, True
-
-    active_session = db.scalar(
-        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-    )
-    if active_session is None:
-        active_session = get_or_create_active_session(db, now=utcnow())
-
-    active_turn_count_raw = db.scalar(
-        select(func.count(TurnRecord.id)).where(TurnRecord.session_id == active_session.id)
-    )
-    active_turn_count = int(active_turn_count_raw or 0)
-    if (
-        reason == "user_initiated"
-        and normalized_idempotency_key is None
-        and active_session.rotation_reason == "user_initiated"
-        and isinstance(active_session.rotated_from_session_id, str)
-        and active_turn_count == 0
-    ):
-        existing_rotation = db.scalar(
-            select(SessionRotationRecord)
-            .where(SessionRotationRecord.rotated_to_session_id == active_session.id)
-            .limit(1)
-        )
-        if existing_rotation is not None:
-            return active_session, existing_rotation, True
-
-    now = utcnow()
-    prior_session_id = active_session.id
-    rotated_session_id = new_id("ses")
-    rotation_id = new_id("rot")
-
-    active_session.is_active = False
-    active_session.lifecycle_state = "closed"
-    active_session.updated_at = now
-
-    rotated_session = SessionRecord(
-        id=rotated_session_id,
-        is_active=True,
-        lifecycle_state="active",
-        rotated_from_session_id=prior_session_id,
-        rotation_reason=reason,
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(rotated_session)
-    db.flush()
-
-    rotation_record = SessionRotationRecord(
-        id=rotation_id,
-        rotated_from_session_id=prior_session_id,
-        rotated_to_session_id=rotated_session.id,
-        reason=reason,
-        idempotency_key=normalized_idempotency_key,
-        actor_id=actor_id,
-        trigger_snapshot=trigger_snapshot if isinstance(trigger_snapshot, dict) else {},
-        created_at=now,
-    )
-    db.add(rotation_record)
-    db.flush()
-
-    return rotated_session, rotation_record, False
-
-
-def _auto_rotation_reason(
-    *,
-    session_created_at: datetime,
-    prior_turn_count: int,
-    max_turns: int,
-    max_age_seconds: int,
-    now: datetime,
-) -> tuple[AutoRotationReason | None, dict[str, Any]]:
-    session_age_seconds = max(0, int((now - session_created_at).total_seconds()))
-    snapshot = {
-        "session_age_seconds": session_age_seconds,
-        "prior_turn_count": prior_turn_count,
-        "thresholds": {
-            "max_turns": max_turns,
-            "max_age_seconds": max_age_seconds,
-        },
-    }
-    if prior_turn_count <= 0:
-        return None, snapshot
-    if prior_turn_count >= max_turns:
-        return "threshold_turn_count", snapshot
-    if session_age_seconds >= max_age_seconds:
-        return "threshold_age", snapshot
-    return None, snapshot
 
 
 def _build_turn_context_bundle(
@@ -1158,7 +1017,6 @@ def _append_turn_event(
     db.add(
         EventRecord(
             id=new_id("evn"),
-            session_id=turn.session_id,
             turn_id=turn.id,
             sequence=next_sequence,
             event_type=event_type,
@@ -1215,7 +1073,6 @@ def _background_turn_failed_outcome(
     )
     return TurnExecutionOutcome(
         turn_id=turn.id,
-        effective_session_id=turn.session_id,
         status_code=error.status_code,
         response_payload=_error_payload(error),
     )
@@ -1259,15 +1116,11 @@ def _existing_background_turn_outcome(
         failure_reason = raw_reason if isinstance(raw_reason, str) else "turn failed"
         return _background_turn_failed_outcome(turn=turn, failure_reason=failure_reason)
 
-    session_record = db.get(SessionRecord, turn.session_id)
-    if session_record is None:
-        raise RuntimeError("background turn session is missing")
     events = _turn_events(db=db, turn_id=turn.id)
     action_attempts = _serialize_action_attempts_for_turn(db=db, turn_id=turn.id)
     assistant_sources = _turn_retrieval_sources(db=db, turn_id=turn.id)
     try:
         response_payload = build_surface_message_response(
-            session=serialize_session(session_record),
             turn=serialize_turn(turn, events=events, action_attempts=action_attempts),
             assistant_message=turn.assistant_message,
             assistant_sources=assistant_sources,
@@ -1277,7 +1130,6 @@ def _existing_background_turn_outcome(
         raise _response_contract_error(exc) from exc
     return TurnExecutionOutcome(
         turn_id=turn.id,
-        effective_session_id=turn.session_id,
         status_code=200,
         response_payload=response_payload,
     )
@@ -1288,7 +1140,6 @@ def _wake(
     runtime: Runtime,
     google_runtime: GoogleConnectorRuntime,
     db: Session,
-    request_session_id: str,
     wake_context: WakeContext,
     source_background_task_id: str | None = None,
     execute_google_reads_outside_transaction: bool = False,
@@ -1312,50 +1163,12 @@ def _wake(
         if existing_turn is not None:
             return _existing_background_turn_outcome(db=db, turn=existing_turn)
 
-    active_session = db.scalar(
-        select(SessionRecord)
-        .where(
-            SessionRecord.id == request_session_id,
-            SessionRecord.is_active.is_(True),
-        )
-        .limit(1)
-    )
-    if active_session is None:
-        raise ApiError(
-            status_code=404,
-            code="E_SESSION_NOT_FOUND",
-            message="active session not found",
-            details={"session_id": request_session_id},
-            retryable=False,
-        )
-
     prior_turns = db.scalars(
         select(TurnRecord)
-        .where(TurnRecord.session_id == active_session.id)
-        .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
+        .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
+        .limit(_TAINT_LOOKBACK_TURNS)
     ).all()
-    auto_rotation_reason, trigger_snapshot = _auto_rotation_reason(
-        session_created_at=active_session.created_at,
-        prior_turn_count=len(prior_turns),
-        max_turns=int(runtime.settings.auto_rotate_max_turns),
-        max_age_seconds=int(runtime.settings.auto_rotate_max_age_seconds),
-        now=utcnow(),
-    )
-    if auto_rotation_reason is not None:
-        active_session, _, _ = _rotate_active_session(
-            db,
-            reason=auto_rotation_reason,
-            idempotency_key=None,
-            actor_id=str(runtime.settings.approval_actor_id),
-            trigger_snapshot=trigger_snapshot,
-        )
-        prior_turns = db.scalars(
-            select(TurnRecord)
-            .where(TurnRecord.session_id == active_session.id)
-            .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
-        ).all()
-
-    effective_session_id = active_session.id
+    prior_turns = list(reversed(prior_turns))
     runtime_provenance = _runtime_provenance_for_turn(
         db=db,
         prior_turns=prior_turns,
@@ -1364,7 +1177,6 @@ def _wake(
     now = utcnow()
     turn = TurnRecord(
         id=new_id("trn"),
-        session_id=effective_session_id,
         user_message=user_message,
         assistant_message=None,
         status="in_progress",
@@ -1391,7 +1203,6 @@ def _wake(
         sequence += 1
         event = EventRecord(
             id=new_id("evn"),
-            session_id=effective_session_id,
             turn_id=turn.id,
             sequence=sequence,
             event_type=event_type,
@@ -1404,7 +1215,6 @@ def _wake(
     if discord_context is not None and discord_attachment_sources:
         runtime.attachment_runtime.record_discord_sources(
             db=db,
-            session_id=effective_session_id,
             turn_id=turn.id,
             discord_context=discord_context,
             attachment_sources=discord_attachment_sources,
@@ -1426,7 +1236,6 @@ def _wake(
         db,
         kind=wake_log_kind,
         content=user_message,
-        session_id=effective_session_id,
         turn_id=turn.id,
         taint=runtime_provenance.status,
         source_ref=turn.id,
@@ -1445,7 +1254,6 @@ def _wake(
             sandbox=sandbox,
             db=db,
             session_factory=runtime.session_factory,
-            session_id=effective_session_id,
             turn=turn,
             settings=runtime.settings,
             model_adapter=runtime.model_adapter,
@@ -1477,9 +1285,7 @@ def _wake(
     context_bundle = _build_turn_context_bundle(
         discord_context=discord_context,
         recall_v1=recall_v1,
-        recent_events_text=build_recent_events_block(
-            db=db, session_id=effective_session_id, settings=runtime.settings
-        ),
+        recent_events_text=build_recent_events_block(db=db, settings=runtime.settings),
         open_commitments_and_jobs=_open_commitments_and_jobs_context(db=db),
         relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
             db=db,
@@ -1568,7 +1374,6 @@ def _wake(
         sandbox=sandbox,
         db=db,
         session_factory=runtime.session_factory,
-        session_id=effective_session_id,
         turn=turn,
         settings=runtime.settings,
         model_adapter=runtime.model_adapter,
@@ -1640,7 +1445,6 @@ def _wake(
                 code="E_MODEL_FAILURE",
                 message="model provider request failed",
                 details={
-                    "session_id": effective_session_id,
                     "turn_id": turn.id,
                     "model_call_count": loop_result.model_call_count,
                 },
@@ -1659,7 +1463,6 @@ def _wake(
         assert assistant_response is not None
         current_turn_id = db.scalar(
             select(TurnRecord.id)
-            .where(TurnRecord.session_id == effective_session_id)
             .order_by(TurnRecord.created_at.desc(), TurnRecord.id.desc())
             .limit(1)
         )
@@ -1682,7 +1485,6 @@ def _wake(
             db,
             kind="assistant_message",
             content=assistant_message,
-            session_id=effective_session_id,
             turn_id=turn.id,
             taint=runtime_provenance.status,
             source_ref=turn.id,
@@ -1697,13 +1499,11 @@ def _wake(
         add_event("evt.assistant.emitted", {"message": assistant_message})
         add_event("evt.turn.completed", {})
 
-    active_session.updated_at = utcnow()
     db.commit()
 
     if model_failure is not None:
         return TurnExecutionOutcome(
             turn_id=turn.id,
-            effective_session_id=effective_session_id,
             status_code=model_failure.status_code,
             response_payload=_error_payload(model_failure),
         )
@@ -1712,7 +1512,6 @@ def _wake(
     # Re-query action attempts from the DB: the loop tracks them internally and
     # commits after each program, so they are durable by this point.
     serialized_action_attempts = _serialize_action_attempts_for_turn(db=db, turn_id=turn.id)
-    raw_session = serialize_session(active_session)
     raw_turn = serialize_turn(
         turn,
         events=created_events,
@@ -1720,7 +1519,6 @@ def _wake(
     )
     try:
         response_payload = build_surface_message_response(
-            session=raw_session,
             turn=raw_turn,
             assistant_message=turn.assistant_message,
             assistant_sources=assistant_sources,
@@ -1730,7 +1528,6 @@ def _wake(
         raise _response_contract_error(exc) from exc
     return TurnExecutionOutcome(
         turn_id=turn.id,
-        effective_session_id=effective_session_id,
         status_code=200,
         response_payload=response_payload,
     )
@@ -1786,8 +1583,6 @@ def create_app(
     app.state.bind_port = settings.bind_port
     app.state.local_auth_required = settings.local_auth_required
     app.state.local_auth_token = settings.local_auth_token
-    app.state.auto_rotate_max_turns = settings.auto_rotate_max_turns
-    app.state.auto_rotate_max_age_seconds = settings.auto_rotate_max_age_seconds
     app.state.max_response_tokens = settings.max_response_tokens
     app.state.turn_budget_seconds_soft = settings.turn_budget_seconds_soft
     app.state.turn_budget_seconds_hard = settings.turn_budget_seconds_hard
@@ -1890,8 +1685,8 @@ def create_app(
             "message": "Ariel is Discord-primary. Use the Discord bot for chat.",
             "api": {
                 "health": "/v1/health",
-                "active_session": "/v1/sessions/active",
-                "session_events": "/v1/sessions/{session_id}/events",
+                "post_message": "/v1/messages",
+                "events": "/v1/events",
                 "approval_decisions": "/v1/approvals",
                 "agency_events": "/v1/agency/events",
                 "provider_events": "/v1/provider-events",
@@ -2152,80 +1947,6 @@ def create_app(
                     raise
         raise RuntimeError("agency event persistence retry exhausted")
 
-    @app.post("/v1/sessions")
-    def create_or_get_session() -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = get_or_create_active_session(db, now=utcnow())
-            return {"ok": True, "session": serialize_session(active_session)}
-
-    @app.get("/v1/sessions/active")
-    def get_active_session() -> dict[str, Any]:
-        _ensure_schema_ready()
-        with session_factory() as db:
-            with db.begin():
-                active_session = get_or_create_active_session(db, now=utcnow())
-            return {"ok": True, "session": serialize_session(active_session)}
-
-    @app.post("/v1/sessions/rotate", response_model=None)
-    def rotate_active_session(request: Request) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        idempotency_key = _normalize_idempotency_key(request.headers.get("Idempotency-Key"))
-        with session_factory() as db:
-            with db.begin():
-                rotated_session, rotation_record, idempotent_replay = _rotate_active_session(
-                    db,
-                    reason="user_initiated",
-                    idempotency_key=idempotency_key,
-                    actor_id=str(app.state.approval_actor_id),
-                )
-                try:
-                    return build_surface_rotation_response(
-                        session=serialize_session(rotated_session),
-                        rotation={
-                            "rotation_id": rotation_record.id,
-                            "reason": rotation_record.reason,
-                            "rotated_from_session_id": rotation_record.rotated_from_session_id,
-                            "idempotency_key": rotation_record.idempotency_key,
-                            "idempotent_replay": idempotent_replay,
-                        },
-                    )
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
-    @app.get("/v1/sessions/rotations", response_model=None)
-    def get_session_rotations(limit: int = 100) -> JSONResponse | dict[str, Any]:
-        _ensure_schema_ready()
-        bounded_limit = max(1, min(limit, 500))
-        with session_factory() as db:
-            with db.begin():
-                rows = db.scalars(
-                    select(SessionRotationRecord)
-                    .order_by(
-                        SessionRotationRecord.created_at.desc(),
-                        SessionRotationRecord.id.desc(),
-                    )
-                    .limit(bounded_limit)
-                ).all()
-                payload = [
-                    {
-                        "rotation_id": row.id,
-                        "reason": row.reason,
-                        "rotated_from_session_id": row.rotated_from_session_id,
-                        "rotated_to_session_id": row.rotated_to_session_id,
-                        "idempotency_key": row.idempotency_key,
-                        "actor_id": row.actor_id,
-                        "trigger_snapshot": row.trigger_snapshot,
-                        "created_at": to_rfc3339(row.created_at),
-                    }
-                    for row in rows
-                ]
-                try:
-                    return build_surface_rotation_list_response(rotations=payload)
-                except ResponseContractViolation as exc:
-                    raise _response_contract_error(exc) from exc
-
     @app.get("/v1/weather/default-location")
     def get_weather_default_location() -> dict[str, Any]:
         _ensure_schema_ready()
@@ -2417,14 +2138,12 @@ def create_app(
                     )
             return {"ok": True, "connector": connector_payload}
 
-    @app.post("/v1/sessions/{session_id}/message", response_model=None)
+    @app.post("/v1/messages", response_model=None)
     def post_message(
-        session_id: str,
         payload: MessageRequest,
         request: Request,
     ) -> JSONResponse | dict[str, Any]:
         _ensure_schema_ready()
-        request_session_id = session_id
         discord_context: dict[str, Any] | None = None
         discord_attachment_sources: list[dict[str, Any]] = []
         if payload.discord is not None:
@@ -2451,7 +2170,6 @@ def create_app(
         )
         request_hash = (
             _message_request_hash(
-                session_id=request_session_id,
                 message=payload.message,
                 discord_context=discord_context,
                 attachment_sources=discord_attachment_sources,
@@ -2466,13 +2184,11 @@ def create_app(
                     assert request_hash is not None
                     _acquire_message_idempotency_lock(
                         db,
-                        session_id=request_session_id,
                         idempotency_key=normalized_idempotency_key,
                     )
                     existing_idempotency = db.scalar(
                         select(TurnIdempotencyRecord)
                         .where(
-                            TurnIdempotencyRecord.session_id == request_session_id,
                             TurnIdempotencyRecord.idempotency_key == normalized_idempotency_key,
                         )
                         .limit(1)
@@ -2492,24 +2208,6 @@ def create_app(
                             status_code=existing_idempotency.status_code,
                             content=existing_idempotency.response_payload,
                         )
-
-                # Validate that the target session exists before enqueuing.
-                active_session_check = db.scalar(
-                    select(SessionRecord)
-                    .where(
-                        SessionRecord.id == request_session_id,
-                        SessionRecord.is_active.is_(True),
-                    )
-                    .limit(1)
-                )
-                if active_session_check is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_SESSION_NOT_FOUND",
-                        message="active session not found",
-                        details={"session_id": request_session_id},
-                        retryable=False,
-                    )
 
                 if discord_context is not None:
                     now_discord = utcnow()
@@ -2604,7 +2302,6 @@ def create_app(
                     db,
                     task_type="user_message",
                     payload={
-                        "session_id": request_session_id,
                         "message": payload.message,
                         "discord_context": discord_context,
                         "attachment_sources": discord_attachment_sources
@@ -2612,14 +2309,7 @@ def create_app(
                         else None,
                     },
                     now=now,
-                    idempotency_key=(
-                        _message_task_idempotency_key(
-                            session_id=request_session_id,
-                            idempotency_key=normalized_idempotency_key,
-                        )
-                        if normalized_idempotency_key is not None
-                        else None
-                    ),
+                    idempotency_key=normalized_idempotency_key,
                 )
                 response_payload = {"status": "accepted", "task_id": task.id}
                 if normalized_idempotency_key is not None:
@@ -2627,7 +2317,6 @@ def create_app(
                     db.add(
                         TurnIdempotencyRecord(
                             id=new_id("idem"),
-                            session_id=request_session_id,
                             idempotency_key=normalized_idempotency_key,
                             request_hash=request_hash,
                             turn_id=None,
@@ -2745,33 +2434,22 @@ def create_app(
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
-    @app.get("/v1/sessions/{session_id}/events")
-    def get_session_events(session_id: str, after: str | None = None) -> dict[str, Any]:
+    @app.get("/v1/events")
+    def get_events(after: str | None = None) -> dict[str, Any]:
         _ensure_schema_ready()
         with session_factory() as db:
             with db.begin():
-                session_record = db.scalar(
-                    select(SessionRecord).where(SessionRecord.id == session_id).limit(1)
-                )
-                if session_record is None:
-                    raise ApiError(
-                        status_code=404,
-                        code="E_SESSION_NOT_FOUND",
-                        message="session not found",
-                        details={"session_id": session_id},
-                        retryable=False,
-                    )
-
-                reconcile_expired_approvals_for_session(
+                reconcile_expired_approvals(
                     db=db,
-                    session_id=session_id,
                     now_fn=utcnow,
                     new_id_fn=new_id,
                 )
 
+                # Only user-visible turns (agent_turn). Memory and research turns
+                # are subsystem bookkeeping and aren't part of the conversation.
                 turns = db.scalars(
                     select(TurnRecord)
-                    .where(TurnRecord.session_id == session_id)
+                    .where(TurnRecord.kind == "agent_turn")
                     .order_by(TurnRecord.created_at.asc(), TurnRecord.id.asc())
                 ).all()
                 turn_ids = [turn.id for turn in turns]
@@ -2784,18 +2462,14 @@ def create_app(
                 cursor_event: EventRecord | None = None
                 if isinstance(after, str) and after.strip():
                     cursor_event = db.scalar(
-                        select(EventRecord)
-                        .where(
-                            EventRecord.id == after.strip(), EventRecord.session_id == session_id
-                        )
-                        .limit(1)
+                        select(EventRecord).where(EventRecord.id == after.strip()).limit(1)
                     )
                     if cursor_event is None:
                         raise ApiError(
                             status_code=404,
                             code="E_EVENT_CURSOR_NOT_FOUND",
-                            message="event cursor not found in session",
-                            details={"session_id": session_id, "after": after.strip()},
+                            message="event cursor not found",
+                            details={"after": after.strip()},
                             retryable=False,
                         )
                 if turn_ids:
@@ -2872,10 +2546,7 @@ def create_app(
                     for turn in turns_to_serialize
                 ]
                 try:
-                    return build_surface_timeline_response(
-                        session_id=session_id,
-                        turns=serialized_turns,
-                    )
+                    return build_surface_timeline_response(turns=serialized_turns)
                 except ResponseContractViolation as exc:
                     raise _response_contract_error(exc) from exc
 
@@ -3416,7 +3087,6 @@ def create_app(
                                 "created_at": to_rfc3339(row.created_at),
                                 "kind": row.kind,
                                 "content": row.content,
-                                "session_id": row.session_id,
                                 "turn_id": row.turn_id,
                                 "taint": row.taint,
                                 "source_ref": row.source_ref,

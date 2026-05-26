@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import sessionmaker
 
 from ariel import run_runtime
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.persistence import TurnRecord
 from ariel.run_runtime import RunProgramResult, execute_run_program
 from tests.fake_sandbox import FakeSandboxRuntime
 
@@ -21,7 +21,6 @@ NOW = datetime(2026, 5, 23, 12, 0, tzinfo=UTC)
 def _turn() -> TurnRecord:
     return TurnRecord(
         id="trn_run_defect",
-        session_id="ses_run_defect",
         user_message="test",
         assistant_message=None,
         status="in_progress",
@@ -43,17 +42,6 @@ def _execute(
     try:
         with session_factory() as db:
             with db.begin():
-                db.add(
-                    SessionRecord(
-                        id="ses_run_defect",
-                        is_active=True,
-                        lifecycle_state="active",
-                        rotated_from_session_id=None,
-                        rotation_reason=None,
-                        created_at=NOW,
-                        updated_at=NOW,
-                    )
-                )
                 turn = _turn()
                 db.add(turn)
                 db.flush()
@@ -62,7 +50,6 @@ def _execute(
                     source=source,
                     db=db,
                     session_factory=session_factory,
-                    session_id="ses_run_defect",
                     turn=turn,
                     proposal_index_start=0,
                     approval_ttl_seconds=300,

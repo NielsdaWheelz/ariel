@@ -223,7 +223,6 @@ def _dispatch_egress_requests(*, egress_requests: list[dict[str, Any]]) -> str |
 def append_turn_event(
     *,
     db: Session,
-    session_id: str,
     turn_id: str,
     sequence: int,
     event_type: str,
@@ -233,7 +232,6 @@ def append_turn_event(
 ) -> EventRecord:
     event = EventRecord(
         id=new_id_fn("evn"),
-        session_id=session_id,
         turn_id=turn_id,
         sequence=sequence,
         event_type=event_type,

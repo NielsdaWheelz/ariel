@@ -3979,7 +3979,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # log layer to specific event types only; pass it only with values from the
     # enum below. ``since`` is RFC3339 (e.g. ``"2026-05-20T12:00:00Z"``).
     "memory.search": "(query: str, limit: int = 24, since: str | None = None, kinds: list[Literal['user_message','agent_round','assistant_message','tool_observation','proactive_trigger','note_create','note_edit','note_delete','recall','research_finding']] | None = None) -> {'hits': list[{'id', 'layer', 'kind', 'created_at', 'snippet', 'taint'}], 'status': 'succeeded'}",
-    "memory.read": "(id: str) -> {'status': Literal['found', 'not_found'], 'id': str, 'layer': Literal['log', 'note'], 'kind': str | None, 'created_at': str, 'content': dict | str, 'taint': dict, 'session_id': str | None, 'turn_id': str | None}",
+    "memory.read": "(id: str) -> {'status': Literal['found', 'not_found'], 'id': str, 'layer': Literal['log', 'note'], 'kind': str | None, 'created_at': str, 'content': dict | str, 'taint': dict, 'turn_id': str | None}",
     "memory.recall": "(query: str) -> {'status': 'recalled', 'recall': dict}",
     "memory.remember": "(note: str) -> {'status': 'queued', 'encode_id': str}",
     "memory.note.create": "(content: str) -> {'status': 'created', 'id': str}",

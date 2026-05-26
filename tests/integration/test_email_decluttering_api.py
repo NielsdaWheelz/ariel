@@ -17,7 +17,6 @@ from ariel.model_adapter import ModelCall, ModelResponse
 from ariel.persistence import (
     ActionAttemptRecord,
     ProviderWriteReceiptRecord,
-    SessionRecord,
     TurnRecord,
 )
 from tests.fake_sandbox import FakeSandboxRuntime
@@ -61,20 +60,8 @@ def test_email_state_inspection_endpoints_return_serialized_records(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_email_api",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_email_api",
-                    session_id="ses_email_api",
                     user_message="clean up email",
                     assistant_message=None,
                     status="in_progress",
@@ -85,7 +72,6 @@ def test_email_state_inspection_endpoints_return_serialized_records(
             db.add(
                 ActionAttemptRecord(
                     id="aat_email_api",
-                    session_id="ses_email_api",
                     turn_id="trn_email_api",
                     proposal_index=1,
                     capability_id="cap.email.archive",

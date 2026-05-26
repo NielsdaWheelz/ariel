@@ -75,7 +75,7 @@ round-history eviction, per-program commit, retry, and run-protocol validation
 Every turn runs in the single-threaded background worker, reached through the
 `background_tasks` queue. The HTTP ingress never runs a turn.
 
-The user-message endpoint (`post_message`, `POST /v1/sessions/{id}/message`)
+The user-message endpoint (`post_message`, `POST /v1/messages`)
 validates its input, enqueues a `user_message` task, and returns `202` with
 `{status: "accepted", task_id}`. The worker takes the earliest due row,
 dispatches on `task_type`, and runs the turn:
@@ -102,17 +102,21 @@ construction; there is no per-turn session advisory lock.
 ## The long adaptive loop
 
 The loop runs as many reason→act→observe rounds as a task needs. There is no
-fixed model-call cap. Three rails bound it:
+fixed model-call cap. Four rails bound it:
 
-- **Wall-clock budget** — `main_turn_budget_seconds` for `_wake`,
-  `research_run_budget_seconds` for `run_research`. Checked before each model
-  call; on exhaustion the loop ends gracefully. User-message turns emit a plain
-  "I wasn't able to finish that within the time available" message and complete
-  normally (not a `429`). Proactive wakes complete silently. Research returns a
-  `partial` finding.
-- **Model-call backstop** — `agent_loop_max_model_calls`, a high paranoid cap,
-  not the primary control. Exhausting it ends the loop on the same graceful
-  path as budget exhaustion.
+- **Soft wall-clock budget** — `turn_budget_seconds_soft` for `_wake` (600s
+  default), `research_run_budget_seconds` for subagent loops. When crossed,
+  the loop injects a one-shot wrap-up nudge asking the model to emit a final
+  `agent.emit_message` with what it has and stop starting new tool chains. An
+  `evt.agent.wrap_up_nudged` row records the cross. Subagent loops set
+  soft == hard and skip the nudge (no user to address).
+- **Hard wall-clock budget** — `turn_budget_seconds_hard` (1800s default).
+  Cold-stop safety net. User-message turns emit "I wasn't able to finish that
+  within the time available" and complete normally. Proactive wakes complete
+  silently. Research returns a `partial` finding.
+- **Model-call caps** — `turn_max_model_calls_soft` (120) fires the nudge;
+  `turn_max_model_calls_hard` (300) cold-stops. Subagent loops use
+  `agent_loop_max_model_calls` (50) for both soft and hard.
 - **Stuck-detection** — if the model returns a program whose source is
   byte-identical to the immediately preceding round's source, the loop is
   cycling; it ends on the graceful path. This is host-side and the model cannot
@@ -188,7 +192,7 @@ there is no router and no manager — the model delegates by calling a syscall.
 `research.investigate(question, mode)`, backed by the `cap.research.investigate`
 capability — `impact_level=read`, `policy_decision=allow_inline`, so dispatch
 needs no approval. The capability's `execute` enqueues a `research_run` task
-carrying the question, the mode, and the originating `session_id`, and returns
+carrying the question and the mode, and returns
 `{status: "queued", research_id}`. The main agent acknowledges to the user
 ("looking into that") and ends its turn. The main agent owns clarification — it
 resolves an ambiguous request with the user before dispatching. The research
@@ -256,6 +260,41 @@ content, so the main agent treats it exactly like a fetched web page. Because
 the finding is tainted, any action it motivates is evaluated tainted and routes
 through `requires_approval`. A prompt-injected finding cannot authorize an
 unapproved action.
+
+## The recent-events block
+
+Every wake's initial context includes one `recent_external_events` system
+block listing the K most recent externally-relevant events from the durable
+`events` log. The agent reads canonical IDs (Gmail `message_id`, Calendar
+`event_id`, Drive `file_id`, ...) directly out of payloads and re-fetches
+full content via the existing capability surface (`email.read`,
+`calendar.list`, `drive.read`, ...). There is no curated transcript, no IDs
+index, no lifecycle machinery — the agent's own recent activity is the
+source of truth.
+
+Selection is content-agnostic: a structural whitelist of event_types
+representing world or conversation state changes (turn lifecycle, assistant
+emissions, action execution outcomes, approvals, research findings, model
+failures, provider write reconciliations, memory recalls). Loop-internal
+events (model timing, action.proposed, policy_decided, started markers,
+intra-turn emit_value, ai_judgment internals, connector lifecycle noise)
+are excluded. The whitelist lives in
+`src/ariel/conversational_continuity.py:EXTERNAL_EVENT_TYPES` and is
+revisited only when a new event_type representing a real state change is
+introduced.
+
+Oversized payloads (above `recent_event_payload_byte_cap`, default 4096
+bytes) are recursively compacted by `_walk_compact`: scalars and any
+`*_id` / `*_ids` keys are kept verbatim at any depth, long strings get a
+`{_truncated_str, _byte_size, _preview}` marker, long lists become a
+`{_kind, _size, _sampled}` marker, and the payload root gets
+`_truncated: true`. The compact view always preserves the IDs the agent
+needs to re-fetch.
+
+Token budget caps the block (`recent_events_token_budget`, default
+100,000 tokens — 10% of Sonnet-4.6's 1M window). Oldest events evict
+first; the current turn's own `evt.turn.started` is always retained so
+the agent at minimum sees its own user prompt.
 
 ## Rules
 

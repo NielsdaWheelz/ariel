@@ -375,7 +375,6 @@ def test_submit_discord_turn_posts_message_with_discord_message_idempotency(
         assert timeout == 60.0
         client = FakeHttpClient(
             responses=[
-                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
                 httpx.Response(202, json={"status": "accepted", "task_id": "tsk_1"}),
             ]
         )
@@ -391,10 +390,9 @@ def test_submit_discord_turn_posts_message_with_discord_message_idempotency(
     )
 
     assert fake_clients[0].calls == [
-        {"method": "GET", "url": "http://127.0.0.1:8000/v1/sessions/active"},
         {
             "method": "POST",
-            "url": "http://127.0.0.1:8000/v1/sessions/ses_test/message",
+            "url": "http://127.0.0.1:8000/v1/messages",
             "headers": {"Idempotency-Key": "discord-message-123"},
             "json": {"message": "status please"},
         },
@@ -410,7 +408,6 @@ def test_submit_discord_turn_sends_local_auth_and_idempotency(
         assert timeout == 60.0
         client = FakeHttpClient(
             responses=[
-                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
                 httpx.Response(202, json={"status": "accepted", "task_id": "tsk_1"}),
             ]
         )
@@ -427,9 +424,6 @@ def test_submit_discord_turn_sends_local_auth_and_idempotency(
     )
 
     assert fake_clients[0].calls[0]["headers"] == {
-        "Authorization": "Bearer local_token_0123456789abcdef012345"
-    }
-    assert fake_clients[0].calls[1]["headers"] == {
         "Authorization": "Bearer local_token_0123456789abcdef012345",
         "Idempotency-Key": "discord-message-123",
     }
@@ -444,7 +438,6 @@ def test_submit_discord_turn_posts_discord_context_as_separate_field(
         assert timeout == 60.0
         client = FakeHttpClient(
             responses=[
-                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
                 httpx.Response(202, json={"status": "accepted", "task_id": "tsk_1"}),
             ]
         )
@@ -466,7 +459,7 @@ def test_submit_discord_turn_posts_discord_context_as_separate_field(
         },
     )
 
-    assert fake_clients[0].calls[1]["json"] == {
+    assert fake_clients[0].calls[0]["json"] == {
         "message": "status please",
         "discord": {
             "guild_id": 1,
@@ -574,13 +567,6 @@ def test_status_command_fetches_only_deterministic_ops_endpoints(
                     200,
                     json={
                         "ok": True,
-                        "session": {"id": "ses_123", "lifecycle_state": "active"},
-                    },
-                ),
-                httpx.Response(
-                    200,
-                    json={
-                        "ok": True,
                         "jobs": [
                             {"id": "job_1", "status": "running", "title": "Do work"},
                             {"id": "job_2", "status": "succeeded", "title": "Done"},
@@ -597,11 +583,9 @@ def test_status_command_fetches_only_deterministic_ops_endpoints(
     message = get_status(ariel_base_url="http://127.0.0.1:8000")
 
     assert "Ariel status: ok" in message
-    assert "Active session: ses_123 (active)" in message
     assert "Recent jobs: 2 total, 1 active" in message
     assert fake_clients[0].calls == [
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/health"},
-        {"method": "GET", "url": "http://127.0.0.1:8000/v1/sessions/active"},
         {"method": "GET", "url": "http://127.0.0.1:8000/v1/jobs?limit=5"},
     ]
 
@@ -1227,7 +1211,6 @@ def test_submit_discord_turn_raises_on_message_post_failure(
         assert timeout == 60.0
         return FakeHttpClient(
             responses=[
-                httpx.Response(200, json={"ok": True, "session": {"id": "ses_test"}}),
                 httpx.Response(
                     422,
                     json={

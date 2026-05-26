@@ -214,8 +214,6 @@ def test_bind_host_rejects_public_interfaces(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_TURNS", raising=False)
-    monkeypatch.delenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", raising=False)
     monkeypatch.delenv("ARIEL_MAX_RESPONSE_TOKENS", raising=False)
     monkeypatch.delenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", raising=False)
     monkeypatch.delenv("ARIEL_TURN_BUDGET_SECONDS_HARD", raising=False)
@@ -231,8 +229,6 @@ def test_turn_budget_defaults_are_configured(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.delenv("ARIEL_APPROVAL_ACTOR_ID", raising=False)
 
     settings = AppSettings.model_validate({})
-    assert settings.auto_rotate_max_turns == 120
-    assert settings.auto_rotate_max_age_seconds == 172800
     assert settings.max_response_tokens == 12000
     assert settings.turn_budget_seconds_soft == 600.0
     assert settings.turn_budget_seconds_hard == 1800.0
@@ -329,8 +325,6 @@ def test_local_auth_rejects_weak_tokens() -> None:
 
 
 def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_TURNS", "77")
-    monkeypatch.setenv("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "2222")
     monkeypatch.setenv("ARIEL_MAX_RESPONSE_TOKENS", "321")
     monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_SOFT", "300.0")
     monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "900.0")
@@ -342,8 +336,6 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("ARIEL_APPROVAL_ACTOR_ID", "user.integration")
 
     settings = AppSettings()
-    assert settings.auto_rotate_max_turns == 77
-    assert settings.auto_rotate_max_age_seconds == 2222
     assert settings.max_response_tokens == 321
     assert settings.turn_budget_seconds_soft == 300.0
     assert settings.turn_budget_seconds_hard == 900.0
@@ -380,8 +372,6 @@ def test_memory_embedding_dimensions_must_match_schema(monkeypatch: pytest.Monke
 @pytest.mark.parametrize(
     ("env_name", "env_value"),
     [
-        ("ARIEL_AUTO_ROTATE_MAX_TURNS", "0"),
-        ("ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS", "0"),
         ("ARIEL_MAX_RESPONSE_TOKENS", "0"),
         ("ARIEL_TURN_BUDGET_SECONDS_SOFT", "0"),
         ("ARIEL_TURN_BUDGET_SECONDS_HARD", "0"),

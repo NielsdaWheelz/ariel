@@ -445,14 +445,8 @@ def _bind_google_fakes(
     _worker_module.build_google_runtime = _worker_build_google_runtime
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -567,10 +561,9 @@ def test_blocking_auth_failures_remap_readiness_to_reconnect_required(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code=connect_code)
-        session_id = _session_id(client)
 
-        turn = post_message_and_drain(client, session_id, message="draft follow-up")
-        turn_data = _turn_data(client, session_id)
+        turn = post_message_and_drain(client, message="draft follow-up")
+        turn_data = _turn_data(client)
 
         if expected_failure == "consent_required" and turn_data["surface_action_lifecycle"] == []:
             assert all(
@@ -595,7 +588,7 @@ def test_blocking_auth_failures_remap_readiness_to_reconnect_required(
         assert approved.status_code == 200
         assert process_queued_action_execution(client, approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert attempt["execution"]["status"] == "failed"
@@ -638,10 +631,9 @@ def test_transient_auth_failures_do_not_remap_connected_readiness(
             workspace_provider=FakeGoogleWorkspaceProvider(),
         )
         _connect_google(client, code="connect-read-expired")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="search inbox")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="search inbox")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "provider_timeout"
@@ -787,10 +779,9 @@ def test_reconnect_required_persists_until_successful_reconnect(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-compose")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="draft follow-up")
-        first_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="draft follow-up")
+        first_turn_data = _turn_data(client)
         first_attempt = _surface_attempt(first_turn_data)
         assert first_attempt["approval"]["status"] == "pending"
         first_approved = client.post(
@@ -804,7 +795,7 @@ def test_reconnect_required_persists_until_successful_reconnect(
         assert first_approved.status_code == 200
         assert process_queued_action_execution(client, first_approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         first_attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert first_attempt["execution"]["error"] == "scope_missing"
@@ -813,8 +804,8 @@ def test_reconnect_required_persists_until_successful_reconnect(
         assert blocked_status.status_code == 200
         assert blocked_status.json()["connector"]["readiness"] == "reconnect_required"
 
-        post_message_and_drain(client, session_id, message="show schedule")
-        successful_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="show schedule")
+        successful_turn_data = _turn_data(client)
         successful_attempt = _surface_attempt(successful_turn_data)
         assert successful_attempt["execution"]["status"] == "succeeded"
 
@@ -894,10 +885,9 @@ def test_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
             workspace_provider=workspace_provider,
         )
         _connect_google(client, code="connect-compose")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="draft follow-up")
-        blocking_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="draft follow-up")
+        blocking_turn_data = _turn_data(client)
         blocking_attempt = _surface_attempt(blocking_turn_data)
         assert blocking_attempt["approval"]["status"] == "pending"
         blocking_approved = client.post(
@@ -911,7 +901,7 @@ def test_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
         assert blocking_approved.status_code == 200
         assert process_queued_action_execution(client, blocking_approved.json()) is True
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events")
+        timeline = client.get("/v1/events")
         assert timeline.status_code == 200
         blocking_attempt = _surface_attempt(timeline.json()["turns"][-1])
         assert blocking_attempt["execution"]["error"] == "scope_missing"
@@ -922,8 +912,8 @@ def test_blocking_readiness_state_is_not_downgraded_by_later_transient_failure(
                 assert connector is not None
                 connector.access_token_expires_at = datetime.now(tz=UTC) - timedelta(minutes=1)
 
-        post_message_and_drain(client, session_id, message="show schedule")
-        transient_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="show schedule")
+        transient_turn_data = _turn_data(client)
         transient_attempt = _surface_attempt(transient_turn_data)
         assert transient_attempt["execution"]["error"] == "provider_timeout"
 
@@ -998,10 +988,9 @@ def test_attendee_reconnect_intent_requests_freebusy_and_restores_full_availabil
             workspace_provider=FakeGoogleWorkspaceProvider(),
         )
         _connect_google(client, code="connect-no-freebusy")
-        session_id = _session_id(client)
 
-        post_message_and_drain(client, session_id, message="plan team sync")
-        before_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="plan team sync")
+        before_turn_data = _turn_data(client)
         before_attempt = _surface_attempt(before_turn_data)
         assert before_attempt["execution"]["status"] == "succeeded"
         assert before_attempt["execution"]["output"]["partial"] is True
@@ -1043,8 +1032,8 @@ def test_attendee_reconnect_intent_requests_freebusy_and_restores_full_availabil
             "The selected time works for all attendees."
         )
 
-        post_message_and_drain(client, session_id, message="plan team sync")
-        after_turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="plan team sync")
+        after_turn_data = _turn_data(client)
         after_attempt = _surface_attempt(after_turn_data)
         assert after_attempt["execution"]["status"] == "succeeded"
         assert after_attempt["execution"]["output"]["partial"] is False

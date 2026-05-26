@@ -50,24 +50,11 @@ def submit_discord_turn(
     discord_context: dict[str, Any] | None = None,
 ) -> None:
     with httpx.Client(timeout=60.0) as client:
-        session_response = client.get(
-            f"{ariel_base_url}/v1/sessions/active",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        session_payload = _json_response_payload(session_response)
-        if session_response.status_code >= 400 or session_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(session_payload))
-
-        session = session_payload.get("session")
-        session_id = session.get("id") if isinstance(session, dict) else None
-        if not isinstance(session_id, str) or not session_id:
-            raise ArielDiscordError("Ariel returned an invalid active session response.")
-
         request_payload: dict[str, Any] = {"message": prompt}
         if discord_context is not None:
             request_payload["discord"] = discord_context
         message_response = client.post(
-            f"{ariel_base_url}/v1/sessions/{session_id}/message",
+            f"{ariel_base_url}/v1/messages",
             headers=_auth_headers(
                 ariel_auth_token,
                 {"Idempotency-Key": f"discord-message-{discord_message_id}"},
@@ -91,14 +78,6 @@ def get_status(
         if health_response.status_code >= 400 or health_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(health_payload))
 
-        session_response = client.get(
-            f"{ariel_base_url}/v1/sessions/active",
-            headers=_auth_headers(ariel_auth_token),
-        )
-        session_payload = _json_response_payload(session_response)
-        if session_response.status_code >= 400 or session_payload.get("ok") is not True:
-            raise ArielDiscordError(_safe_ariel_error_message(session_payload))
-
         jobs_response = client.get(
             f"{ariel_base_url}/v1/jobs?limit=5",
             headers=_auth_headers(ariel_auth_token),
@@ -107,13 +86,8 @@ def get_status(
         if jobs_response.status_code >= 400 or jobs_payload.get("ok") is not True:
             raise ArielDiscordError(_safe_ariel_error_message(jobs_payload))
 
-    session = session_payload.get("session")
-    if not isinstance(session, dict):
-        raise ArielDiscordError("Ariel returned an invalid active session response.")
-
     jobs = jobs_payload.get("jobs")
     return _format_status_for_discord(
-        session=session,
         jobs=jobs if isinstance(jobs, list) else [],
     )
 
@@ -511,16 +485,7 @@ def _format_approval_response_for_discord(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _format_status_for_discord(
-    *,
-    session: dict[str, Any],
-    jobs: list[Any],
-) -> str:
-    session_id = session.get("id")
-    session_state = session.get("lifecycle_state")
-    if not isinstance(session_id, str) or not isinstance(session_state, str):
-        raise ArielDiscordError("Ariel returned an invalid active session response.")
-
+def _format_status_for_discord(*, jobs: list[Any]) -> str:
     running_jobs = 0
     for job in jobs:
         if not isinstance(job, dict):
@@ -531,7 +496,6 @@ def _format_status_for_discord(
     return "\n".join(
         [
             "Ariel status: ok",
-            f"Active session: {session_id} ({session_state})",
             f"Recent jobs: {len(jobs)} total, {running_jobs} active",
         ]
     )

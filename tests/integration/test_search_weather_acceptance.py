@@ -91,14 +91,8 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -247,9 +241,8 @@ def test_search_web_executes_against_brave_provider_with_citations(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="web search fixture")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="web search fixture")
+        turn_data = _turn_data(client)
 
         assert "[1]" in turn_data["assistant_message"]
         sources = _turn_sources(client, turn_data["id"])
@@ -323,9 +316,8 @@ def test_search_web_egress_fails_closed_before_execute(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message=message)
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message=message)
+        turn_data = _turn_data(client)
 
         assert "egress_destination_denied" in turn_data["assistant_message"]
 
@@ -374,9 +366,8 @@ def test_weather_explicit_location_wins_and_response_contains_location_timeframe
         )
         assert set_default.status_code == 200
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="weather explicit")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="weather explicit")
+        turn_data = _turn_data(client)
 
         assert len(captured_inputs) == 1
         assert captured_inputs[0]["location"] == "Tokyo, JP"
@@ -451,8 +442,7 @@ def test_weather_default_location_is_canonical_state_with_env_bootstrap_once_onl
         assert read_after_env_change.status_code == 200
         assert read_after_env_change.json()["default_location"] == "Portland, OR"
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="weather default")
+        post_message_and_drain(client, message="weather default")
         assert len(captured_inputs) == 1
         assert captured_inputs[0]["location"] == "Portland, OR"
 
@@ -490,9 +480,8 @@ def test_weather_without_resolvable_location_asks_clarification_instead_of_guess
         assert default_read.status_code == 200
         assert default_read.json()["default_location"] is None
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="weather missing location")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="weather missing location")
+        turn_data = _turn_data(client)
 
         message = turn_data["assistant_message"].lower()
         assert "location" in message
@@ -530,9 +519,8 @@ def test_weather_upstream_failure_is_explicit_and_recoverable(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="weather timeout")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="weather timeout")
+        turn_data = _turn_data(client)
 
         message = turn_data["assistant_message"].lower()
         assert "uncertain" in message
@@ -584,9 +572,8 @@ def test_weather_egress_fails_closed_before_execute(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="weather egress deny")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="weather egress deny")
+        turn_data = _turn_data(client)
 
         assert "egress_destination_denied" in turn_data["assistant_message"]
         assert _turn_sources(client, turn_data["id"]) == []

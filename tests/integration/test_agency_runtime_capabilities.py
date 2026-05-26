@@ -13,7 +13,7 @@ from ariel.capability_registry import (
     get_capability,
     payload_hash,
 )
-from ariel.persistence import ActionAttemptRecord, JobRecord, SessionRecord, TurnRecord
+from ariel.persistence import ActionAttemptRecord, JobRecord, TurnRecord
 
 
 NOW = datetime(2026, 5, 20, 9, 0, tzinfo=UTC)
@@ -64,7 +64,6 @@ def _seed_action_attempt(
     assert capability is not None
     attempt = ActionAttemptRecord(
         id=action_attempt_id,
-        session_id="ses_agency_reads",
         turn_id="trn_agency_reads",
         proposal_index=proposal_index,
         capability_id=capability.capability_id,
@@ -105,20 +104,8 @@ def test_agency_status_and_artifacts_execute_against_daemon_and_update_job(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_agency_reads",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_agency_reads",
-                    session_id="ses_agency_reads",
                     user_message="check agency job",
                     assistant_message=None,
                     status="in_progress",
@@ -130,7 +117,6 @@ def test_agency_status_and_artifacts_execute_against_daemon_and_update_job(
             db.add(
                 JobRecord(
                     id="job_agency_reads",
-                    session_id="ses_agency_reads",
                     turn_id="trn_agency_reads",
                     action_attempt_id=None,
                     source="agency.daemon",
@@ -168,7 +154,6 @@ def test_agency_status_and_artifacts_execute_against_daemon_and_update_job(
                 capability_id="cap.agency.status",
                 normalized_input={"job_id": "job_agency_reads"},
                 action_attempt=status_attempt,
-                session_id="ses_agency_reads",
                 turn_id="trn_agency_reads",
                 now_fn=lambda: NOW,
                 new_id_fn=lambda prefix: f"{prefix}_agency_reads",
@@ -178,7 +163,6 @@ def test_agency_status_and_artifacts_execute_against_daemon_and_update_job(
                 capability_id="cap.agency.artifacts",
                 normalized_input={"job_id": "job_agency_reads"},
                 action_attempt=artifacts_attempt,
-                session_id="ses_agency_reads",
                 turn_id="trn_agency_reads",
                 now_fn=lambda: NOW,
                 new_id_fn=lambda prefix: f"{prefix}_agency_reads",

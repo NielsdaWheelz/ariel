@@ -674,7 +674,6 @@ def test_memory_and_scheduler_signatures_name_runtime_outputs() -> None:
         "'status'",
         "'found'",
         "'not_found'",
-        "session_id",
         "turn_id",
         "taint",
     }:
@@ -923,7 +922,6 @@ def _run_one_call(
         function_call_raw=function_call_raw,
         db=db,
         session_factory=session_factory,
-        session_id="ses_1",
         turn=turn,
         approval_ttl_seconds=300,
         approval_actor_id="usr_1",
@@ -959,7 +957,6 @@ def test_process_one_call_default_denies_without_turn_scope() -> None:
 
     turn = TurnRecord(
         id="trn_1",
-        session_id="ses_1",
         user_message="quiet",
         assistant_message=None,
         status="in_progress",
@@ -1020,7 +1017,6 @@ def test_process_one_call_denies_unscoped_tools() -> None:
 
     turn = TurnRecord(
         id="trn_1",
-        session_id="ses_1",
         user_message="echo",
         assistant_message=None,
         status="in_progress",
@@ -1073,7 +1069,6 @@ def test_process_one_call_maps_expected_memory_execution_error(
     monkeypatch.setattr("ariel.action_runtime._execute_memory_capability", fail_memory)
     turn = TurnRecord(
         id="trn_1",
-        session_id="ses_1",
         user_message="search memory",
         assistant_message=None,
         status="in_progress",
@@ -1137,7 +1132,6 @@ def test_process_one_call_propagates_unexpected_memory_execution_defect(
     monkeypatch.setattr("ariel.action_runtime._execute_memory_capability", fail_memory)
     turn = TurnRecord(
         id="trn_1",
-        session_id="ses_1",
         user_message="search memory",
         assistant_message=None,
         status="in_progress",
@@ -1219,7 +1213,6 @@ def test_process_one_call_executes_attachment_read_runtime() -> None:
 
     turn = TurnRecord(
         id="trn_1",
-        session_id="ses_1",
         user_message="read the attachment",
         assistant_message=None,
         status="in_progress",

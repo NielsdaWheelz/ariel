@@ -24,7 +24,6 @@ Append-only, immutable. One row per event. No code path updates or deletes a row
 | `content` | Text, not null — the event payload |
 | `embedding` | Vector, null — pgvector, HNSW-indexed; null = pending |
 | `search_vector` | TSVECTOR — generated from `content`, GIN-indexed |
-| `session_id` | String(32), null, FK→`sessions` |
 | `turn_id` | String(32), null, FK→`turns` |
 | `taint` | trust label of the event's content |
 | `source_ref` | Text, null — pointer to the originating record |

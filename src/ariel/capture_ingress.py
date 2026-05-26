@@ -17,7 +17,6 @@ from ariel.persistence import (
     CaptureRecord,
     EventRecord,
     TurnRecord,
-    get_or_create_active_session,
 )
 
 
@@ -529,10 +528,8 @@ def record_capture(
         return CaptureRecordResult(capture=existing_capture, idempotent_replay=True)
 
     now = now_fn()
-    active_session = get_or_create_active_session(db, now=now)
     turn = TurnRecord(
         id=new_id_fn("trn"),
-        session_id=active_session.id,
         user_message=normalized_capture.normalized_turn_input,
         assistant_message=None,
         status="completed",
@@ -545,7 +542,6 @@ def record_capture(
     events = [
         EventRecord(
             id=new_id_fn("evn"),
-            session_id=active_session.id,
             turn_id=turn.id,
             sequence=1,
             event_type="evt.turn.started",
@@ -559,7 +555,6 @@ def record_capture(
         ),
         EventRecord(
             id=new_id_fn("evn"),
-            session_id=active_session.id,
             turn_id=turn.id,
             sequence=2,
             event_type="evt.turn.completed",
@@ -569,14 +564,12 @@ def record_capture(
     ]
     db.add_all(events)
 
-    active_session.updated_at = now
     capture_record = CaptureRecord(
         id=new_id_fn("cpt"),
         capture_kind=normalized_capture.kind,
         idempotency_key=idempotency_key,
         request_hash=request_hash,
         normalized_turn_input=normalized_capture.normalized_turn_input,
-        effective_session_id=active_session.id,
         turn_id=turn.id,
         created_at=now,
         updated_at=now,

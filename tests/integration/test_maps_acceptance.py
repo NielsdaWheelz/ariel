@@ -101,15 +101,9 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
+def _turn_data(client: TestClient) -> dict[str, Any]:
     """Fetch the latest turn from the events timeline."""
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -278,9 +272,8 @@ def test_maps_directions_executes_against_routes_api_with_citations(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="route to airport")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="route to airport")
+        turn_data = _turn_data(client)
 
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.maps.directions"
@@ -391,9 +384,8 @@ def test_maps_search_places_executes_against_places_api_with_metadata(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="find nearby coffee")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="find nearby coffee")
+        turn_data = _turn_data(client)
 
         attempt = _surface_attempt(turn_data)
         assert attempt["proposal"]["capability_id"] == "cap.maps.search_places"
@@ -479,9 +471,8 @@ def test_maps_search_places_enforces_radius_with_haversine_filter(
         assistant_text_by_message={"radius filtered coffee": "Nearby coffee is available [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="radius filtered coffee")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="radius filtered coffee")
+        turn_data = _turn_data(client)
 
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
@@ -521,9 +512,8 @@ def test_maps_directions_missing_required_route_fields_asks_explicit_clarificati
         },
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="missing route field")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="missing route field")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
@@ -545,9 +535,8 @@ def test_maps_search_places_missing_location_context_asks_explicit_clarification
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="missing places location")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="missing places location")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "maps_location_context_required"
@@ -582,9 +571,8 @@ def test_maps_capability_not_offered_when_api_key_missing(
         assistant_text_by_message={"maps without key": "Maps is not configured."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="maps without key")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="maps without key")
+        turn_data = _turn_data(client)
         assert turn_data["surface_action_lifecycle"] == []
         assert all(
             event["event_type"] != "evt.action.execution.started" for event in turn_data["events"]
@@ -670,9 +658,8 @@ def test_maps_provider_failures_are_typed_and_recoverable(
         assistant_text_by_message={"maps runtime failure": f"{expected_error}: {expected_hint}."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="maps runtime failure")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="maps runtime failure")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error
@@ -735,9 +722,8 @@ def test_maps_directions_retries_transient_status_before_success(
         assistant_text_by_message={"retry route": "The route is available after retry [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="retry route")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="retry route")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
 
     assert attempt["execution"]["status"] == "succeeded"
@@ -789,9 +775,8 @@ def test_maps_egress_preflight_remains_fail_closed_before_execution(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="maps egress deny")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="maps egress deny")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert "egress_destination_denied" in (attempt["execution"]["error"] or "")
@@ -833,9 +818,8 @@ def test_maps_retrieval_isolation_from_google_connector_readiness(
         assert connector_status.status_code == 200
         assert connector_status.json()["connector"]["readiness"] == "not_connected"
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="maps while google disconnected")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="maps while google disconnected")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         assert "google connector auth failure" not in turn_data["assistant_message"].lower()
@@ -895,9 +879,8 @@ def test_maps_outputs_remain_normalized_for_mixed_retrieval_turns(
         }
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="mixed retrieval")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="mixed retrieval")
+        turn_data = _turn_data(client)
         message = turn_data["assistant_message"]
         assert "[1]" in message
         assert "[2]" in message
@@ -943,9 +926,8 @@ def test_maps_directions_walking_mode_omits_traffic_routing_preference(
         assistant_text_by_message={"walk there": "The walking route is available [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="walk there")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="walk there")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         routes_body = calls[0]["json"]
@@ -985,9 +967,8 @@ def test_maps_directions_reports_uncertainty_when_no_route(
         assistant_text_by_message={"no route": "I could not find a route."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="no route")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="no route")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1041,9 +1022,8 @@ def test_maps_directions_multi_stop_routes_a_single_legged_trip(
         assistant_text_by_message={"plan my errands": "Your errand route is planned [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="plan my errands")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="plan my errands")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1119,9 +1099,8 @@ def test_maps_directions_optimize_order_reports_googles_chosen_stop_order(
         assistant_text_by_message={"best errand order": "Best errand order found [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="best errand order")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="best errand order")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         route = attempt["execution"]["output"]["routes"][0]
@@ -1197,9 +1176,8 @@ def test_maps_directions_returns_alternative_routes_for_plain_query(
         assistant_text_by_message={"route options": "Two routes are available [1][2]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="route options")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="route options")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1246,9 +1224,8 @@ def test_maps_directions_caps_alternatives_at_three_routes(
         assistant_text_by_message={"many routes": "Routes are available [1]."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="many routes")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="many routes")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1284,9 +1261,8 @@ def test_maps_search_places_reports_uncertainty_when_no_places(
         assistant_text_by_message={"no places": "I could not find nearby places."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="no places")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="no places")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "succeeded"
         output = attempt["execution"]["output"]
@@ -1319,9 +1295,8 @@ def test_maps_search_places_unresolvable_location_asks_clarification(
         },
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="vague place")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="vague place")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == "maps_location_not_found"
@@ -1370,9 +1345,8 @@ def test_maps_search_places_geocoding_and_places_leg_failures_are_typed(
         assistant_text_by_message={"geocode failure": f"maps failure: {expected_error}."},
     )
     with _build_client(postgres_url, adapter) as client:
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="geocode failure")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="geocode failure")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"
         assert attempt["execution"]["error"] == expected_error

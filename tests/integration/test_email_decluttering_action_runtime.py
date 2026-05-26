@@ -29,7 +29,6 @@ from ariel.persistence import (
     BackgroundTaskRecord,
     EventRecord,
     ProviderWriteReceiptRecord,
-    SessionRecord,
     TurnRecord,
     serialize_action_attempt,
 )
@@ -218,22 +217,10 @@ def _seed_action_attempt(
     )
     with session_factory() as db:
         with db.begin():
-            if db.get(SessionRecord, "ses_email") is None:
-                db.add(
-                    SessionRecord(
-                        id="ses_email",
-                        is_active=True,
-                        lifecycle_state="active",
-                        rotated_from_session_id=None,
-                        rotation_reason=None,
-                        created_at=NOW,
-                        updated_at=NOW,
-                    )
-                )
+            if db.get(TurnRecord, "turn_email") is None:
                 db.add(
                     TurnRecord(
                         id="turn_email",
-                        session_id="ses_email",
                         user_message="declutter email",
                         assistant_message=None,
                         status="in_progress",
@@ -244,7 +231,6 @@ def _seed_action_attempt(
             db.add(
                 ActionAttemptRecord(
                     id=action_attempt_id,
-                    session_id="ses_email",
                     turn_id="turn_email",
                     proposal_index=proposal_index,
                     capability_id=capability_id,
@@ -420,7 +406,6 @@ def test_calendar_write_actions_record_receipts_and_authority(
         "user_instruction_ref": "turn:turn_email",
         "turn_id": "turn_email",
         "action_turn_id": "turn_email",
-        "session_id": "ses_email",
     }
     assert event is not None
     assert event.payload["output"] == execution_output

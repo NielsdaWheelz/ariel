@@ -239,7 +239,6 @@ def _add_existing_research_event(
     db.add(
         EventRecord(
             id=new_id("evn"),
-            session_id=turn.session_id,
             turn_id=turn.id,
             sequence=_next_turn_event_sequence(db=db, turn_id=turn.id),
             event_type=event_type,
@@ -335,7 +334,6 @@ def run_research(
     settings: AppSettings,
     model_adapter: ModelAdapter,
     google_runtime: GoogleConnectorRuntime,
-    session_id: str,
     question: str,
     mode: ResearchMode,
     now_fn: Callable[[], datetime] | None = None,
@@ -343,8 +341,7 @@ def run_research(
 ) -> ResearchFinding:
     """Drive the read-only research loop and return a typed finding.
 
-    ``session_id`` is the active session the research ``TurnRecord`` is
-    attached to.  The loop runs ``run`` programs against the mode whitelist,
+    The loop runs ``run`` programs against the mode whitelist,
     committing after each clean program; it ends when a program calls
     ``agent.emit_finding``, when the budget/backstop/stuck-detection halts it,
     or when the model call raises.  Returns
@@ -385,7 +382,6 @@ def run_research(
     now = clock()
     turn = TurnRecord(
         id=new_id("trn"),
-        session_id=session_id,
         user_message=question,
         assistant_message=None,
         status="in_progress",
@@ -405,7 +401,6 @@ def run_research(
         db.add(
             EventRecord(
                 id=new_id("evn"),
-                session_id=session_id,
                 turn_id=turn.id,
                 sequence=sequence,
                 event_type=event_type,
@@ -476,7 +471,6 @@ def run_research(
         sandbox=sandbox,
         db=db,
         session_factory=session_factory,
-        session_id=session_id,
         turn=turn,
         settings=settings,
         model_adapter=model_adapter,

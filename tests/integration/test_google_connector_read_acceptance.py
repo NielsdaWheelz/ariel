@@ -619,14 +619,8 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
     return TestClient(app)
 
 
-def _session_id(client: TestClient) -> str:
-    active = client.get("/v1/sessions/active")
-    assert active.status_code == 200
-    return active.json()["session"]["id"]
-
-
-def _turn_data(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _turn_data(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     turns = resp.json()["turns"]
     assert turns, "no turns in timeline"
@@ -1689,7 +1683,6 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
         )
         _connect_google(client, code="connect-read-scopes")
 
-        session_id = _session_id(client)
         for message in (
             "show schedule",
             "list calendars",
@@ -1697,8 +1690,8 @@ def test_calendar_and_email_read_caps_execute_allowlisted_without_approval(
             "search inbox",
             "open inbox item",
         ):
-            post_message_and_drain(client, session_id, message=message)
-            turn_data = _turn_data(client, session_id)
+            post_message_and_drain(client, message=message)
+            turn_data = _turn_data(client)
 
             attempt = _surface_attempt(turn_data)
             assert attempt["policy"]["decision"] == "allow_inline"
@@ -1839,9 +1832,8 @@ def test_email_read_restores_same_digest_provider_evidence(
                     ]
                 )
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="open restored item")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="open restored item")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         output = attempt["execution"]["output"]
 
@@ -2006,9 +1998,8 @@ def test_calendar_list_same_digest_cancellation_marks_evidence_deleted(
                     )
                 )
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="show cancelled event")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="show cancelled event")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         output = attempt["execution"]["output"]
 
@@ -2087,9 +2078,8 @@ def test_attendee_slots_are_limited_scope_and_recoverable_without_freebusy_scope
         )
         _connect_google(client, code="connect-no-freebusy")
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="plan team sync")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="plan team sync")
+        turn_data = _turn_data(client)
 
         rendered_message = turn_data["assistant_message"].lower()
         assert "attendee" in rendered_message
@@ -2166,9 +2156,8 @@ def test_calendar_propose_slots_uses_freebusy_scope_for_all_attendees(
         )
         _connect_google(client, code="connect-freebusy")
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="plan with attendee calendars")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="plan with attendee calendars")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         output = attempt["execution"]["output"]
 
@@ -2222,9 +2211,8 @@ def test_email_read_thread_mode_executes_allowlisted_without_approval(
         )
         _connect_google(client, code="connect-thread-read")
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="open inbox thread")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="open inbox thread")
+        turn_data = _turn_data(client)
         attempt = _surface_attempt(turn_data)
         output = attempt["execution"]["output"]
 
@@ -2321,9 +2309,8 @@ def test_typed_auth_scope_failures_are_deterministic_and_recoverable(
         if connect_code is not None:
             _connect_google(client, code=connect_code)
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="read emails")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="read emails")
+        turn_data = _turn_data(client)
 
         rendered_message = turn_data["assistant_message"].lower()
         assert expected_class in rendered_message
@@ -2397,9 +2384,8 @@ def test_bearer_token_rejection_remains_token_expired(
         )
         _connect_google(client, code="connect-gmail")
 
-        session_id = _session_id(client)
-        post_message_and_drain(client, session_id, message="read emails")
-        turn_data = _turn_data(client, session_id)
+        post_message_and_drain(client, message="read emails")
+        turn_data = _turn_data(client)
 
         attempt = _surface_attempt(turn_data)
         assert attempt["execution"]["status"] == "failed"

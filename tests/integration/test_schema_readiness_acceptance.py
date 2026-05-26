@@ -72,14 +72,6 @@ def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: st
         assert "schema_issues" in health_body["error"]["details"]
         assert "missing_tables" not in health_body["error"]["details"]
 
-        active = client.get("/v1/sessions/active")
-        assert active.status_code == 503
-        active_body = active.json()
-        assert active_body["ok"] is False
-        assert active_body["error"]["code"] == "E_SCHEMA_NOT_READY"
-        assert "schema_issues" in active_body["error"]["details"]
-        assert "missing_tables" not in active_body["error"]["details"]
-
     run_migrations(unmigrated_postgres_url)
     app_with_migration = create_app(
         database_url=unmigrated_postgres_url,
@@ -88,7 +80,6 @@ def test_schema_not_ready_returns_503_until_migrated(unmigrated_postgres_url: st
     )
     with TestClient(app_with_migration) as client:
         assert client.get("/v1/health").status_code == 200
-        assert client.get("/v1/sessions/active").status_code == 200
 
 
 def test_schema_readiness_recovers_when_migrations_land_after_startup(
@@ -133,8 +124,6 @@ def test_schema_readiness_recovers_when_migrations_land_after_startup(
 
         recovered = client.get("/v1/health")
         assert recovered.status_code == 200
-
-        assert client.get("/v1/sessions/active").status_code == 200
 
 
 def test_schema_readiness_reports_missing_subscriber_heartbeat(postgres_url: str) -> None:
@@ -448,53 +437,6 @@ def test_subscriber_heartbeat_identity_migration_backfills_existing_rows(
         engine.dispose()
 
 
-def test_schema_readiness_reports_context_pressure_rotation_reason(
-    unmigrated_postgres_url: str,
-) -> None:
-    run_migrations(unmigrated_postgres_url, revision="20260522_0060")
-    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
-    try:
-        schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260525_0069" in schema_issues
-        assert "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
-        assert (
-            "forbidden_constraint_fragment:"
-            "session_rotations.ck_session_rotation_reason_type" in schema_issues
-        )
-    finally:
-        engine.dispose()
-
-
-def test_rotation_reason_schema_migration_rejects_context_pressure_rows(
-    unmigrated_postgres_url: str,
-) -> None:
-    run_migrations(unmigrated_postgres_url, revision="20260522_0060")
-    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "INSERT INTO sessions "
-                    "(id, is_active, lifecycle_state, created_at, updated_at) "
-                    "VALUES ('ses_source', false, 'closed', now(), now())"
-                )
-            )
-            connection.execute(
-                text(
-                    "INSERT INTO sessions "
-                    "(id, is_active, lifecycle_state, rotated_from_session_id, "
-                    "rotation_reason, created_at, updated_at) "
-                    "VALUES ('ses_blocked', false, 'closed', 'ses_source', "
-                    "'threshold_context_pressure', now(), now())"
-                )
-            )
-
-        with pytest.raises(RuntimeError, match="rotation rows must be repaired first"):
-            run_migrations(unmigrated_postgres_url)
-    finally:
-        engine.dispose()
-
-
 def test_schema_readiness_reports_stale_capture_ingress_schema(
     unmigrated_postgres_url: str,
 ) -> None:
@@ -502,7 +444,7 @@ def test_schema_readiness_reports_stale_capture_ingress_schema(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260525_0069" in schema_issues
+        assert "missing_alembic_head:20260526_0070" in schema_issues
         assert "unexpected_column:captures.original_payload" in schema_issues
         assert "unexpected_column:captures.terminal_state" in schema_issues
         assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues
@@ -523,11 +465,11 @@ def test_capture_schema_migration_rejects_rows_outside_durable_record_shape(
                 text(
                     "INSERT INTO captures "
                     "(id, capture_kind, idempotency_key, request_hash, original_payload, "
-                    "normalized_turn_input, effective_session_id, turn_id, terminal_state, "
+                    "normalized_turn_input, turn_id, terminal_state, "
                     "ingest_error_code, ingest_error_message, ingest_error_details, "
                     "ingest_error_retryable, status_code, response_payload, created_at, updated_at) "
                     "VALUES ('cpt_bad', 'unknown', NULL, :request_hash, '{}'::jsonb, "
-                    "NULL, NULL, NULL, 'ingest_failed', 'bad_capture', "
+                    "NULL, NULL, 'ingest_failed', 'bad_capture', "
                     "'bad capture', '{}'::jsonb, false, 422, '{}'::jsonb, now(), now())"
                 ),
                 {"request_hash": "0" * 64},
@@ -578,7 +520,6 @@ def test_capture_schema_migration_removes_raw_payload_and_dead_state(
         assert "status_code" not in columns
         assert "response_payload" not in columns
         assert columns["normalized_turn_input"] is False
-        assert columns["effective_session_id"] is False
         assert columns["turn_id"] is False
         assert constraints == {"ck_capture_kind"}
         assert schema_readiness_issues(engine) == []
@@ -593,7 +534,7 @@ def test_schema_readiness_reports_undispatched_background_task_types(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260525_0069" in schema_issues
+        assert "missing_alembic_head:20260526_0070" in schema_issues
         assert (
             "forbidden_constraint_fragment:background_tasks.ck_background_task_type"
             in schema_issues

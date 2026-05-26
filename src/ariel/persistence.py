@@ -20,7 +20,6 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
 
 from ariel.clock import utcnow
@@ -29,202 +28,20 @@ from ariel.redaction import redact_json_value, redact_text
 
 
 MEMORY_EMBEDDING_DIMENSIONS = 1536
-_ACTIVE_SESSION_LOCK_ID = 24_310_001
 
 
 def to_rfc3339(timestamp: datetime) -> str:
     return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-# Stable id of the singleton session row that owns background work without a
-# calling user session — currently the ``memory_dream`` scheduled rememberer
-# (and any future system-owned background turn). The row is seeded by the
-# ``system_session`` migration and is ``is_active=False, lifecycle_state='closed'``
-# so it never collides with the partial unique index on the user-facing active
-# session. See ``ensure_system_session`` for the defensive self-heal helper.
-SYSTEM_SESSION_ID = "ses_system"
-
-
 class Base(DeclarativeBase):
     pass
-
-
-class SessionRecord(Base):
-    __tablename__ = "sessions"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
-    rotated_from_session_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    rotation_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    turns: Mapped[list["TurnRecord"]] = relationship(back_populates="session")
-
-    __table_args__ = (
-        CheckConstraint(
-            (
-                "(rotation_reason IS NULL) OR "
-                "(rotation_reason IN ('user_initiated', 'threshold_turn_count', "
-                "'threshold_age'))"
-            ),
-            name="ck_session_rotation_reason",
-        ),
-        CheckConstraint(
-            "lifecycle_state IN ('active', 'rotating', 'closed', 'recovery_needed')",
-            name="ck_session_lifecycle_state",
-        ),
-        CheckConstraint(
-            (
-                "(is_active IS TRUE AND lifecycle_state = 'active') OR "
-                "(is_active IS FALSE AND lifecycle_state IN ('rotating', 'closed', 'recovery_needed'))"
-            ),
-            name="ck_session_lifecycle_matches_is_active",
-        ),
-        CheckConstraint(
-            (
-                "(rotation_reason IS NULL AND rotated_from_session_id IS NULL) OR "
-                "(rotation_reason IS NOT NULL AND rotated_from_session_id IS NOT NULL)"
-            ),
-            name="ck_session_rotation_fields_paired",
-        ),
-        Index(
-            "ix_single_active_session",
-            "is_active",
-            unique=True,
-            postgresql_where=(is_active.is_(True)),
-        ),
-        Index(
-            "ix_sessions_rotated_from_session_id_unique",
-            "rotated_from_session_id",
-            unique=True,
-            postgresql_where=(rotated_from_session_id.is_not(None)),
-        ),
-    )
-
-
-def ensure_system_session(db: Session, *, now: datetime) -> str:
-    """Idempotently ensure the singleton ``SYSTEM_SESSION_ID`` row exists.
-
-    The system session is seeded by the ``system_session`` migration; this
-    helper is the defensive self-heal that re-creates the row if it ever goes
-    missing (operator wipe, partial restore). Background work without a
-    calling user session — currently the ``memory_dream`` scheduled rememberer
-    — must call this before inserting any FK-owning row (turn, action_attempt,
-    event) that references the system session.
-
-    Returns ``SYSTEM_SESSION_ID``. Safe to call from inside an existing
-    transaction; uses ``ON CONFLICT DO NOTHING`` so concurrent callers race
-    safely.
-    """
-    db.execute(
-        text(
-            "INSERT INTO sessions "
-            "(id, is_active, lifecycle_state, "
-            " rotated_from_session_id, rotation_reason, "
-            " created_at, updated_at) "
-            "VALUES "
-            "(:id, FALSE, 'closed', NULL, NULL, :now, :now) "
-            "ON CONFLICT (id) DO NOTHING"
-        ),
-        {"id": SYSTEM_SESSION_ID, "now": now},
-    )
-    return SYSTEM_SESSION_ID
-
-
-def lock_active_session(db: Session) -> None:
-    bind = db.get_bind()
-    if bind is not None and bind.dialect.name == "postgresql":
-        db.execute(
-            text("SELECT pg_advisory_xact_lock(:lock_id)"),
-            {"lock_id": _ACTIVE_SESSION_LOCK_ID},
-        )
-
-
-def get_or_create_active_session(db: Session, *, now: datetime) -> SessionRecord:
-    lock_active_session(db)
-
-    active_session = db.scalar(
-        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-    )
-    if active_session is not None:
-        return active_session
-
-    with db.begin_nested():
-        created = SessionRecord(
-            id=new_id("ses"),
-            is_active=True,
-            lifecycle_state="active",
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(created)
-        try:
-            db.flush()
-            return created
-        except IntegrityError:
-            pass
-
-    active_session = db.scalar(
-        select(SessionRecord).where(SessionRecord.is_active.is_(True)).limit(1)
-    )
-    if active_session is None:
-        raise RuntimeError("failed to create or load active session")
-    return active_session
-
-
-class SessionRotationRecord(Base):
-    __tablename__ = "session_rotations"
-
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    rotated_from_session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    rotated_to_session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    reason: Mapped[str] = mapped_column(String(32), nullable=False)
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    trigger_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-
-    __table_args__ = (
-        CheckConstraint(
-            ("reason IN ('user_initiated', 'threshold_turn_count', 'threshold_age')"),
-            name="ck_session_rotation_reason_type",
-        ),
-        UniqueConstraint("rotated_to_session_id", name="uq_session_rotations_rotated_to"),
-        Index(
-            "ix_session_rotations_idempotency_key_unique",
-            "idempotency_key",
-            unique=True,
-            postgresql_where=(idempotency_key.is_not(None)),
-        ),
-    )
 
 
 class TurnRecord(Base):
     __tablename__ = "turns"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     user_message: Mapped[str] = mapped_column(Text, nullable=False)
     assistant_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -235,7 +52,6 @@ class TurnRecord(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    session: Mapped[SessionRecord] = relationship(back_populates="turns")
     events: Mapped[list["EventRecord"]] = relationship(back_populates="turn")
     action_attempts: Mapped[list["ActionAttemptRecord"]] = relationship(back_populates="turn")
 
@@ -261,12 +77,6 @@ class TurnIdempotencyRecord(Base):
     __tablename__ = "turn_idempotency_keys"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     turn_id: Mapped[str | None] = mapped_column(
@@ -291,8 +101,7 @@ class TurnIdempotencyRecord(Base):
             name="ck_turn_idempotency_has_owner",
         ),
         Index(
-            "ix_turn_idempotency_session_key_unique",
-            "session_id",
+            "ix_turn_idempotency_key_unique",
             "idempotency_key",
             unique=True,
         ),
@@ -313,12 +122,6 @@ class CaptureRecord(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     normalized_turn_input: Mapped[str] = mapped_column(Text, nullable=False)
-    effective_session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -350,12 +153,6 @@ class EventRecord(Base):
     __tablename__ = "events"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -430,12 +227,6 @@ class ActionAttemptRecord(Base):
     __tablename__ = "action_attempts"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -531,12 +322,6 @@ class ApprovalRequestRecord(Base):
         unique=True,
         index=True,
     )
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -570,12 +355,6 @@ class ArtifactRecord(Base):
     __tablename__ = "artifacts"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -640,12 +419,6 @@ class AttachmentSourceRecord(Base):
     __tablename__ = "attachment_sources"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
     turn_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -684,8 +457,7 @@ class AttachmentSourceRecord(Base):
             name="ck_attachment_source_declared_size_nonnegative",
         ),
         Index(
-            "ix_attachment_sources_session_turn_ref",
-            "session_id",
+            "ix_attachment_sources_turn_ref",
             "turn_id",
             "attachment_ref",
             unique=True,
@@ -757,11 +529,6 @@ class MemoryLogRecord(Base):
         Computed("to_tsvector('english', content)", persisted=True),
         nullable=False,
     )
-    session_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=True,
-    )
     turn_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -788,7 +555,7 @@ class MemoryLogRecord(Base):
             "search_vector",
             postgresql_using="gin",
         ),
-        Index("ix_memory_log_session_created", "session_id", "created_at"),
+        Index("ix_memory_log_created_at", "created_at"),
         Index(
             "ix_memory_log_embedding_hnsw",
             "embedding",
@@ -1597,12 +1364,6 @@ class JobRecord(Base):
     __tablename__ = "jobs"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    session_id: Mapped[str | None] = mapped_column(
-        String(32),
-        ForeignKey("sessions.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
     turn_id: Mapped[str | None] = mapped_column(
         String(32),
         ForeignKey("turns.id", ondelete="RESTRICT"),
@@ -1724,21 +1485,10 @@ class SubscriberHeartbeatRecord(Base):
     )
 
 
-def serialize_session(session: SessionRecord) -> dict[str, Any]:
-    return {
-        "id": session.id,
-        "is_active": session.is_active,
-        "lifecycle_state": session.lifecycle_state,
-        "created_at": to_rfc3339(session.created_at),
-        "updated_at": to_rfc3339(session.updated_at),
-    }
-
-
 def serialize_capture(capture: CaptureRecord) -> dict[str, Any]:
     return {
         "id": capture.id,
         "kind": capture.capture_kind,
-        "effective_session_id": capture.effective_session_id,
         "turn_id": capture.turn_id,
         "idempotency_key": capture.idempotency_key,
         "created_at": to_rfc3339(capture.created_at),
@@ -1829,7 +1579,6 @@ def serialize_agency_event(event: AgencyEventRecord) -> dict[str, Any]:
 def serialize_job(job: JobRecord) -> dict[str, Any]:
     return {
         "id": job.id,
-        "session_id": job.session_id,
         "turn_id": job.turn_id,
         "action_attempt_id": job.action_attempt_id,
         "source": job.source,
@@ -2318,7 +2067,6 @@ def serialize_turn(
     serialized_events = [serialize_event(event) for event in events]
     return {
         "id": turn.id,
-        "session_id": turn.session_id,
         "user_message": turn.user_message,
         "assistant_message": turn.assistant_message,
         "status": turn.status,

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from ariel.config import AppSettings
-from ariel.persistence import SessionRecord, TurnRecord
+from ariel.persistence import TurnRecord
 from ariel.run_runtime import (
     ScratchEntry,
     _MAX_EMITTED_FINDING_BYTES,
@@ -37,21 +37,9 @@ def _settings() -> AppSettings:
     return cast(AppSettings, cast(Any, AppSettings)(_env_file=None))
 
 
-def _turn(db: Any, *, session_id: str, turn_id: str) -> TurnRecord:
-    db.add(
-        SessionRecord(
-            id=session_id,
-            is_active=True,
-            lifecycle_state="active",
-            rotated_from_session_id=None,
-            rotation_reason=None,
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    )
+def _turn(db: Any, *, turn_id: str) -> TurnRecord:
     turn = TurnRecord(
         id=turn_id,
-        session_id=session_id,
         user_message="test",
         assistant_message=None,
         status="in_progress",
@@ -84,7 +72,6 @@ def _run(
         source=source,
         db=db,
         session_factory=session_factory,
-        session_id=turn.session_id,
         turn=turn,
         proposal_index_start=0,
         approval_ttl_seconds=300,
@@ -112,7 +99,7 @@ def test_research_finding_happy_path_sets_emitted_finding(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_ok", turn_id="trn_finding_ok")
+            turn = _turn(db, turn_id="trn_finding_ok")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -138,7 +125,7 @@ def test_research_finding_emitted_finding_is_none_on_failed_program(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_fail", turn_id="trn_finding_fail")
+            turn = _turn(db, turn_id="trn_finding_fail")
             # Program calls agent.emit_finding then raises, so program_ok=False.
             source = _VALID_FINDING_SOURCE + "raise RuntimeError('boom')\n"
             result = _run(
@@ -162,7 +149,7 @@ def test_research_finding_schema_invalid_missing_field(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_schema", turn_id="trn_finding_schema")
+            turn = _turn(db, turn_id="trn_finding_schema")
             # Missing 'sources' key.
             source = "agent.emit_finding(\n    summary='ok',\n    claims=[],\n    gaps=[],\n)\n"
             result = _run(
@@ -186,7 +173,7 @@ def test_research_finding_schema_invalid_wrong_type(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_type", turn_id="trn_finding_type")
+            turn = _turn(db, turn_id="trn_finding_type")
             source = (
                 "agent.emit_finding(\n"
                 "    summary='ok',\n"
@@ -217,7 +204,7 @@ def test_research_finding_too_large_rejected(
     big_summary = "x" * (_MAX_EMITTED_FINDING_BYTES + 1)
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_big", turn_id="trn_finding_big")
+            turn = _turn(db, turn_id="trn_finding_big")
             source = (
                 f"agent.emit_finding(\n"
                 f"    summary={big_summary!r},\n"
@@ -247,7 +234,7 @@ def test_emit_finding_rejected_in_main_agent_run(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_gate", turn_id="trn_finding_gate")
+            turn = _turn(db, turn_id="trn_finding_gate")
             result = _run(
                 sandbox=sandbox,
                 db=db,
@@ -271,7 +258,7 @@ def test_main_agent_run_emitted_finding_is_none(
     sandbox.start()
     with session_factory() as db:
         with db.begin():
-            turn = _turn(db, session_id="ses_finding_none", turn_id="trn_finding_none")
+            turn = _turn(db, turn_id="trn_finding_none")
             result = _run(
                 sandbox=sandbox,
                 db=db,

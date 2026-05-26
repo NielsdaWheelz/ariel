@@ -20,8 +20,8 @@ from tests.integration.responses_helpers import (
 )
 
 
-def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _timeline(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     return resp.json()
 
@@ -106,12 +106,11 @@ def test_model_call_backstop_exhaustion_ends_gracefully(
     monkeypatch.setenv("ARIEL_TURN_BUDGET_SECONDS_HARD", "300.0")
     adapter = RetryableFailureAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger model call backstop")
+        turn = post_message_and_drain(client, message="trigger model call backstop")
         assert turn.status == "completed"
         assert turn.assistant_message == "I wasn't able to finish that within the time available."
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         assert turn_data["status"] == "completed"
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
@@ -142,12 +141,11 @@ def test_turn_budget_exhaustion_ends_gracefully(
 
     adapter = DirectResponseAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger turn budget")
+        turn = post_message_and_drain(client, message="trigger turn budget")
         assert turn.status == "completed"
         assert turn.assistant_message == "I wasn't able to finish that within the time available."
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         assert turn_data["status"] == "completed"
         assert not any(saved_turn["status"] == "in_progress" for saved_turn in timeline["turns"])
@@ -169,12 +167,11 @@ def test_stuck_detection_ends_turn_gracefully(
 
     adapter = RepeatingRunAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger stuck detection")
+        turn = post_message_and_drain(client, message="trigger stuck detection")
         assert turn.status == "completed"
         assert turn.assistant_message == "I wasn't able to finish that within the time available."
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         assert turn_data["status"] == "completed"
         event_types = [event["event_type"] for event in turn_data["events"]]
@@ -236,12 +233,11 @@ def test_soft_budget_injects_wrap_up_nudge_and_completes_with_message(
 
     adapter = WrapUpNudgeAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="trigger soft nudge")
+        turn = post_message_and_drain(client, message="trigger soft nudge")
         assert turn.status == "completed"
         assert turn.assistant_message == "wrapping up with what i have"
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turn_data = timeline["turns"][0]
         nudge_events = [
             e for e in turn_data["events"] if e["event_type"] == "evt.agent.wrap_up_nudged"

@@ -22,7 +22,6 @@ from ariel.persistence import (
     JobEventRecord,
     JobRecord,
     ProviderWriteReceiptRecord,
-    SessionRecord,
     TurnRecord,
 )
 from ariel.worker import process_one_task
@@ -77,18 +76,8 @@ def _seed_provider_write_reconcile_task(
     task_id: str = "tsk_worker_reconcile",
     idempotency_key: str | None = "provider_write_reconcile:pwr_worker_reconcile",
 ) -> None:
-    session = SessionRecord(
-        id="ses_worker_reconcile",
-        is_active=True,
-        lifecycle_state="active",
-        rotated_from_session_id=None,
-        rotation_reason=None,
-        created_at=NOW,
-        updated_at=NOW,
-    )
     turn = TurnRecord(
         id="trn_worker_reconcile",
-        session_id=session.id,
         user_message="reconcile",
         assistant_message=None,
         status="completed",
@@ -99,7 +88,6 @@ def _seed_provider_write_reconcile_task(
     )
     action_attempt = ActionAttemptRecord(
         id="act_worker_reconcile",
-        session_id=session.id,
         turn_id=turn.id,
         proposal_index=1,
         capability_id="cap.calendar.update_event",
@@ -138,7 +126,7 @@ def _seed_provider_write_reconcile_task(
         created_at=NOW,
         updated_at=NOW,
     )
-    db.add_all([session, turn, action_attempt])
+    db.add_all([turn, action_attempt])
     db.flush()
     db.add(receipt)
     db.flush()
@@ -422,7 +410,6 @@ def test_agency_event_received_missing_job_id_fails_event_and_retries_task(
 def _seed_pending_approval(
     db: Session,
     *,
-    session_id: str,
     turn_id: str,
     action_attempt_id: str,
     approval_id: str,
@@ -439,7 +426,6 @@ def _seed_pending_approval(
     db.add(
         ActionAttemptRecord(
             id=action_attempt_id,
-            session_id=session_id,
             turn_id=turn_id,
             proposal_index=proposal_index,
             capability_id=capability.capability_id,
@@ -467,7 +453,6 @@ def _seed_pending_approval(
         ApprovalRequestRecord(
             id=approval_id,
             action_attempt_id=action_attempt_id,
-            session_id=session_id,
             turn_id=turn_id,
             actor_id="user:smoke",
             status="pending",
@@ -492,20 +477,8 @@ def test_expire_approvals_task_expires_pending_once_and_rearms(
     with session_factory() as db:
         with db.begin():
             db.add(
-                SessionRecord(
-                    id="ses_expiry",
-                    is_active=True,
-                    lifecycle_state="active",
-                    rotated_from_session_id=None,
-                    rotation_reason=None,
-                    created_at=NOW,
-                    updated_at=NOW,
-                )
-            )
-            db.add(
                 TurnRecord(
                     id="trn_expiry",
-                    session_id="ses_expiry",
                     user_message="approval expiry smoke",
                     assistant_message=None,
                     status="in_progress",
@@ -515,7 +488,6 @@ def test_expire_approvals_task_expires_pending_once_and_rearms(
             )
             _seed_pending_approval(
                 db,
-                session_id="ses_expiry",
                 turn_id="trn_expiry",
                 action_attempt_id="aat_expired",
                 approval_id="apr_expired",
@@ -524,7 +496,6 @@ def test_expire_approvals_task_expires_pending_once_and_rearms(
             )
             _seed_pending_approval(
                 db,
-                session_id="ses_expiry",
                 turn_id="trn_expiry",
                 action_attempt_id="aat_pending",
                 approval_id="apr_pending",

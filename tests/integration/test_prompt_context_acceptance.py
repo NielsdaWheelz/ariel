@@ -18,8 +18,8 @@ from tests.integration.responses_helpers import (
 )
 
 
-def _timeline(client: TestClient, session_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{session_id}/events")
+def _timeline(client: TestClient) -> dict[str, Any]:
+    resp = client.get("/v1/events")
     assert resp.status_code == 200
     return resp.json()
 
@@ -62,19 +62,15 @@ def _build_client(postgres_url: str, adapter: ModelAdapter) -> TestClient:
 def test_model_led_direct_and_clarification_messages_are_emitted(postgres_url: str) -> None:
     adapter = PromptContextAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-
-        clear_turn = post_message_and_drain(
-            client, session_id, message="summarize this in one line"
-        )
+        clear_turn = post_message_and_drain(client, message="summarize this in one line")
         assert clear_turn.assistant_message is not None
         assert clear_turn.assistant_message.startswith("direct::")
 
-        ambiguous_turn = post_message_and_drain(client, session_id, message="book me travel")
+        ambiguous_turn = post_message_and_drain(client, message="book me travel")
         assert ambiguous_turn.assistant_message is not None
         assert "destination and travel dates" in ambiguous_turn.assistant_message
 
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         event_types_by_turn = [
             [event["event_type"] for event in turn["events"]] for turn in timeline["turns"]
         ]
@@ -93,12 +89,10 @@ def test_turn_context_section_order_and_audit_metadata(
     adapter = PromptContextAdapter()
 
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
+        post_message_and_drain(client, message="first turn")
+        post_message_and_drain(client, message="second turn")
 
-        post_message_and_drain(client, session_id, message="first turn")
-        post_message_and_drain(client, session_id, message="second turn")
-
-        timeline = _timeline(client, session_id)
+        timeline = _timeline(client)
         turns = timeline["turns"]
         assert len(turns) == 2
 

@@ -17,7 +17,6 @@ def _attempt(
 ) -> ActionAttemptRecord:
     return ActionAttemptRecord(
         id="aat_test_1",
-        session_id="ses_test",
         turn_id="trn_test",
         proposal_index=1,
         capability_id="cap.memory.search",

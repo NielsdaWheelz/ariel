@@ -136,14 +136,13 @@ def test_main_loop_emit_finding_misuse_recovers_with_typed_nudge(
 ) -> None:
     adapter = _FindingThenMessageAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="answer this")
+        turn = post_message_and_drain(client, message="answer this")
 
         assert turn.status == "completed"
         assert turn.assistant_message == "Hello, here is the answer."
         assert adapter.main_call_count == 2
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+        timeline = client.get("/v1/events").json()
         events = timeline["turns"][0]["events"]
         event_types = [event["event_type"] for event in events]
         assert "evt.run.validation_failed" in event_types
@@ -209,14 +208,13 @@ def test_main_loop_emit_done_misuse_recovers_with_typed_nudge(
 ) -> None:
     adapter = _DoneThenMessageAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="answer this")
+        turn = post_message_and_drain(client, message="answer this")
 
         assert turn.status == "completed"
         assert turn.assistant_message == "Hello, here is the answer."
         assert adapter.main_call_count == 2
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+        timeline = client.get("/v1/events").json()
         events = timeline["turns"][0]["events"]
         event_types = [event["event_type"] for event in events]
         assert "evt.run.validation_failed" in event_types
@@ -294,8 +292,7 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
 
     adapter = _WhitespaceVariantFindingAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="answer this")
+        turn = post_message_and_drain(client, message="answer this")
 
         # The loop halted gracefully (not a failed turn) before consuming
         # all three whitespace variants — the semantic stuck rail trips on
@@ -303,7 +300,7 @@ def test_main_loop_semantic_stuck_rail_halts_on_repeated_program_errors(
         assert turn.status == "completed"
         assert adapter.main_call_count <= 3
 
-        timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+        timeline = client.get("/v1/events").json()
         turn_data = timeline["turns"][0]
         event_types = [event["event_type"] for event in turn_data["events"]]
         assert "evt.run.validation_failed" in event_types
@@ -375,8 +372,7 @@ def test_main_loop_budget_exhaustion_uses_canned_line_without_summary_call(
 
     adapter = _BudgetExhaustedAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="check my calendar")
+        turn = post_message_and_drain(client, message="check my calendar")
 
         assert turn.status == "completed"
         assert turn.assistant_message == ("I wasn't able to finish that within the time available.")
@@ -444,7 +440,6 @@ def _seed_memory_log_hit(postgres_url: str, snippet: str) -> None:
                     kind="user_message",
                     content=snippet,
                     embedding=None,
-                    session_id=None,
                     turn_id=None,
                     taint="clean",
                     source_ref=None,
@@ -466,8 +461,7 @@ def test_emit_value_carries_read_facts_to_next_round_context(
     adapter = _SyscallThenMessageAdapter()
     with _build_client(postgres_url, adapter) as client:
         _seed_memory_log_hit(postgres_url, _DISTINCTIVE_SNIPPET)
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="what's on my career meeting?")
+        turn = post_message_and_drain(client, message="what's on my career meeting?")
 
     assert turn.status == "completed"
     assert adapter.main_call_count == 2
@@ -583,10 +577,8 @@ def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a
 
     adapter = _PrematureSynthesisAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(
             client,
-            session_id,
             message="given my notes, what's the most important thing for me today?",
         )
 
@@ -600,7 +592,7 @@ def test_main_loop_premature_synthesis_rail_drops_round_one_message_and_forces_a
 
     # The premature-synthesis rail event was emitted with the expected payload
     # (rejected message length and the read capability_id that triggered it).
-    timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+    timeline = client.get("/v1/events").json()
     events = timeline["turns"][0]["events"]
     rejection_events = [
         event for event in events if event["event_type"] == "evt.agent.premature_synthesis_rejected"
@@ -652,14 +644,13 @@ def test_main_loop_pure_emit_message_round_one_is_not_dropped(
 
     adapter = _GreetingOnlyAdapter()
     with _build_client(postgres_url, adapter) as client:
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(client, session_id, message="hi")
+        turn = post_message_and_drain(client, message="hi")
 
     assert turn.status == "completed"
     assert adapter.main_call_count == 1
     assert turn.assistant_message == adapter.greeting_text
 
-    timeline = client.get(f"/v1/sessions/{session_id}/events").json()
+    timeline = client.get("/v1/events").json()
     event_types = [event["event_type"] for event in timeline["turns"][0]["events"]]
     assert "evt.agent.premature_synthesis_rejected" not in event_types
 
@@ -725,10 +716,7 @@ def test_failed_program_preserves_action_attempt_status_without_output_echo(
     adapter = _SearchThenRaiseAdapter()
     with _build_client(postgres_url, adapter) as client:
         _seed_memory_log_hit(postgres_url, _FAILED_PROGRAM_DISTINCTIVE_SNIPPET)
-        session_id = client.get("/v1/sessions/active").json()["session"]["id"]
-        turn = post_message_and_drain(
-            client, session_id, message="what's in my term sheet revision?"
-        )
+        turn = post_message_and_drain(client, message="what's in my term sheet revision?")
 
     assert turn.status == "completed"
     assert adapter.main_call_count == 2
