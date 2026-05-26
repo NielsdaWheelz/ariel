@@ -15,6 +15,7 @@ dependencies = [
   "fastapi>=0.115.11",
   "google-cloud-pubsub>=2.38",
   "httpx>=0.28.1",
+  "json-repair>=0.30",
   "pydantic-settings>=2.8.1",
   "psycopg[binary]>=3.2.6",
   "pgvector>=0.3.6",

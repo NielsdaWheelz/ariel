@@ -157,6 +157,39 @@ def test_call_raises_contract_violation_on_malformed_tool_args() -> None:
         asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
 
 
+def test_call_repairs_tool_args_with_raw_newline_inside_string() -> None:
+    # The gpt-5.5 failure mode: a JSON object whose string value contains a
+    # raw newline byte instead of an escaped \\n. json.loads rejects it;
+    # json_repair recovers it as a dict.
+    malformed = '{"source": "line1\nline2"}'
+
+    def fn(_msgs: list[ModelMessage], _info: AgentInfo) -> PydAIModelResponse:
+        return PydAIModelResponse(
+            parts=[ToolCallPart(tool_name="run", args=malformed, tool_call_id="c1")]
+        )
+
+    adapter = _adapter_with(FunctionModel(fn))
+    response = asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
+
+    assert response.tool_calls[0].arguments == {"source": "line1\nline2"}
+
+
+def test_call_raises_contract_violation_when_repair_returns_non_dict() -> None:
+    # json_repair returns a list for inputs like "{not-json" — the adapter
+    # must still raise so the agent loop's failure path engages.
+    def fn(_msgs: list[ModelMessage], _info: AgentInfo) -> PydAIModelResponse:
+        return PydAIModelResponse(
+            parts=[ToolCallPart(tool_name="lookup", args="{not-json", tool_call_id="c1")]
+        )
+
+    adapter = _adapter_with(FunctionModel(fn))
+    with pytest.raises(ResponseContractViolation) as excinfo:
+        asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
+    assert excinfo.value.contract == "model_tool_call_arguments"
+    assert excinfo.value.errors[0]["repair_attempted"] is True
+    assert "repair_result_type" in excinfo.value.errors[0]
+
+
 def test_call_validates_structured_output() -> None:
     def fn(_msgs: list[ModelMessage], _info: AgentInfo) -> PydAIModelResponse:
         return PydAIModelResponse(

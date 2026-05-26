@@ -24,7 +24,7 @@ class ModelRef(BaseModel):
 
 
 # Conversational loop: strong default for tool-heavy assistant turns.
-MAIN: Final[ModelRef] = ModelRef(provider="openrouter", model="openai/gpt-5.5")
+MAIN: Final[ModelRef] = ModelRef(provider="openrouter", model="anthropic/claude-sonnet-4.6")
 
 # Read-only research loop: high-volume investigation with a cheaper reasoning model.
 RESEARCH: Final[ModelRef] = ModelRef(provider="openrouter", model="deepseek/deepseek-v3.2")

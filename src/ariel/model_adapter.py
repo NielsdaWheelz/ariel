@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any, Literal
 
+import json_repair
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic_ai.embeddings.base import EmbeddingModel
 from pydantic_ai.embeddings.openai import OpenAIEmbeddingModel
@@ -29,6 +31,42 @@ from pydantic_ai.tools import ToolDefinition
 from .config import AppSettings
 from .models import EMBEDDING, ModelRef
 from .response_contracts import ResponseContractViolation
+
+_log = logging.getLogger(__name__)
+
+
+def _repair_tool_args(
+    *,
+    args: str,
+    tool_name: str,
+    decode_exc: json.JSONDecodeError,
+) -> dict[str, Any]:
+    base_error: dict[str, Any] = {
+        "tool": tool_name,
+        "error": str(decode_exc),
+        "raw_args": args[:2000],
+        "raw_args_length": len(args),
+        "repair_attempted": True,
+    }
+    try:
+        repaired = json_repair.loads(args)
+    except Exception as repair_exc:
+        raise ResponseContractViolation(
+            contract="model_tool_call_arguments",
+            errors=[{**base_error, "repair_error": str(repair_exc)}],
+        ) from decode_exc
+    if not isinstance(repaired, dict):
+        raise ResponseContractViolation(
+            contract="model_tool_call_arguments",
+            errors=[{**base_error, "repair_result_type": type(repaired).__name__}],
+        ) from decode_exc
+    _log.warning(
+        "repaired malformed tool args (tool=%s, raw_args_length=%d, decode_error=%s)",
+        tool_name,
+        len(args),
+        decode_exc,
+    )
+    return repaired
 
 
 class ToolSpec(BaseModel):
@@ -241,17 +279,11 @@ class ModelAdapter:
                     try:
                         parsed_args: dict[str, Any] = json.loads(args)
                     except json.JSONDecodeError as exc:
-                        raise ResponseContractViolation(
-                            contract="model_tool_call_arguments",
-                            errors=[
-                                {
-                                    "tool": part.tool_name,
-                                    "error": str(exc),
-                                    "raw_args": args[:2000],
-                                    "raw_args_length": len(args),
-                                }
-                            ],
-                        ) from exc
+                        parsed_args = _repair_tool_args(
+                            args=args,
+                            tool_name=part.tool_name,
+                            decode_exc=exc,
+                        )
                 elif args is None:
                     parsed_args = {}
                 else:
