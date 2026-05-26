@@ -1525,7 +1525,10 @@ class DefaultGoogleWorkspaceProvider:
         body_digests: list[str] = []
         truncated = False
         for normalized in normalized_messages:
-            body_digests.append(normalized.body.body_digest)
+            # Skip messages with no extractable body — the thread-level digest
+            # is computed only from messages that have body content.
+            if normalized.body.body_digest is not None:
+                body_digests.append(normalized.body.body_digest)
             decode_notes.extend(normalized.body.decode_notes)
             truncated = truncated or normalized.body.truncated
             for block in normalized.body.blocks:
@@ -1538,7 +1541,11 @@ class DefaultGoogleWorkspaceProvider:
                     break
             if len(blocks) >= _MAX_GMAIL_EVIDENCE_BLOCKS:
                 break
-        body_digest = hashlib.sha256("|".join(body_digests).encode("utf-8")).hexdigest()
+        body_digest = (
+            hashlib.sha256("|".join(body_digests).encode("utf-8")).hexdigest()
+            if body_digests
+            else None
+        )
         return {
             "schema_version": "google.gmail.message_evidence.v1",
             "mode": mode,
@@ -4215,6 +4222,7 @@ def _gmail_evidence_blocks_are_valid(blocks: Any) -> bool:
 
 
 def _is_google_gmail_message_evidence_output(payload: dict[str, Any]) -> bool:
+    # See: docs/modules/gmail-evidence-schema.md for the typed-output contract.
     if payload.get("schema_version") != "google.gmail.message_evidence.v1" or "results" in payload:
         return False
     if not _has_only_keys(

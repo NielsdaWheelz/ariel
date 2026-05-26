@@ -220,7 +220,8 @@ final behavior:
     ids, thread ids, bounded preview, provider URL, and `evidence_status`.
   - `email_read` returns `google.gmail.message_evidence.v1`: bounded message
     metadata, evidence blocks, body digest, HTML security diagnostics, and
-    `read_outcome`.
+    `read_outcome`. See [gmail-evidence-schema.md](gmail-evidence-schema.md) for
+    the typed-output contract.
   - Calendar list and slot proposal paths are bounded but not connected to
     commitment state.
 - `src/ariel/action_runtime.py`

@@ -2070,3 +2070,87 @@ def test_gmail_sync_invalid_cursor_fails_closed_without_provider_call(
             assert run.status == "failed"
             assert run.error == "gmail_sync_cursor_invalid"
             assert run.cursor_before == "hist-expired"
+
+
+def test_gmail_sync_skips_invalid_typed_output_without_crashing_batch(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_id = "msg-bad"
+    message_ids = ("msg-good-1", bad_id, "msg-good-2")
+
+    class FakeMixedValidityGmailProvider:
+        def email_list_history(self, **_: Any) -> dict[str, Any]:
+            return {
+                "historyId": "hist-2",
+                "history": [
+                    {
+                        "id": "history-mixed",
+                        "messagesAdded": [
+                            {
+                                "message": {
+                                    "id": mid,
+                                    "threadId": f"thr-{mid}",
+                                    "labelIds": ["INBOX"],
+                                }
+                            }
+                            for mid in message_ids
+                        ],
+                    }
+                ],
+            }
+
+        def email_read(self, *, normalized_input: dict[str, Any], **_: Any) -> dict[str, Any]:
+            message_id = normalized_input["message_id"]
+            output = gmail_message_read_output(
+                message_id=message_id,
+                thread_id=f"thr-{message_id}",
+                published_at="2026-05-07T12:00:00Z",
+            )
+            if message_id == bad_id:
+                # Validator rejects: status="no_body" forbids a non-None body_digest.
+                output["read_outcome"] = {
+                    "status": "no_body",
+                    "reason_code": "gmail_message_unavailable",
+                    "recovery": None,
+                }
+            return output
+
+    class FakeGoogleConnectorRuntime:
+        def __init__(self, **_: Any) -> None:
+            self.workspace_provider = FakeMixedValidityGmailProvider()
+
+        def access_token_for_background_sync(self, **_: Any) -> str:
+            return "access-token"
+
+    monkeypatch.setattr("ariel.sync_runtime.GoogleConnectorRuntime", FakeGoogleConnectorRuntime)
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    new_id = IdFactory()
+    _seed_google_connector(session_factory, now=now)
+    _seed_sync_cursor(
+        session_factory,
+        new_id,
+        resource_type="gmail",
+        resource_id="primary",
+        cursor_value="hist-1",
+        now=now,
+    )
+
+    process_provider_sync_due(
+        session_factory=session_factory,
+        task_payload={"provider": "google", "resource_type": "gmail", "resource_id": "primary"},
+        settings=_settings(),
+        now_fn=lambda: now,
+        new_id_fn=new_id,
+    )
+
+    with session_factory() as db:
+        run = db.scalar(select(SyncRunRecord).limit(1))
+        tasks = db.scalars(select(BackgroundTaskRecord)).all()
+
+    assert run is not None and run.status == "succeeded" and run.error is None
+    assert [task.task_type for task in tasks] == ["agent_wake"]
+    items = tasks[0].payload["items"]
+    assert {item["message_id"] for item in items} == {"msg-good-1", "msg-good-2"}
+    for item in items:
+        assert item["evidence_blocks"][0]["text"] == "Thanks, I will follow up by Friday."

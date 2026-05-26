@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+from ariel.google_connector import DefaultGoogleWorkspaceProvider, is_typed_google_read_output
 from ariel.google_workspace_normalization import (
     normalize_calendar_event,
     normalize_gmail_message,
@@ -149,6 +150,44 @@ def test_gmail_html_nested_hidden_content_stays_omitted_after_inner_close() -> N
     assert "nested hidden tag" not in normalized.body.text
     assert normalized.body.html_security["hidden_text_count"] == 4
     assert normalized.body.html_security["conversion_notes"] == ["hidden_html_text_omitted"]
+
+
+def test_gmail_html_font_size_zero_wrapper_does_not_hide_inner_content() -> None:
+    payload = {
+        "id": "msg_mjml",
+        "threadId": "thread_mjml",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}],
+            "body": {
+                "data": _b64url(
+                    b"<td style='font-size:0px; padding: 0;'>"
+                    b"<p style='font-size:14px'>Visible content</p></td>"
+                )
+            },
+        },
+    }
+
+    normalized = normalize_gmail_message(payload, provider_account_id="acct_1")
+
+    assert "Visible content" in normalized.body.text
+    assert normalized.body.html_security["hidden_text_count"] == 0
+    assert isinstance(normalized.body.body_digest, str) and normalized.body.body_digest
+
+
+def test_gmail_html_display_none_still_hides_content() -> None:
+    payload = {
+        "id": "msg_dn",
+        "threadId": "thread_dn",
+        "payload": {
+            "mimeType": "text/html",
+            "headers": [{"name": "Content-Type", "value": "text/html; charset=utf-8"}],
+            "body": {"data": _b64url(b"<p>Shown</p><div style='display:none'>secret</div>")},
+        },
+    }
+    normalized = normalize_gmail_message(payload, provider_account_id="acct_1")
+    assert "secret" not in normalized.body.text
+    assert normalized.body.html_security["hidden_text_count"] >= 1
 
 
 def test_gmail_html_hidden_content_ignores_unmatched_inner_close() -> None:
@@ -355,3 +394,28 @@ def test_calendar_event_normalization_preserves_typed_event_fields() -> None:
     assert normalized.provider_url == "https://calendar.google.com/event?eid=evt_1"
     assert normalized.etag == '"etag_1"'
     assert len(normalized.raw_payload_digest) == 64
+
+
+def test_gmail_no_body_payload_passes_evidence_validator_with_none_digest() -> None:
+    payload = {
+        "id": "msg_no_body",
+        "threadId": "thread_no_body",
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [{"name": "Subject", "value": "Empty"}],
+            "body": {"size": 0},
+        },
+    }
+
+    normalized = normalize_gmail_message(payload, provider_account_id="acct_1")
+    assert normalized.body.body_digest is None
+    assert normalized.body.blocks == ()
+
+    evidence_payload = DefaultGoogleWorkspaceProvider()._gmail_message_evidence_output(
+        normalized=normalized,
+        payload=payload,
+        mode="message",
+    )
+    assert is_typed_google_read_output(capability_id="cap.email.read", payload=evidence_payload)
+    assert evidence_payload["read_outcome"]["status"] == "no_body"
+    assert evidence_payload["evidence"]["body_digest"] is None

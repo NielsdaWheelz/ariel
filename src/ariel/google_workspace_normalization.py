@@ -104,7 +104,9 @@ class NormalizedGmailBody:
     html_security: dict[str, Any]
     blocks: tuple[NormalizedTextBlock, ...]
     truncated: bool
-    body_digest: str
+    # None ⇔ no extractable body — pairs with read_outcome.status != "ok" per
+    # the google.gmail.message_evidence.v1 invariant.
+    body_digest: str | None
     decode_notes: tuple[str, ...]
 
 
@@ -480,7 +482,7 @@ def _normalize_gmail_body(
             html_security=html_security,
             blocks=blocks,
             truncated=truncated,
-            body_digest=_text_digest(preferred_text),
+            body_digest=_text_digest(preferred_text) if preferred_text else None,
             decode_notes=tuple(notes),
         ),
         attachments,
@@ -633,9 +635,10 @@ def _html_attrs_hidden(attrs: dict[str, str | None]) -> bool:
     if not isinstance(style, str):
         return False
     normalized = style.replace(" ", "").lower()
+    # font-size:0 is a layout/whitespace hack in MJML-style email templates, not
+    # a hide-content marker — children with their own font-size render normally.
     return any(
-        marker in normalized
-        for marker in ("display:none", "visibility:hidden", "opacity:0", "font-size:0")
+        marker in normalized for marker in ("display:none", "visibility:hidden", "opacity:0")
     )
 
 

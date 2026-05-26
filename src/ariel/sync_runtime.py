@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import logging
 from typing import Any, cast
 
 from sqlalchemy import select, text
@@ -39,6 +40,8 @@ from ariel.provider_evidence_lifecycle import (
     record_deleted_evidence,
     record_unavailable_evidence,
 )
+
+_log = logging.getLogger(__name__)
 
 _CALENDAR_SYNC_PAGE_SIZE = 10
 _PROVIDER_SYNC_WAKE_MAX_ITEMS = 8
@@ -554,8 +557,17 @@ def process_provider_sync_due(
                                         "retrieved_at": to_rfc3339(now_fn()),
                                         "status": "succeeded",
                                     }
+                                # If the typed-output validator rejects, skip
+                                # this one message instead of poisoning the
+                                # whole batch. Downstream gmail_read_outputs.get
+                                # returns None for skipped messages, degrading
+                                # the wake to metadata-only.
                                 if not _gmail_sync_read_output_valid(read_output):
-                                    raise RuntimeError("gmail_sync_read_output_invalid")
+                                    _log.warning(
+                                        "gmail_sync_read_output_invalid skipping message_id=%s",
+                                        message_id,
+                                    )
+                                    continue
                                 gmail_read_outputs[message_id] = read_output
         except GoogleProviderRequestFailure as exc:
             _mark_sync_failed(
