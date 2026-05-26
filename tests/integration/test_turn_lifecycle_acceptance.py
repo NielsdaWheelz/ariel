@@ -159,28 +159,31 @@ def test_model_timeline_includes_identity_duration_and_usage(postgres_url: str) 
         assert payload["usage"]["total_tokens"] == 18
 
 
-def test_model_failure_is_auditable_and_turn_terminates_failed(postgres_url: str) -> None:
+def test_model_failure_is_auditable_and_user_message_falls_back(postgres_url: str) -> None:
     adapter = DeterministicModelAdapter(fail=True)
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(client, session_id, message="this should fail")
-        assert turn.status == "failed"
+        # User-message wakes fall back to a polite reply on model failure so the
+        # user sees something instead of silence; the model failure is still
+        # auditable via evt.model.failed.
+        assert turn.status == "completed"
+        assert turn.assistant_message == "I wasn't able to complete that request. Please try again."
 
         timeline = _timeline(client, session_id)
         turns = timeline["turns"]
         assert len(turns) == 1
         turn_data = turns[0]
-        assert turn_data["status"] == "failed"
+        assert turn_data["status"] == "completed"
         event_types = [event["event_type"] for event in turn_data["events"]]
-        # Retriever runs first (succeeds, emitting its model events); then the
-        # main agent call fails with the simulated provider failure.
         assert event_types == [
             "evt.turn.started",
             "evt.model.started",  # retriever
             "evt.model.completed",  # retriever
             "evt.model.started",  # main agent
             "evt.model.failed",  # main agent
-            "evt.turn.failed",
+            "evt.assistant.emitted",
+            "evt.turn.completed",
         ]
         model_failed = next(
             event for event in turn_data["events"] if event["event_type"] == "evt.model.failed"
@@ -258,7 +261,7 @@ def test_model_failure_reason_preserves_non_secret_detail(postgres_url: str) -> 
     with _build_client(postgres_url, adapter) as client:
         session_id = client.get("/v1/sessions/active").json()["session"]["id"]
         turn = post_message_and_drain(client, session_id, message="trigger non-secret failure")
-        assert turn.status == "failed"
+        assert turn.status == "completed"
 
         timeline = _timeline(client, session_id)
         events = timeline["turns"][0]["events"]

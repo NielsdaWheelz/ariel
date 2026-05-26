@@ -65,6 +65,7 @@ from .model_adapter import (
 )
 from .models import ModelRef
 from .persistence import ActionAttemptRecord, TurnRecord
+from .response_contracts import ResponseContractViolation
 from .run_runtime import (
     ScratchEntry,
     execute_run_program,
@@ -378,16 +379,18 @@ def run_agent_loop(
         except Exception as exc:
             duration_ms = int((time.perf_counter() - model_started_at) * 1000)
             should_retry = cfg.retry_on_model_error and bool(getattr(exc, "retryable", False))
-            add_event(
-                "evt.model.failed",
-                {
-                    "provider": cfg.model_ref.provider,
-                    "model": cfg.model_ref.model,
-                    "duration_ms": duration_ms,
-                    "failure_reason": getattr(exc, "safe_reason", str(exc)),
-                    "model_call_count": model_call_count,
-                },
-            )
+            model_failed_payload: dict[str, Any] = {
+                "provider": cfg.model_ref.provider,
+                "model": cfg.model_ref.model,
+                "duration_ms": duration_ms,
+                "failure_reason": getattr(exc, "safe_reason", str(exc)),
+                "model_call_count": model_call_count,
+            }
+            if isinstance(exc, ResponseContractViolation):
+                model_failed_payload["failure_code"] = exc.contract
+                model_failed_payload["validation_status"] = "invalid"
+                model_failed_payload["validation_errors"] = exc.errors
+            add_event("evt.model.failed", model_failed_payload)
             if should_retry:
                 continue
             return LoopResult(

@@ -243,7 +243,14 @@ class ModelAdapter:
                     except json.JSONDecodeError as exc:
                         raise ResponseContractViolation(
                             contract="model_tool_call_arguments",
-                            errors=[{"tool": part.tool_name, "error": str(exc)}],
+                            errors=[
+                                {
+                                    "tool": part.tool_name,
+                                    "error": str(exc),
+                                    "raw_args": args[:2000],
+                                    "raw_args_length": len(args),
+                                }
+                            ],
                         ) from exc
                 elif args is None:
                     parsed_args = {}

@@ -239,6 +239,7 @@ class SurfaceEventModelFailedPayloadContract(BaseModel):
     usage: SurfaceModelUsageContract | None = None
     provider_response_id: str | None = None
     response_output_shape: dict[str, Any] | None = None
+    validation_errors: list[dict[str, Any]] | None = None
 
 
 class SurfaceEventModelProtocolFailedPayloadContract(BaseModel):

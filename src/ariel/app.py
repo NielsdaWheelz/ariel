@@ -1612,6 +1612,12 @@ def _wake(
             }
         case "budget_exhausted" | "finding" | "operations":
             assistant_response = exhausted_response
+        case "model_failed" if wake_context.trigger_kind == "user_message":
+            assistant_response = {
+                **exhausted_response,
+                "assistant_text": "I wasn't able to complete that request. Please try again.",
+                "assistant_silent": False,
+            }
         case "model_failed":
             model_failure = ApiError(
                 status_code=502,
