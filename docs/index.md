@@ -40,6 +40,8 @@ This directory is the canonical home for repository documentation.
   OpenClaw-class parity, Claw-variant lessons, and personal-agent SOTA roadmap
 - [north-star-cutover.md](north-star-cutover.md): single-`run`,
   Agency-centered product architecture
+- [conversational-continuity-cutover.md](conversational-continuity-cutover.md):
+  events-window block, budget reformulation, session abolition
 - [cleanliness.md](cleanliness.md): remove dead code, compatibility paths,
   duplicate owners, and unearned abstractions
 - [simplicity.md](simplicity.md): fewer code paths, no speculative surface

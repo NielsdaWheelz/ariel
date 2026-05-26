@@ -81,6 +81,9 @@ directly; do not put it in `/etc/ariel/ariel.env`.
 | `ARIEL_RESEARCH_RUN_BUDGET_SECONDS` | no | Research runtime | Research run timeout test or bounded manual research check. |
 | `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` | no | Agent loop | Backstop exhaustion test completes gracefully. |
 | `ARIEL_AGENT_LOOP_LIVE_ROUNDS` | no | Agent loop | Prompt-context tests verify live window behavior. |
+| `ARIEL_RECENT_EVENTS_TOKEN_BUDGET` | no | Conversational continuity | Recent-events block render test stays under budget. |
+| `ARIEL_RECENT_EVENTS_MAX_ROWS` | no | Conversational continuity | Recent-events query respects row cap. |
+| `ARIEL_RECENT_EVENT_PAYLOAD_BYTE_CAP` | no | Conversational continuity | Oversize payloads compact to canonical IDs. |
 | `ARIEL_AUTO_ROTATE_MAX_TURNS` | no | Session rotation | Rotation threshold acceptance test or manual forced threshold. |
 | `ARIEL_AUTO_ROTATE_MAX_AGE_SECONDS` | no | Session rotation | Rotation age acceptance test or manual forced threshold. |
 | `ARIEL_APPROVAL_TTL_SECONDS` | no | Approval runtime | Pending approval expiry test rejects stale approval execution. |
@@ -201,6 +204,9 @@ the owning feature still needs its own live smoke row.
 | `ARIEL_AGENCY_TIMEOUT_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |
 | `ARIEL_AGENT_LOOP_LIVE_ROUNDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
 | `ARIEL_AGENT_LOOP_MAX_MODEL_CALLS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_RECENT_EVENT_PAYLOAD_BYTE_CAP` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_RECENT_EVENTS_MAX_ROWS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
+| `ARIEL_RECENT_EVENTS_TOKEN_BUDGET` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: unset, so the code default applies. |
 | `ARIEL_ANTHROPIC_API_KEY` | `passed` | `not_enabled` | Validator/inventory guards track this supported provider key; current default model refs do not use Anthropic. |
 | `ARIEL_APPROVAL_ACTOR_ID` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |
 | `ARIEL_APPROVAL_TTL_SECONDS` | `passed` | `partial` | Validator/inventory guards track this key; redacted current env load: present. |

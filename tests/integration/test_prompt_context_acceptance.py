@@ -115,6 +115,7 @@ def test_turn_context_section_order_and_audit_metadata(
             assert context_meta["section_order"] == [
                 "policy_system_instructions",
                 "recall_v1",
+                "recent_events",
                 "open_commitments_and_jobs",
                 "relevant_artifacts_and_observations",
             ]

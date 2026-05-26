@@ -141,6 +141,9 @@ class AppSettings(BaseSettings):
     memory_dream_interval_seconds: float = 86400.0
     agent_loop_max_model_calls: int = 50
     agent_loop_live_rounds: int = 8
+    recent_events_token_budget: int = 100_000
+    recent_events_max_rows: int = 5_000
+    recent_event_payload_byte_cap: int = 4_096
     approval_ttl_seconds: int = 900
     approval_actor_id: str = "user.local"
     google_oauth_client_id: str | None = None
@@ -491,6 +494,27 @@ class AppSettings(BaseSettings):
     def _agent_loop_live_rounds_must_be_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("agent_loop_live_rounds must be >= 1")
+        return value
+
+    @field_validator("recent_events_token_budget")
+    @classmethod
+    def _recent_events_token_budget_must_be_positive(cls, value: int) -> int:
+        if value < 1_000:
+            raise ValueError("recent_events_token_budget must be >= 1000")
+        return value
+
+    @field_validator("recent_events_max_rows")
+    @classmethod
+    def _recent_events_max_rows_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("recent_events_max_rows must be >= 1")
+        return value
+
+    @field_validator("recent_event_payload_byte_cap")
+    @classmethod
+    def _recent_event_payload_byte_cap_must_be_reasonable(cls, value: int) -> int:
+        if value < 512:
+            raise ValueError("recent_event_payload_byte_cap must be >= 512")
         return value
 
     @field_validator("approval_ttl_seconds")

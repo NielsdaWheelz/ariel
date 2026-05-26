@@ -455,7 +455,7 @@ def test_schema_readiness_reports_context_pressure_rotation_reason(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260524_0068" in schema_issues
+        assert "missing_alembic_head:20260525_0069" in schema_issues
         assert "forbidden_constraint_fragment:sessions.ck_session_rotation_reason" in schema_issues
         assert (
             "forbidden_constraint_fragment:"
@@ -502,7 +502,7 @@ def test_schema_readiness_reports_stale_capture_ingress_schema(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260524_0068" in schema_issues
+        assert "missing_alembic_head:20260525_0069" in schema_issues
         assert "unexpected_column:captures.original_payload" in schema_issues
         assert "unexpected_column:captures.terminal_state" in schema_issues
         assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues
@@ -593,7 +593,7 @@ def test_schema_readiness_reports_undispatched_background_task_types(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260524_0068" in schema_issues
+        assert "missing_alembic_head:20260525_0069" in schema_issues
         assert (
             "forbidden_constraint_fragment:background_tasks.ck_background_task_type"
             in schema_issues

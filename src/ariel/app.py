@@ -48,6 +48,7 @@ from ariel.capability_registry import (
 from ariel.capture_ingress import CaptureIngressError, CaptureRecordRequest, record_capture
 from ariel.clock import utcnow
 from ariel.config import AppSettings
+from ariel.conversational_continuity import build_recent_events_block
 from ariel.db import SchemaReadinessProbe
 from ariel.db_errors import is_serialization_failure, is_unique_constraint_failure
 from ariel.google_connector import (
@@ -159,6 +160,7 @@ _AGENCY_EVENT_SOURCE_EXTERNAL_ID_CONSTRAINT = "uq_agency_event_source_external_i
 _CONTEXT_SECTION_ORDER: tuple[str, ...] = (
     "policy_system_instructions",
     "recall_v1",
+    "recent_events",
     "open_commitments_and_jobs",
     "relevant_artifacts_and_observations",
 )
@@ -472,6 +474,13 @@ def _build_initial_messages(
         rendered = _render_recall_v1(recall_v1)
         if rendered:
             push_system(rendered)
+
+    # Recent external events — the agent's anchor for "what just happened" across
+    # the session. Built by build_recent_events_block; absent (None) when the log
+    # is empty (first turn of a new session).
+    recent_events_text = context_bundle.get("recent_events_text")
+    if isinstance(recent_events_text, str) and recent_events_text:
+        push_system(recent_events_text)
 
     # 10. Open jobs
     open_commitments_and_jobs = context_bundle.get("open_commitments_and_jobs")
@@ -869,6 +878,7 @@ def _build_turn_context_bundle(
     *,
     discord_context: dict[str, Any] | None,
     recall_v1: dict[str, Any],
+    recent_events_text: str | None,
     open_commitments_and_jobs: dict[str, Any],
     relevant_artifacts_and_observations: dict[str, Any],
 ) -> dict[str, Any]:
@@ -881,6 +891,7 @@ def _build_turn_context_bundle(
         "prompt_version": MAIN_AGENT_PROMPT_VERSION,
         "policy_system_instructions": list(MAIN_AGENT_STATIC_SYSTEM_INSTRUCTIONS),
         "recall_v1": recall_v1,
+        "recent_events_text": recent_events_text,
         "open_commitments_and_jobs": dict(open_commitments_and_jobs),
         "relevant_artifacts_and_observations": dict(relevant_artifacts_and_observations),
     }
@@ -1466,6 +1477,9 @@ def _wake(
     context_bundle = _build_turn_context_bundle(
         discord_context=discord_context,
         recall_v1=recall_v1,
+        recent_events_text=build_recent_events_block(
+            db=db, session_id=effective_session_id, settings=runtime.settings
+        ),
         open_commitments_and_jobs=_open_commitments_and_jobs_context(db=db),
         relevant_artifacts_and_observations=_relevant_artifacts_and_observations_context(
             db=db,
