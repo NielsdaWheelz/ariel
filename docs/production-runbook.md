@@ -74,7 +74,25 @@ If the host is still running ad hoc services as a human user from
 Cut over to the canonical layout first:
 
 1. Commit or otherwise preserve the exact Ariel revision to deploy.
-2. From `/opt/ariel`, install the checked-in production service scaffold:
+2. Inventory the host before changing ports or service files:
+
+   ```sh
+   systemctl list-units --type=service --state=running --no-pager
+   systemctl list-unit-files --type=service --state=enabled --no-pager
+   docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+   ss -ltnp
+   caddy validate --config /etc/caddy/Caddyfile
+   ```
+
+   Treat public listeners, Caddy routes, enabled system services, and containers
+   with restart policies as possible live services. Loopback-only Docker
+   containers from local/test compose projects with `restart=no` are not
+   production dependencies unless a production service or Caddy route points at
+   them. Stop or rehome local containers that occupy canonical production ports;
+   do not move Ariel production to non-canonical ports to accommodate leftover
+   dev infrastructure.
+3. Clone or pull the intended Ariel revision into `/opt/ariel`.
+4. From `/opt/ariel`, install the checked-in production service scaffold:
 
    ```sh
    sudo bash scripts/install_production_services.sh
@@ -84,13 +102,13 @@ Cut over to the canonical layout first:
    roots under `/opt`, writable runtime state under `/var/lib/ariel` and
    `/var/lib/agency`, installs the checked-in systemd units, and reloads
    systemd. It does not start services.
-3. Build `/etc/ariel/ariel.env` from the rotated production secrets and set file
+5. Build `/etc/ariel/ariel.env` from the rotated production secrets and set file
    mode `0640`, owned by `root:ariel`.
-4. Install `runsc` on the host `PATH`, install Agency at
+6. Install `runsc` on the host `PATH`, install Agency at
    `/opt/agency/bin/agency`, and install Ariel dependencies in `/opt/ariel`.
-5. Stop the old user-scoped Ariel and Agency processes only after the canonical
+7. Stop the old user-scoped Ariel and Agency processes only after the canonical
    services are installed and ready to start.
-6. Enable the checked-in systemd units, run `make production-posture`, then run
+8. Enable the checked-in systemd units, run `make production-posture`, then run
    the Discord and Agency smokes below.
 
 ## Sandbox Runtime
@@ -128,11 +146,25 @@ sudo -u ariel runsc --rootless --network=none do true && echo runsc ok
 
 ## Postgres
 
+Use host-managed PostgreSQL supervised by `postgresql.service`; Docker
+Postgres is acceptable only as a temporary migration source. Production keeps
+the `ariel` database on `127.0.0.1:5432`; if a local/test container owns that
+port, stop or rehome the container instead of changing `ARIEL_DATABASE_URL`.
+
+Install PostgreSQL and pgvector:
+
+```sh
+apt-get update
+apt-get install -y postgresql postgresql-contrib postgresql-16-pgvector
+systemctl enable --now postgresql
+```
+
 Create the production role and database:
 
 ```sh
 sudo -u postgres createuser --pwprompt ariel
 sudo -u postgres createdb --owner ariel ariel
+sudo -u postgres psql -d ariel -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 ```
 
 Set `ARIEL_DATABASE_URL` to the local Postgres URL:
@@ -142,6 +174,43 @@ ARIEL_DATABASE_URL=postgresql+psycopg://ariel:<password>@127.0.0.1:5432/ariel
 ```
 
 Run Alembic migrations from `/opt/ariel` before starting services.
+
+When cutting over from a live Docker-backed Ariel database, take a custom-format
+dump before stopping the old services, restore it into host PostgreSQL, and keep
+the Docker volume untouched until post-cutover verification passes:
+
+```sh
+docker exec ariel-postgres pg_dump -U ariel -d ariel -Fc > /var/backups/ariel-pre-cutover.dump
+sudo -u postgres pg_restore --clean --if-exists --no-owner \
+  --dbname ariel /var/backups/ariel-pre-cutover.dump
+sudo -u postgres psql -d ariel -v ON_ERROR_STOP=1 <<'SQL'
+ALTER SCHEMA public OWNER TO ariel;
+GRANT USAGE, CREATE ON SCHEMA public TO ariel;
+DO $$
+DECLARE r record;
+DECLARE object_kind text;
+BEGIN
+  FOR r IN
+    SELECT c.relkind, n.nspname, c.relname
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+  LOOP
+    object_kind := CASE r.relkind
+      WHEN 'S' THEN 'SEQUENCE'
+      WHEN 'v' THEN 'VIEW'
+      WHEN 'm' THEN 'MATERIALIZED VIEW'
+      WHEN 'f' THEN 'FOREIGN TABLE'
+      ELSE 'TABLE'
+    END;
+    EXECUTE format('ALTER %s %I.%I OWNER TO ariel', object_kind, r.nspname, r.relname);
+  END LOOP;
+END $$;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ariel;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ariel;
+SQL
+```
 
 ## Environment
 

@@ -54,6 +54,14 @@ def test_run_protocol_events_are_surfaceable() -> None:
         "reason": "stale_turn",
         "current_turn_id": "trn_new",
     }
+    assert _project_surface_event_payload(
+        "evt.agent.provider_sync_grounding_rejected",
+        {"model_call_count": 2, "rejected_message_chars": 180},
+    ) == {
+        "model_call_count": 2,
+        "rejected_message_chars": 180,
+        "provider_response_id": None,
+    }
 
 
 def test_action_proposed_accepts_research_finding_evidence() -> None:
