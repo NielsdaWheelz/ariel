@@ -205,6 +205,9 @@ class LoopConfig:
     action_trace_nudge: str
     emit_value_nudge: str
     no_terminal_output_nudge: str
+    provider_sync_grounding_message_ids: tuple[str, ...] = ()
+    provider_sync_grounding_thread_ids: tuple[str, ...] = ()
+    provider_sync_grounding_evidence_ids: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -742,6 +745,12 @@ def run_agent_loop(
             and bool(run_program_result.emitted_message)
             and any(a.impact_level == "read" for a in run_program_result.action_attempts)
         )
+        provider_sync_grounding_rejected = (
+            cfg.output_mode == "message"
+            and bool(run_program_result.emitted_message)
+            and not premature_synthesis
+            and not _provider_sync_grounding_satisfied(db=db, turn_id=turn.id, cfg=cfg)
+        )
         if premature_synthesis:
             add_event(
                 "evt.agent.premature_synthesis_rejected",
@@ -754,6 +763,15 @@ def run_agent_loop(
                         for a in run_program_result.action_attempts
                         if a.impact_level == "read"
                     ],
+                },
+            )
+        if provider_sync_grounding_rejected:
+            add_event(
+                "evt.agent.provider_sync_grounding_rejected",
+                {
+                    "model_call_count": model_call_count,
+                    "provider_response_id": candidate_response.provider_response_id,
+                    "rejected_message_chars": len(run_program_result.emitted_message),
                 },
             )
 
@@ -797,7 +815,11 @@ def run_agent_loop(
                         runtime_provenance=final_runtime_provenance,
                     )
             case "message":
-                if run_program_result.emitted_message and not premature_synthesis:
+                if (
+                    run_program_result.emitted_message
+                    and not premature_synthesis
+                    and not provider_sync_grounding_rejected
+                ):
                     return LoopResult(
                         outcome="message",
                         emitted_message=run_program_result.emitted_message,
@@ -847,6 +869,33 @@ def run_agent_loop(
         # --- Non-terminal branches (continue the loop) ---
 
         round_start = len(messages)
+
+        if provider_sync_grounding_rejected:
+            attempt_observations = _action_attempt_observations(run_program_result.action_attempts)
+            output = json.dumps(
+                {
+                    "status": "completed",
+                    "message_rejected": True,
+                    "action_attempts": attempt_observations,
+                },
+                sort_keys=True,
+            )
+            messages.append(_assistant_tool_call_message(tool_calls))
+            messages.append(
+                _tool_returns_with_nudge(
+                    returns=[(run_call_id, output)] if run_call_id else [],
+                    nudge=_PROVIDER_SYNC_GROUNDING_NUDGE,
+                )
+            )
+            _evict_oldest_round(
+                messages,
+                round_spans,
+                round_start,
+                stable_prefix_len,
+                budget_item_index,
+                settings.agent_loop_live_rounds,
+            )
+            continue
 
         if run_program_result.emitted_values:
             # Surface one evt.agent.value_emitted event per value (digest only,
@@ -967,6 +1016,57 @@ def run_agent_loop(
 # ---------------------------------------------------------------------------
 
 
+def _provider_sync_grounding_satisfied(*, db: Session, turn_id: str, cfg: LoopConfig) -> bool:
+    message_ids = set(cfg.provider_sync_grounding_message_ids)
+    thread_ids = set(cfg.provider_sync_grounding_thread_ids)
+    evidence_ids = set(cfg.provider_sync_grounding_evidence_ids)
+    if not message_ids and not thread_ids and not evidence_ids:
+        return True
+
+    attempts = db.scalars(
+        select(ActionAttemptRecord)
+        .where(
+            ActionAttemptRecord.turn_id == turn_id,
+            ActionAttemptRecord.status == "succeeded",
+            ActionAttemptRecord.capability_id.in_(("cap.email.read", "cap.provider_evidence.read")),
+        )
+        .order_by(ActionAttemptRecord.proposal_index.asc())
+    ).all()
+    for attempt in attempts:
+        output = attempt.execution_output if isinstance(attempt.execution_output, dict) else {}
+        read_outcome = output.get("read_outcome")
+        if not isinstance(read_outcome, dict) or read_outcome.get("status") != "ok":
+            continue
+        if attempt.capability_id == "cap.provider_evidence.read":
+            evidence = output.get("provider_evidence")
+            evidence_id = (
+                evidence.get("provider_evidence_id") if isinstance(evidence, dict) else None
+            )
+            if isinstance(evidence_id, str) and evidence_id in evidence_ids:
+                return True
+            continue
+        message = output.get("message")
+        evidence = output.get("evidence")
+        refs = output.get("provider_evidence_refs")
+        read_message_id = (message.get("message_id") if isinstance(message, dict) else None) or (
+            evidence.get("message_id") if isinstance(evidence, dict) else None
+        )
+        read_thread_id = (message.get("thread_id") if isinstance(message, dict) else None) or (
+            evidence.get("thread_id") if isinstance(evidence, dict) else None
+        )
+        if isinstance(read_message_id, str) and read_message_id in message_ids:
+            return True
+        if isinstance(read_thread_id, str) and read_thread_id in thread_ids:
+            return True
+        for ref in refs if isinstance(refs, list) else []:
+            if not isinstance(ref, dict):
+                continue
+            evidence_id = ref.get("provider_evidence_id")
+            if isinstance(evidence_id, str) and evidence_id in evidence_ids:
+                return True
+    return False
+
+
 _PREMATURE_SYNTHESIS_NUDGE = (
     "Your round-one program both called a read capability and emitted a "
     "user-visible message. That message was authored before you observed the "
@@ -974,6 +1074,14 @@ _PREMATURE_SYNTHESIS_NUDGE = (
     "loop dropped it and the user did not see it. Take another round: fetch "
     "the data again and, if it needs model synthesis, carry the relevant facts "
     "forward with agent.emit_value before answering in a later round."
+)
+
+
+_PROVIDER_SYNC_GROUNDING_NUDGE = (
+    "The user did not see that message. Provider-sync Gmail excerpts are preview "
+    "evidence only. Before emitting a user-visible summary or body-level claim, "
+    "read the specific message with email.read or read the provider evidence ref "
+    "with provider_evidence.read. If the item is routine, finish silently."
 )
 
 

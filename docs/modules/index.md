@@ -19,4 +19,7 @@ This directory contains docs owned by specific infrastructure modules or feature
 - [maps.md](maps.md): maps read vertical — directions and nearby-place capabilities
 - [memory.md](memory.md): memory subsystem — two-layer substrate (raw log + curated notes), agentic recall, and the rememberer
 - [proactivity.md](proactivity.md): proactivity — the agent loop reached by non-human triggers, the scheduler, and provider ingestion
+- [provider-evidence-agent-surface-cutover.md](provider-evidence-agent-surface-cutover.md):
+  hard cutover for model-visible provider evidence, audit-safe result surfaces,
+  provider-sync grounding, and production posture
 - [transport.md](transport.md): transport lifecycle ownership

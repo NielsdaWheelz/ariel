@@ -238,6 +238,9 @@ def test_production_posture_verifier_checks_live_caddy_and_firewall_contract() -
     assert "validate_caddy_config_posture" in text
     assert "validate_ufw_firewall_posture" in text
     assert "deploy/caddy/Caddyfile" in text
+    assert "_health_posture_errors" in text
+    assert "provider_evidence" in text
+    assert "cap.provider_evidence.read" in text
 
 
 def test_runbook_uses_post_callback_smoke_not_unauthenticated_head() -> None:

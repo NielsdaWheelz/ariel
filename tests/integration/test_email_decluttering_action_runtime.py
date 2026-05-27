@@ -408,7 +408,9 @@ def test_calendar_write_actions_record_receipts_and_authority(
         "action_turn_id": "turn_email",
     }
     assert event is not None
-    assert event.payload["output"] == execution_output
+    assert event.payload["capability_id"] == capability_id
+    assert event.payload["status"] == "succeeded"
+    assert event.payload["execution_output"] == execution_output
 
 
 def _seed_ambiguous_google_calendar_receipt(
@@ -1228,7 +1230,7 @@ def test_email_action_success_redacts_undo_token_from_event_audit(
             .limit(1)
         )
         assert event is not None
-        assert event.payload["output"]["undo_token"] == "[redacted]"
+        assert event.payload["execution_output"]["undo_token"] == "[redacted]"
         receipt = db.scalar(select(ProviderWriteReceiptRecord).limit(1))
         assert receipt is not None
         assert receipt.status == "succeeded"

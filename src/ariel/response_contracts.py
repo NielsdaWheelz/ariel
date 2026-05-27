@@ -123,6 +123,7 @@ class SurfaceTaintEvidenceContract(BaseModel):
     provider_event_id: str | None = None
     item_count: int | None = None
     observation_count: int | None = None
+    grounding_items: list[dict[str, Any]] | None = None
 
 
 class SurfaceRuntimeProvenanceContract(BaseModel):
@@ -191,6 +192,7 @@ class SurfaceEventTurnFailedPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     failure_reason: str
+    error_code: str | None = None
 
 
 class SurfaceEventTurnCompletedPayloadContract(BaseModel):
@@ -365,7 +367,9 @@ class SurfaceEventActionExecutionSucceededPayloadContract(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action_attempt_id: str
-    output: Any
+    capability_id: str
+    status: Literal["succeeded"]
+    execution_output: Any
     provider_write_receipt_id: str | None = None
     replayed_provider_write_receipt_id: str | None = None
     reconciled: bool | None = None

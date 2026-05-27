@@ -36,6 +36,7 @@ from ariel.persistence import (
 from ariel.provider_evidence_lifecycle import (
     ProviderEvidenceBlockInput,
     mark_provider_object_evidence_deleted,
+    provider_evidence_ref,
     record_available_evidence,
     record_deleted_evidence,
     record_unavailable_evidence,
@@ -1135,6 +1136,8 @@ def _sync_gmail_history(
                 )
                 if evidence is None:
                     continue
+                if isinstance(read_output, dict):
+                    read_output["provider_evidence_refs"] = [provider_evidence_ref(db, evidence)]
     return item_count, observation_count
 
 
@@ -1396,6 +1399,7 @@ def _gmail_provider_sync_wake_item(
     read_message = read_output.get("message") if isinstance(read_output, dict) else None
     read_evidence = read_output.get("evidence") if isinstance(read_output, dict) else None
     read_outcome = read_output.get("read_outcome") if isinstance(read_output, dict) else None
+    evidence_blocks = _gmail_wake_evidence_blocks(read_evidence)
     message_id = _payload_text(message, "id")
     thread_id = _payload_text(message, "threadId")
     labels = _gmail_wake_labels(message=message, read_message=read_message)
@@ -1412,6 +1416,14 @@ def _gmail_provider_sync_wake_item(
         "read_outcome": _payload_text(read_outcome, "status")
         if isinstance(read_outcome, dict)
         else None,
+        "preview_kind": "provider_sync_preview",
+        "preview_truncated": any(
+            block.get("preview_truncated") is True for block in evidence_blocks
+        ),
+        "requires_read_for_body_claims": bool(evidence_blocks),
+        "provider_evidence_refs": read_output.get("provider_evidence_refs")
+        if isinstance(read_output, dict)
+        else None,
         "provider_url": _payload_text(read_message, "provider_url")
         if isinstance(read_message, dict)
         else (
@@ -1426,7 +1438,7 @@ def _gmail_provider_sync_wake_item(
                 "subject": _payload_text(read_message, "subject"),
                 "sender": _gmail_wake_address(read_message.get("sender")),
                 "direction": _payload_text(read_message, "direction"),
-                "evidence_blocks": _gmail_wake_evidence_blocks(read_evidence),
+                "evidence_blocks": evidence_blocks,
             }
         )
     return {key: value for key, value in item.items() if value not in (None, [], {})}
@@ -1466,14 +1478,18 @@ def _gmail_wake_evidence_blocks(read_evidence: Any) -> list[dict[str, Any]]:
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        text = _bounded_provider_text(_payload_text(block, "text"))
+        raw_text = _payload_text(block, "text")
+        text = _bounded_provider_text(raw_text)
         if text is None:
             continue
+        normalized_raw_text = " ".join(raw_text.split()) if isinstance(raw_text, str) else ""
         result.append(
             {
                 "kind": _payload_text(block, "kind") or "body",
                 "text": text,
                 "truncated": bool(block.get("truncated")),
+                "preview_truncated": bool(block.get("truncated"))
+                or len(normalized_raw_text) > _PROVIDER_SYNC_WAKE_MAX_BLOCK_CHARS,
             }
         )
         if len(result) >= _PROVIDER_SYNC_WAKE_MAX_BLOCKS_PER_ITEM:

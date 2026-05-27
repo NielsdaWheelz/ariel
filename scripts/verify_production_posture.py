@@ -117,6 +117,53 @@ def _health_payload(url: str) -> dict[str, Any]:
     return payload
 
 
+def _health_posture_errors(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if payload.get("ok") is not True:
+        errors.append("health endpoint is not ok")
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        errors.append("health endpoint missing runtime block")
+    else:
+        if runtime.get("deployment_mode") != "production":
+            errors.append(
+                "health runtime deployment_mode is "
+                f"{runtime.get('deployment_mode')!r}, expected 'production'"
+            )
+        if runtime.get("cwd") != ARIEL_INSTALL_ROOT:
+            errors.append(
+                f"health runtime cwd is {runtime.get('cwd')!r}, expected {ARIEL_INSTALL_ROOT!r}"
+            )
+        if runtime.get("effective_user") != "ariel":
+            errors.append(
+                "health runtime effective_user is "
+                f"{runtime.get('effective_user')!r}, expected 'ariel'"
+            )
+        if "git_sha" not in runtime:
+            errors.append("health runtime missing git_sha")
+    schema = payload.get("schema")
+    if not isinstance(schema, dict) or schema.get("ready") is not True:
+        errors.append("health schema is not ready")
+    elif schema.get("issues") != []:
+        errors.append(f"health schema issues are not empty: {schema.get('issues')!r}")
+    capabilities = payload.get("capabilities")
+    if not isinstance(capabilities, dict) or not isinstance(capabilities.get("digest"), str):
+        errors.append("health endpoint missing capability contract digest")
+    provider_evidence = payload.get("provider_evidence")
+    if not isinstance(provider_evidence, dict):
+        errors.append("health endpoint missing provider_evidence block")
+    else:
+        if provider_evidence.get("surface") != "ready":
+            errors.append("health provider_evidence surface is not ready")
+        if provider_evidence.get("read_capability") != "cap.provider_evidence.read":
+            errors.append("health provider_evidence read capability mismatch")
+        if not isinstance(provider_evidence.get("available_rows"), int):
+            errors.append("health provider_evidence available_rows missing")
+        if not isinstance(provider_evidence.get("block_rows"), int):
+            errors.append("health provider_evidence block_rows missing")
+    return errors
+
+
 def _path_is_socket(path: str) -> bool:
     try:
         mode = Path(path).stat().st_mode
@@ -452,8 +499,7 @@ def main() -> int:
 
     try:
         payload = _health_payload(str(args.health_url))
-        if payload.get("ok") is not True:
-            errors.append("health endpoint is not ok")
+        errors.extend(_health_posture_errors(payload))
     except RuntimeError as exc:
         errors.append(str(exc))
 

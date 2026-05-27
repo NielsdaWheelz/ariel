@@ -20,7 +20,10 @@ from ariel.persistence import (
     ActionAttemptRecord,
     BackgroundTaskRecord,
     EventRecord,
+    GoogleProviderObjectRecord,
     MemoryLogRecord,
+    ProviderEvidenceBlockRecord,
+    ProviderEvidenceRecord,
     TurnRecord,
     enqueue_background_task,
 )
@@ -362,6 +365,40 @@ class _WakeAdapter(FakeModelAdapter):
         )
 
 
+class _ProviderSyncGroundingAdapter(FakeModelAdapter):
+    provider = "provider.provider-sync-grounding"
+    model = "model.provider-sync-grounding-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider,
+                model=self.model,
+                messages=request.messages,
+            )
+        self.main_call_count += 1
+        if self.main_call_count == 1:
+            return run_response(
+                source="agent.emit_message(text='Preview-only schedule summary')\n",
+                provider=self.provider,
+                model=self.model,
+                provider_response_id="resp_provider_sync_grounding_1",
+            )
+        return run_response(
+            source=(
+                "result = provider_evidence.read(provider_evidence_id='pev_sync_grounding')\n"
+                "agent.emit_message(text=result['blocks'][0]['text'])\n"
+            ),
+            provider=self.provider,
+            model=self.model,
+            provider_response_id="resp_provider_sync_grounding_2",
+        )
+
+
 class _NonTerminalWakeAdapter(FakeModelAdapter):
     provider = "provider.wake"
     model = "model.wake-v1"
@@ -571,8 +608,167 @@ def test_worker_provider_sync_agent_wake_invokes_normal_wake_with_tainted_contex
             "provider_event_id": "pev_provider_sync_review",
             "item_count": 1,
             "observation_count": 1,
+            "grounding_items": [],
         }
     ]
+
+
+def test_provider_sync_wake_requires_provider_evidence_read_before_message(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    adapter = _ProviderSyncGroundingAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    GoogleProviderObjectRecord(
+                        id="gpo_sync_grounding",
+                        provider_account_id="acct_1",
+                        object_type="gmail_message",
+                        external_id="msg_grounding",
+                        thread_external_id="thr_grounding",
+                        calendar_id=None,
+                        ical_uid=None,
+                        status="active",
+                        source_timestamp=now,
+                        observed_at=now,
+                        provider_url=None,
+                        metadata_json={},
+                        content_digest="a" * 64,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    ProviderEvidenceRecord(
+                        id="pev_sync_grounding",
+                        provider_object_id="gpo_sync_grounding",
+                        provider="google",
+                        provider_account_id="acct_1",
+                        source_kind="gmail_message",
+                        external_id="msg_grounding",
+                        thread_external_id="thr_grounding",
+                        calendar_id=None,
+                        source_uri=None,
+                        source_timestamp=now,
+                        content_digest="a" * 64,
+                        metadata_json={},
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="pending",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.flush()
+                db.add(
+                    ProviderEvidenceBlockRecord(
+                        id="peb_sync_grounding",
+                        evidence_id="pev_sync_grounding",
+                        block_index=0,
+                        block_kind="body",
+                        text="Full facade schedule says stacks 09, 11, 01, and 03.",
+                        digest="b" * 64,
+                        source_offsets={"block_id": "gmail:msg_grounding:body:0"},
+                        metadata_json={"truncated": False},
+                        created_at=now,
+                    )
+                )
+                db.add(
+                    BackgroundTaskRecord(
+                        id="tsk_provider_sync_grounding",
+                        task_type="agent_wake",
+                        idempotency_key=None,
+                        provider_write_receipt_id=None,
+                        payload={
+                            "kind": "provider_sync_review",
+                            "provider": "google",
+                            "resource_type": "gmail",
+                            "resource_id": "primary",
+                            "sync_run_id": "syn_provider_sync_grounding",
+                            "provider_event_id": "pev_provider_sync_grounding",
+                            "item_count": 1,
+                            "observation_count": 1,
+                            "items": [
+                                {
+                                    "change": "messagesAdded",
+                                    "message_id": "msg_grounding",
+                                    "thread_id": "thr_grounding",
+                                    "subject": "Facade repair schedule",
+                                    "preview_kind": "provider_sync_preview",
+                                    "preview_truncated": True,
+                                    "requires_read_for_body_claims": True,
+                                    "provider_evidence_refs": [
+                                        {
+                                            "provider_evidence_id": "pev_sync_grounding",
+                                            "citation_refs": [
+                                                {
+                                                    "kind": "provider_evidence_block",
+                                                    "block_id": "peb_sync_grounding",
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                    "evidence_blocks": [
+                                        {
+                                            "kind": "body",
+                                            "text": "Full facade schedule says stacks 09...",
+                                            "preview_truncated": True,
+                                        }
+                                    ],
+                                }
+                            ],
+                            "omitted_item_count": 0,
+                            "note": "A Google Gmail sync found 1 new inbound message.",
+                        },
+                        attempts=0,
+                        recurrence_seconds=None,
+                        run_after=now - timedelta(minutes=1),
+                        created_at=now - timedelta(minutes=5),
+                        updated_at=now - timedelta(minutes=5),
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+    assert adapter.main_call_count == 2
+    with session_factory() as db:
+        turn = db.scalar(
+            select(TurnRecord).where(
+                TurnRecord.source_background_task_id == "tsk_provider_sync_grounding"
+            )
+        )
+        assert turn is not None
+        events = db.scalars(
+            select(EventRecord)
+            .where(EventRecord.turn_id == turn.id)
+            .order_by(EventRecord.sequence.asc())
+        ).all()
+        attempts = db.scalars(
+            select(ActionAttemptRecord).where(ActionAttemptRecord.turn_id == turn.id)
+        ).all()
+
+    assert turn.assistant_message == "Full facade schedule says stacks 09, 11, 01, and 03."
+    assert any(event.event_type == "evt.agent.provider_sync_grounding_rejected" for event in events)
+    assert [attempt.capability_id for attempt in attempts] == ["cap.provider_evidence.read"]
 
 
 def test_provider_sync_wake_budget_exhaustion_stays_silent(

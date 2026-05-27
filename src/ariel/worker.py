@@ -878,7 +878,31 @@ def _provider_sync_review_context(task_payload: dict[str, Any]) -> tuple[str, di
         "provider_event_id": provider_event_id,
         "item_count": item_count,
         "observation_count": observation_count,
+        "grounding_items": _provider_sync_grounding_items(items),
     }
+
+
+def _provider_sync_grounding_items(items: list[Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("requires_read_for_body_claims") is not True:
+            continue
+        provider_evidence_ids: list[str] = []
+        refs = item.get("provider_evidence_refs")
+        for ref in refs if isinstance(refs, list) else []:
+            if not isinstance(ref, dict):
+                continue
+            evidence_id = _payload_text(ref, "provider_evidence_id")
+            if evidence_id is not None:
+                provider_evidence_ids.append(evidence_id)
+        result.append(
+            {
+                "message_id": _payload_text(item, "message_id"),
+                "thread_id": _payload_text(item, "thread_id"),
+                "provider_evidence_ids": provider_evidence_ids,
+            }
+        )
+    return result
 
 
 def _render_provider_sync_item(index: int, item: Any) -> list[str]:
@@ -899,6 +923,9 @@ def _render_provider_sync_item(index: int, item: Any) -> list[str]:
         "source_timestamp",
         "labels",
         "read_outcome",
+        "preview_kind",
+        "preview_truncated",
+        "requires_read_for_body_claims",
         "provider_url",
     ):
         value = item.get(key)
@@ -914,7 +941,7 @@ def _render_provider_sync_item(index: int, item: Any) -> list[str]:
         if text is None:
             continue
         kind = _payload_text(block, "kind") or "body"
-        lines.append(f"   - {kind}_excerpt: {text}")
+        lines.append(f"   - {kind}_preview_excerpt: {text}")
     return lines
 
 

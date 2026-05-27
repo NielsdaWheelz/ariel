@@ -448,8 +448,9 @@ make production-posture
 daemon/socket, loopback health, canonical install/state roots, and
 `/etc/ariel/ariel.env` as a production `AppSettings` source. It rejects stale
 unknown `ARIEL_*` names, non-production settings, non-canonical Agency roots,
-and missing required production env vars, including current checked-in model
-provider keys. Add `--check-db-schema` to
+missing required production env vars, non-production `/v1/health` posture,
+missing capability-contract digest, and missing provider-evidence surface
+health, including current checked-in model provider keys. Add `--check-db-schema` to
 `scripts/verify_production_posture.py` only when a direct database readiness
 check is needed.
 

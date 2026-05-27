@@ -784,9 +784,16 @@ def test_gmail_sync_follows_history_pages_and_dedupes_replayed_events(
     assert first_payload["omitted_item_count"] == 0
     assert first_payload["items"][0]["message_id"] == "msg-1"
     assert first_payload["items"][0]["subject"] == "Follow up"
+    assert first_payload["items"][0]["preview_kind"] == "provider_sync_preview"
+    assert first_payload["items"][0]["preview_truncated"] is False
+    assert first_payload["items"][0]["requires_read_for_body_claims"] is True
+    assert first_payload["items"][0]["provider_evidence_refs"][0][
+        "provider_evidence_id"
+    ].startswith("pev_")
     assert first_payload["items"][0]["evidence_blocks"][0]["text"] == (
         "Thanks, I will follow up by Friday."
     )
+    assert first_payload["items"][0]["evidence_blocks"][0]["preview_truncated"] is False
 
 
 def test_gmail_sync_hydrates_added_messages_into_body_evidence(
@@ -2153,4 +2160,7 @@ def test_gmail_sync_skips_invalid_typed_output_without_crashing_batch(
     items = tasks[0].payload["items"]
     assert {item["message_id"] for item in items} == {"msg-good-1", "msg-good-2"}
     for item in items:
+        assert item["preview_kind"] == "provider_sync_preview"
+        assert item["requires_read_for_body_claims"] is True
+        assert item["provider_evidence_refs"][0]["provider_evidence_id"].startswith("pev_")
         assert item["evidence_blocks"][0]["text"] == "Thanks, I will follow up by Friday."

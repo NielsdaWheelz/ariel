@@ -39,6 +39,28 @@ def provider_evidence_ref(db: Session, evidence: ProviderEvidenceRecord) -> dict
     }
 
 
+def read_provider_evidence_blocks(
+    *,
+    db: Session,
+    evidence_id: str,
+    block_ids: list[str],
+    max_blocks: int,
+) -> tuple[ProviderEvidenceRecord | None, list[ProviderEvidenceBlockRecord], bool]:
+    evidence = db.get(ProviderEvidenceRecord, evidence_id)
+    if evidence is None:
+        return None, [], False
+    query = (
+        select(ProviderEvidenceBlockRecord)
+        .where(ProviderEvidenceBlockRecord.evidence_id == evidence.id)
+        .order_by(ProviderEvidenceBlockRecord.block_index.asc())
+    )
+    if block_ids:
+        query = query.where(ProviderEvidenceBlockRecord.id.in_(block_ids))
+    blocks = list(db.scalars(query).all())
+    missing_requested_block = bool(block_ids) and {block.id for block in blocks} != set(block_ids)
+    return evidence, blocks[:max_blocks], missing_requested_block
+
+
 def ensure_provider_evidence_blocks(
     *,
     db: Session,

@@ -126,6 +126,36 @@ def test_schema_readiness_recovers_when_migrations_land_after_startup(
         assert recovered.status_code == 200
 
 
+def test_health_reports_runtime_schema_and_provider_evidence_posture(
+    postgres_url: str,
+) -> None:
+    app = create_app(
+        database_url=postgres_url,
+        model_adapter=NoCallModelAdapter(),
+        sandbox=FakeSandboxRuntime(),
+    )
+
+    with TestClient(app) as client:
+        health = client.get("/v1/health")
+
+    assert health.status_code == 200
+    payload = health.json()
+    assert payload["ok"] is True
+    assert payload["runtime"]["cwd"]
+    assert "git_sha" in payload["runtime"]
+    assert payload["schema"]["ready"] is True
+    assert payload["schema"]["issues"] == []
+    assert payload["schema"]["alembic_current_revisions"]
+    assert payload["prompt"]["main_agent_prompt_version"]
+    assert payload["capabilities"]["digest"]
+    assert payload["capabilities"]["capability_count"] > 0
+    assert payload["provider_evidence"]["surface"] == "ready"
+    assert payload["provider_evidence"]["read_capability"] == "cap.provider_evidence.read"
+    assert isinstance(payload["provider_evidence"]["available_rows"], int)
+    assert isinstance(payload["provider_evidence"]["block_rows"], int)
+    assert "google_sync" in payload
+
+
 def test_schema_readiness_reports_missing_subscriber_heartbeat(postgres_url: str) -> None:
     engine = create_engine(postgres_url, future=True, pool_pre_ping=True)
     try:

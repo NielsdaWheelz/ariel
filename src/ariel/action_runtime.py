@@ -27,6 +27,7 @@ from ariel.capability_registry import (
     MAPS_CAPABILITY_IDS,
     MEMORY_CAPABILITY_IDS,
     PROACTIVE_CAPABILITY_IDS,
+    PROVIDER_EVIDENCE_CAPABILITY_IDS,
     RESEARCH_CAPABILITY_IDS,
     RESEARCH_MEMORIES_CAPABILITY_IDS,
     canonical_action_payload,
@@ -69,9 +70,15 @@ from ariel.persistence import (
     to_rfc3339,
 )
 from ariel.policy_engine import evaluate_proposal
+from ariel.provider_evidence_surface import (
+    provider_capability_output_for_agent,
+    provider_capability_output_for_audit,
+    provider_capability_output_for_public_transport,
+)
 from ariel.provider_evidence_lifecycle import (
     ProviderEvidenceBlockInput,
     provider_evidence_ref,
+    read_provider_evidence_blocks,
     record_available_evidence,
     record_deleted_evidence,
     record_unavailable_evidence,
@@ -527,91 +534,6 @@ def _redact_google_action_input_for_event(
     return redacted
 
 
-def _redact_evidence_blocks(raw_blocks: Any) -> list[dict[str, Any]]:
-    redacted_blocks: list[dict[str, Any]] = []
-    for block in raw_blocks if isinstance(raw_blocks, list) else []:
-        if not isinstance(block, dict):
-            continue
-        redacted_block = dict(block)
-        text = redacted_block.pop("text", None)
-        if isinstance(text, str):
-            redacted_block["text_redacted"] = True
-            redacted_block["text_digest"] = str(redacted_block.get("digest") or _email_hash(text))
-            redacted_block["text_char_count"] = len(text)
-        redacted_blocks.append(redacted_block)
-    return redacted_blocks
-
-
-def _redact_google_provider_output(
-    *,
-    capability_id: str,
-    output_payload: dict[str, Any],
-) -> dict[str, Any]:
-    redacted = jsonable_encoder(output_payload)
-    if not isinstance(redacted, dict):
-        return {}
-
-    if capability_id == "cap.email.read":
-        evidence = redacted.get("evidence")
-        if isinstance(evidence, dict):
-            evidence["blocks"] = _redact_evidence_blocks(evidence.get("blocks"))
-        message = redacted.get("message")
-        if isinstance(message, dict):
-            for key in ("body", "body_text", "body_html", "snippet"):
-                value = message.pop(key, None)
-                if isinstance(value, str):
-                    message[f"{key}_redacted"] = _redacted_provider_text_marker(value)
-        return redacted
-
-    if capability_id == "cap.calendar.list":
-        events = redacted.get("events")
-        if isinstance(events, list):
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-                event["description_blocks"] = _redact_evidence_blocks(
-                    event.get("description_blocks")
-                )
-                description = event.pop("description", None)
-                if isinstance(description, str):
-                    event["description_redacted"] = _redacted_provider_text_marker(description)
-        return redacted
-
-    if capability_id in {
-        "cap.calendar.create_event",
-        "cap.calendar.update_event",
-        "cap.calendar.respond_to_event",
-    }:
-        description = redacted.pop("description", None)
-        if isinstance(description, str):
-            redacted["description_redacted"] = _redacted_provider_text_marker(description)
-        event = redacted.get("event")
-        if isinstance(event, dict):
-            event_description = event.pop("description", None)
-            if isinstance(event_description, str):
-                event["description_redacted"] = _redacted_provider_text_marker(event_description)
-            event["description_blocks"] = _redact_evidence_blocks(event.get("description_blocks"))
-        return redacted
-
-    if capability_id in {"cap.email.draft", "cap.email.send"}:
-        body = redacted.pop("body", None)
-        if isinstance(body, str):
-            redacted["body_redacted"] = _redacted_provider_text_marker(body)
-        draft = redacted.get("draft")
-        if isinstance(draft, dict):
-            draft_body = draft.pop("body", None)
-            if isinstance(draft_body, str):
-                draft["body_redacted"] = _redacted_provider_text_marker(draft_body)
-        message = redacted.get("message")
-        if isinstance(message, dict):
-            message_body = message.pop("body", None)
-            if isinstance(message_body, str):
-                message["body_redacted"] = _redacted_provider_text_marker(message_body)
-        return redacted
-
-    return redacted
-
-
 def _append_action_execution_event(
     *,
     db: Session,
@@ -630,6 +552,21 @@ def _append_action_execution_event(
         new_id_fn=new_id_fn,
         now_fn=now_fn,
     )
+
+
+def _action_execution_succeeded_payload(
+    action_attempt: ActionAttemptRecord,
+    execution_output: dict[str, Any],
+    **extra: Any,
+) -> dict[str, Any]:
+    payload = {
+        "action_attempt_id": action_attempt.id,
+        "capability_id": action_attempt.capability_id,
+        "status": "succeeded",
+        "execution_output": execution_output,
+    }
+    payload.update(extra)
+    return payload
 
 
 def _fail_action_execution(
@@ -853,6 +790,122 @@ def _execute_memory_capability(
     raise RuntimeError("unknown_memory_capability")
 
 
+def _execute_provider_evidence_capability(
+    *,
+    db: Session,
+    capability_id: str,
+    normalized_input: dict[str, Any],
+) -> dict[str, Any]:
+    if capability_id != "cap.provider_evidence.read":
+        raise RuntimeError("unknown_provider_evidence_capability")
+
+    evidence_id = str(normalized_input["provider_evidence_id"])
+    block_ids = [str(block_id) for block_id in normalized_input["block_ids"]]
+    max_blocks = int(normalized_input["max_blocks"])
+    evidence, blocks, missing_requested_block = read_provider_evidence_blocks(
+        db=db,
+        evidence_id=evidence_id,
+        block_ids=block_ids,
+        max_blocks=max_blocks,
+    )
+    if evidence is None:
+        return _provider_evidence_read_unavailable(
+            provider_evidence_id=evidence_id,
+            lifecycle_state=None,
+            reason_code="provider_evidence_not_found",
+            recovery="Use a provider evidence ref from the current context.",
+        )
+    if evidence.lifecycle_state != "available":
+        return _provider_evidence_read_unavailable(
+            provider_evidence_id=evidence.id,
+            lifecycle_state=evidence.lifecycle_state,
+            reason_code="provider_evidence_lifecycle_state",
+            recovery="Read the current provider source by canonical provider ID.",
+        )
+
+    if missing_requested_block:
+        return _provider_evidence_read_unavailable(
+            provider_evidence_id=evidence.id,
+            lifecycle_state=evidence.lifecycle_state,
+            reason_code="provider_evidence_block_not_found",
+            recovery="Use block ids from the same provider evidence ref.",
+        )
+
+    rendered_blocks: list[dict[str, Any]] = []
+    for block in blocks:
+        if len(block.text) > _MAX_GMAIL_EVIDENCE_BLOCK_CHARS:
+            raise RuntimeError("provider_evidence_block_unbounded")
+        rendered_blocks.append(
+            {
+                "block_id": block.id,
+                "block_index": block.block_index,
+                "kind": block.block_kind,
+                "text": block.text,
+                "digest": block.digest,
+                "truncated": bool(block.metadata_json.get("truncated")),
+                "source_offsets": block.source_offsets,
+            }
+        )
+
+    return {
+        "schema_version": "provider.evidence_blocks.v1",
+        "status": "succeeded",
+        "read_outcome": {"status": "ok", "reason_code": None, "recovery": None},
+        "provider_evidence": _provider_evidence_read_metadata(evidence),
+        "blocks": rendered_blocks,
+        "runtime_provenance": {
+            "status": "tainted",
+            "evidence": [
+                {
+                    "kind": "provider_evidence",
+                    "provider_evidence_id": evidence.id,
+                    "taint": evidence.taint,
+                    "sensitivity": evidence.sensitivity,
+                }
+            ],
+        },
+    }
+
+
+def _provider_evidence_read_metadata(evidence: ProviderEvidenceRecord) -> dict[str, Any]:
+    return {
+        "provider_evidence_id": evidence.id,
+        "provider": evidence.provider,
+        "source_kind": evidence.source_kind,
+        "external_id": evidence.external_id,
+        "thread_external_id": evidence.thread_external_id,
+        "calendar_id": evidence.calendar_id,
+        "content_digest": evidence.content_digest,
+        "taint": evidence.taint,
+        "sensitivity": evidence.sensitivity,
+        "lifecycle_state": evidence.lifecycle_state,
+        "observed_at": to_rfc3339(evidence.observed_at),
+    }
+
+
+def _provider_evidence_read_unavailable(
+    *,
+    provider_evidence_id: str,
+    lifecycle_state: str | None,
+    reason_code: str,
+    recovery: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "provider.evidence_blocks.v1",
+        "status": "succeeded",
+        "read_outcome": {
+            "status": "unavailable",
+            "reason_code": reason_code,
+            "recovery": recovery,
+        },
+        "provider_evidence": {
+            "provider_evidence_id": provider_evidence_id,
+            "lifecycle_state": lifecycle_state,
+        },
+        "blocks": [],
+    }
+
+
 def _execute_proactive_capability(
     *,
     db: Session,
@@ -1033,6 +1086,7 @@ _GROUNDED_RETRIEVAL_CAPABILITIES = {
     *_WEB_EXTRACT_RETRIEVAL_CAPABILITY_IDS,
     *ATTACHMENT_CAPABILITY_IDS,
     *GOOGLE_READ_CAPABILITY_IDS,
+    *PROVIDER_EVIDENCE_CAPABILITY_IDS,
 }
 
 _TYPED_AUTH_RECOVERY: dict[str, str] = {
@@ -2235,7 +2289,7 @@ def _record_provider_write_receipt(
         raw_response_payload["error"] = error
     response_digest = _json_digest(raw_response_payload)
     response_payload = (
-        _redact_google_provider_output(
+        provider_capability_output_for_public_transport(
             capability_id=action_attempt.capability_id,
             output_payload=raw_response_payload,
         )
@@ -3033,12 +3087,12 @@ def process_provider_write_reconcile_due(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": receipt.response_payload,
-                        "provider_write_receipt_id": receipt.id,
-                        "reconciled": True,
-                    },
+                    payload_data=_action_execution_succeeded_payload(
+                        action_attempt,
+                        receipt.response_payload,
+                        provider_write_receipt_id=receipt.id,
+                        reconciled=True,
+                    ),
                     now_fn=lambda: checked_at,
                     new_id_fn=new_id_fn,
                 )
@@ -3155,12 +3209,12 @@ def process_provider_write_reconcile_due(
                 db=db,
                 action_attempt=action_attempt,
                 event_type="evt.action.execution.succeeded",
-                payload_data={
-                    "action_attempt_id": action_attempt.id,
-                    "output": receipt.response_payload,
-                    "provider_write_receipt_id": receipt.id,
-                    "reconciled": True,
-                },
+                payload_data=_action_execution_succeeded_payload(
+                    action_attempt,
+                    receipt.response_payload,
+                    provider_write_receipt_id=receipt.id,
+                    reconciled=True,
+                ),
                 now_fn=now_fn,
                 new_id_fn=new_id_fn,
             )
@@ -3234,6 +3288,7 @@ def process_one_call(
     is_attachment_capability_call = capability_id in ATTACHMENT_CAPABILITY_IDS
     is_memory_capability_call = capability_id in MEMORY_CAPABILITY_IDS
     is_proactive_capability_call = capability_id in PROACTIVE_CAPABILITY_IDS
+    is_provider_evidence_capability_call = capability_id in PROVIDER_EVIDENCE_CAPABILITY_IDS
     is_research_capability_call = capability_id in RESEARCH_CAPABILITY_IDS
     is_retrieval_call = capability_id in _GROUNDED_RETRIEVAL_CAPABILITIES
     is_weather_forecast_call = capability_id == "cap.weather.forecast"
@@ -3878,6 +3933,17 @@ def process_one_call(
             output=proactive_output,
             error=None,
         )
+    elif is_provider_evidence_capability_call:
+        provider_evidence_output = _execute_provider_evidence_capability(
+            db=db,
+            capability_id=capability_id,
+            normalized_input=evaluation.normalized_input,
+        )
+        execution_result = ExecutionResult(
+            status="succeeded",
+            output=provider_evidence_output,
+            error=None,
+        )
     elif is_research_capability_call:
         # The investigate syscall is a read capability that executes inline: it
         # writes one immediate research_run row to the caller's transaction and
@@ -3905,6 +3971,8 @@ def process_one_call(
             normalized_input=normalized_for_execution,
         )
     if execution_result.status == "succeeded" and execution_result.output is not None:
+        agent_output = execution_result.output
+        audit_output = execution_result.output
         if is_google_capability_call and isinstance(execution_result.output, dict):
             output_payload = execution_result.output
             provider_evidence_refs = _persist_google_provider_evidence(
@@ -3934,14 +4002,23 @@ def process_one_call(
                         error="calendar_event_evidence_missing",
                     )
             if execution_result.status == "succeeded":
-                execution_result = ExecutionResult(
-                    status="succeeded",
-                    output=_redact_google_provider_output(
-                        capability_id=capability_id,
-                        output_payload=output_payload,
-                    ),
-                    error=None,
+                agent_output = provider_capability_output_for_agent(
+                    capability_id=capability_id,
+                    output_payload=output_payload,
                 )
+                audit_output = provider_capability_output_for_audit(
+                    capability_id=capability_id,
+                    output_payload=output_payload,
+                )
+        elif is_provider_evidence_capability_call and isinstance(execution_result.output, dict):
+            agent_output = provider_capability_output_for_agent(
+                capability_id=capability_id,
+                output_payload=execution_result.output,
+            )
+            audit_output = provider_capability_output_for_audit(
+                capability_id=capability_id,
+                output_payload=execution_result.output,
+            )
         if execution_result.status != "succeeded" or execution_result.output is None:
             error_reason = execution_result.error or "execution_output_missing"
             if call_id:
@@ -3970,14 +4047,14 @@ def process_one_call(
                 },
             )
             return
-        action_attempt.execution_output = execution_result.output
+        action_attempt.execution_output = audit_output
         action_attempt.execution_error = None
         action_attempt.status = "succeeded"
         action_attempt.updated_at = now_fn()
         _append_reason_codes(
             ctx.interpreter_reason_codes_by_attempt_id,
             action_attempt_id=action_attempt.id,
-            reason_codes=_tool_result_interpretation_reason_codes(execution_result.output),
+            reason_codes=_tool_result_interpretation_reason_codes(agent_output),
         )
         if is_discord_capability_call:
             ctx.silent_response = True
@@ -3985,7 +4062,7 @@ def process_one_call(
             ctx.inline_results.append(
                 {
                     "capability_id": capability_id,
-                    "output": execution_result.output,
+                    "output": agent_output,
                 }
             )
         if call_id:
@@ -3995,7 +4072,7 @@ def process_one_call(
                     payload={
                         "status": "succeeded",
                         "capability_id": capability_id,
-                        "output": execution_result.output,
+                        "output": agent_output,
                     },
                 )
             )
@@ -4003,20 +4080,28 @@ def process_one_call(
             memory_runtime_provenance = _memory_output_runtime_provenance(
                 capability_id=capability_id,
                 action_attempt=action_attempt,
-                output=execution_result.output,
+                output=agent_output,
             )
             ctx.result_runtime_provenance = RuntimeProvenance.merge_optional(
                 ctx.result_runtime_provenance,
                 memory_runtime_provenance,
             )
+        provenance_raw = agent_output.get("runtime_provenance")
+        provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
+        if provenance.get("status") == "tainted" and isinstance(provenance.get("evidence"), list):
+            evidence = [item for item in provenance["evidence"] if isinstance(item, dict)]
+            ctx.result_runtime_provenance = RuntimeProvenance.merge_optional(
+                ctx.result_runtime_provenance,
+                RuntimeProvenance(status="tainted", evidence=tuple(evidence)),
+            )
         if is_retrieval_call:
             if is_attachment_capability_call:
-                read_outcome_raw = execution_result.output.get("read_outcome")
+                read_outcome_raw = agent_output.get("read_outcome")
                 read_outcome = read_outcome_raw if isinstance(read_outcome_raw, dict) else {}
                 read_status = read_outcome.get("status")
                 if isinstance(read_status, str) and read_status != "ok":
                     ctx.retrieval_errors.append(read_status)
-                provenance_raw = execution_result.output.get("runtime_provenance")
+                provenance_raw = agent_output.get("runtime_provenance")
                 provenance = provenance_raw if isinstance(provenance_raw, dict) else {}
                 attachment_provenance_status = provenance.get("status")
                 evidence_raw = provenance.get("evidence")
@@ -4029,7 +4114,7 @@ def process_one_call(
             remaining_citations = _MAX_CITED_SOURCES - len(ctx.retrieval_sources)
             if remaining_citations > 0:
                 candidates = _extract_search_source_candidates(
-                    output_payload=execution_result.output,
+                    output_payload=audit_output,
                     now_fn=now_fn,
                 )
                 if candidates:
@@ -4051,10 +4136,7 @@ def process_one_call(
                     )
         add_event(
             "evt.action.execution.succeeded",
-            {
-                "action_attempt_id": action_attempt.id,
-                "output": execution_result.output,
-            },
+            _action_execution_succeeded_payload(action_attempt, audit_output),
         )
         return
 
@@ -4645,11 +4727,11 @@ def process_action_execution_task(
                             db=db,
                             action_attempt=action_attempt,
                             event_type="evt.action.execution.succeeded",
-                            payload_data={
-                                "action_attempt_id": action_attempt.id,
-                                "output": event_output,
-                                "replayed_provider_write_receipt_id": existing_receipt.id,
-                            },
+                            payload_data=_action_execution_succeeded_payload(
+                                action_attempt,
+                                event_output,
+                                replayed_provider_write_receipt_id=existing_receipt.id,
+                            ),
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
@@ -4750,11 +4832,11 @@ def process_action_execution_task(
                             db=db,
                             action_attempt=action_attempt,
                             event_type="evt.action.execution.succeeded",
-                            payload_data={
-                                "action_attempt_id": action_attempt.id,
-                                "output": existing_receipt.response_payload,
-                                "replayed_provider_write_receipt_id": existing_receipt.id,
-                            },
+                            payload_data=_action_execution_succeeded_payload(
+                                action_attempt,
+                                existing_receipt.response_payload,
+                                replayed_provider_write_receipt_id=existing_receipt.id,
+                            ),
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
@@ -4934,10 +5016,10 @@ def process_action_execution_task(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": memory_output,
-                    },
+                    payload_data=_action_execution_succeeded_payload(
+                        action_attempt,
+                        memory_output,
+                    ),
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
@@ -4961,10 +5043,10 @@ def process_action_execution_task(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": proactive_output,
-                    },
+                    payload_data=_action_execution_succeeded_payload(
+                        action_attempt,
+                        proactive_output,
+                    ),
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
@@ -4987,10 +5069,10 @@ def process_action_execution_task(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": research_output,
-                    },
+                    payload_data=_action_execution_succeeded_payload(
+                        action_attempt,
+                        research_output,
+                    ),
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )
@@ -5084,11 +5166,11 @@ def process_action_execution_task(
                             db=db,
                             action_attempt=action_attempt,
                             event_type="evt.action.execution.succeeded",
-                            payload_data={
-                                "action_attempt_id": action_attempt.id,
-                                "output": existing_receipt.response_payload,
-                                "replayed_provider_write_receipt_id": existing_receipt.id,
-                            },
+                            payload_data=_action_execution_succeeded_payload(
+                                action_attempt,
+                                existing_receipt.response_payload,
+                                replayed_provider_write_receipt_id=existing_receipt.id,
+                            ),
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
@@ -5285,11 +5367,11 @@ def process_action_execution_task(
                             db=db,
                             action_attempt=action_attempt,
                             event_type="evt.action.execution.succeeded",
-                            payload_data={
-                                "action_attempt_id": action_attempt.id,
-                                "output": event_output,
-                                "replayed_provider_write_receipt_id": existing_receipt.id,
-                            },
+                            payload_data=_action_execution_succeeded_payload(
+                                action_attempt,
+                                event_output,
+                                replayed_provider_write_receipt_id=existing_receipt.id,
+                            ),
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
@@ -5410,11 +5492,11 @@ def process_action_execution_task(
                             db=db,
                             action_attempt=action_attempt,
                             event_type="evt.action.execution.succeeded",
-                            payload_data={
-                                "action_attempt_id": action_attempt.id,
-                                "output": existing_receipt.response_payload,
-                                "replayed_provider_write_receipt_id": existing_receipt.id,
-                            },
+                            payload_data=_action_execution_succeeded_payload(
+                                action_attempt,
+                                existing_receipt.response_payload,
+                                replayed_provider_write_receipt_id=existing_receipt.id,
+                            ),
                             now_fn=now_fn,
                             new_id_fn=new_id_fn,
                         )
@@ -5936,7 +6018,7 @@ def process_action_execution_task(
                 if action_attempt.capability_id in _GOOGLE_RECEIPT_CAPABILITY_IDS and isinstance(
                     execution_result.output, dict
                 ):
-                    public_output = _redact_google_provider_output(
+                    public_output = provider_capability_output_for_public_transport(
                         capability_id=action_attempt.capability_id,
                         output_payload=execution_result.output,
                     )
@@ -5964,10 +6046,10 @@ def process_action_execution_task(
                     db=db,
                     action_attempt=action_attempt,
                     event_type="evt.action.execution.succeeded",
-                    payload_data={
-                        "action_attempt_id": action_attempt.id,
-                        "output": event_output,
-                    },
+                    payload_data=_action_execution_succeeded_payload(
+                        action_attempt,
+                        event_output,
+                    ),
                     now_fn=now_fn,
                     new_id_fn=new_id_fn,
                 )

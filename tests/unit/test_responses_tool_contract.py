@@ -632,6 +632,35 @@ def test_run_callable_signatures_warn_about_email_read_invented_nulls() -> None:
     assert error == "schema_invalid"
 
 
+def test_provider_evidence_read_signature_and_contract_are_narrow() -> None:
+    signature = RUN_CALLABLE_SIGNATURES["provider_evidence.read"]
+    assert "provider_evidence_id" in signature
+    assert "provider.evidence_blocks.v1" in signature
+
+    capability = get_capability("cap.provider_evidence.read")
+    assert capability is not None
+    assert capability.impact_level == "read"
+    assert capability.allowed_egress_destinations == ()
+    normalized, error = capability.validate_input(
+        {
+            "provider_evidence_id": " pev_1 ",
+            "block_ids": [" peb_1 "],
+            "max_blocks": 1,
+        }
+    )
+    assert error is None
+    assert normalized == {
+        "provider_evidence_id": "pev_1",
+        "block_ids": ["peb_1"],
+        "max_blocks": 1,
+    }
+    assert capability.validate_input({"provider_evidence_id": ""}) == (None, "schema_invalid")
+    assert capability.validate_input({"provider_evidence_id": "pev_1", "max_blocks": 13}) == (
+        None,
+        "schema_invalid",
+    )
+
+
 def test_web_extract_signature_names_exact_runtime_output_shape() -> None:
     signature = RUN_CALLABLE_SIGNATURES["web.extract"]
 

@@ -5,7 +5,10 @@ from contextlib import asynccontextmanager
 import hmac
 import hashlib
 import json
+import os
 from pathlib import Path
+import pwd
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,7 +44,10 @@ from ariel.attachment_content import AttachmentContentRuntime
 from ariel.capability_registry import (
     EMAIL_MUTATION_CAPABILITY_IDS,
     RESEARCH_MEMORIES_CAPABILITY_IDS,
+    capability_contract_hash,
     eligible_internal_callable_capability_ids,
+    get_capability,
+    internal_callable_capability_ids,
     run_callable_name_for_capability_id,
     run_callable_signature,
 )
@@ -164,6 +170,41 @@ _CONTEXT_SECTION_ORDER: tuple[str, ...] = (
 _MAX_ARTIFACTS_IN_CONTEXT = 8
 
 _CONTEXT_AUDIT_SCHEMA_VERSION = "1.0"
+
+
+def _git_sha() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = completed.stdout.strip()
+    return sha if sha else None
+
+
+def _effective_user() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return str(os.geteuid())
+
+
+def _capability_contract_manifest() -> dict[str, Any]:
+    contracts: dict[str, str] = {}
+    for capability_id in internal_callable_capability_ids():
+        capability = get_capability(capability_id)
+        if capability is not None:
+            contracts[capability_id] = capability_contract_hash(capability)
+    digest = hashlib.sha256(
+        json.dumps(contracts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {"digest": digest, "capability_count": len(contracts)}
 
 
 def _make_empty_context_meta() -> dict[str, Any]:
@@ -709,6 +750,34 @@ class Runtime:
     sandbox: RunSandbox | None
     attachment_runtime: AttachmentContentRuntime
     session_factory: sessionmaker[Session]
+
+
+def _provider_sync_grounding_ids(
+    wake_context: WakeContext,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    if wake_context.trigger_kind != "provider_sync" or wake_context.ingress_provenance is None:
+        return (), (), ()
+    message_ids: list[str] = []
+    thread_ids: list[str] = []
+    evidence_ids: list[str] = []
+    for evidence in wake_context.ingress_provenance.evidence:
+        if evidence.get("kind") != "provider_sync_review":
+            continue
+        items = evidence.get("grounding_items")
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            message_id = item.get("message_id")
+            if isinstance(message_id, str) and message_id and message_id not in message_ids:
+                message_ids.append(message_id)
+            thread_id = item.get("thread_id")
+            if isinstance(thread_id, str) and thread_id and thread_id not in thread_ids:
+                thread_ids.append(thread_id)
+            raw_evidence_ids = item.get("provider_evidence_ids")
+            for evidence_id in raw_evidence_ids if isinstance(raw_evidence_ids, list) else []:
+                if isinstance(evidence_id, str) and evidence_id and evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+    return tuple(message_ids), tuple(thread_ids), tuple(evidence_ids)
 
 
 def _open_commitments_and_jobs_context(*, db: Session) -> dict[str, Any]:
@@ -1328,6 +1397,11 @@ def _wake(
         user_message=user_message,
     )
     scratch: dict[str, ScratchEntry] = {}
+    (
+        provider_sync_grounding_message_ids,
+        provider_sync_grounding_thread_ids,
+        provider_sync_grounding_evidence_ids,
+    ) = _provider_sync_grounding_ids(wake_context)
     loop_cfg = LoopConfig(
         output_mode="message",
         finding_mode="",
@@ -1373,6 +1447,9 @@ def _wake(
             "exactly one run call whose program emits output through "
             "agent.emit_message or finishes silently with agent.finish_silent."
         ),
+        provider_sync_grounding_message_ids=provider_sync_grounding_message_ids,
+        provider_sync_grounding_thread_ids=provider_sync_grounding_thread_ids,
+        provider_sync_grounding_evidence_ids=provider_sync_grounding_evidence_ids,
     )
     loop_result = run_agent_loop(
         loop_cfg,
@@ -1750,20 +1827,86 @@ def create_app(
                     retryable=False,
                 )
             )
-        if settings.google_pubsub_subscription is None:
-            return {"ok": True}
+        now = utcnow()
+        body: dict[str, Any] = {
+            "ok": True,
+            "runtime": {
+                "deployment_mode": settings.deployment_mode,
+                "git_sha": _git_sha(),
+                "cwd": os.getcwd(),
+                "effective_user": _effective_user(),
+                "effective_uid": os.geteuid(),
+                "environment_source": "process_environment",
+            },
+            "schema": {
+                "ready": True,
+                "issues": [],
+            },
+            "prompt": {
+                "main_agent_prompt_version": MAIN_AGENT_PROMPT_VERSION,
+            },
+            "capabilities": _capability_contract_manifest(),
+            "provider_evidence": {
+                "surface": "ready",
+                "read_capability": "cap.provider_evidence.read",
+            },
+        }
 
         with session_factory() as db:
+            current_revisions = db.scalars(text("SELECT version_num FROM alembic_version")).all()
+            body["schema"]["alembic_current_revisions"] = sorted(
+                str(revision) for revision in current_revisions
+            )
+            body["provider_evidence"]["available_rows"] = int(
+                db.scalar(
+                    text(
+                        "SELECT count(*) FROM provider_evidence WHERE lifecycle_state = 'available'"
+                    )
+                )
+                or 0
+            )
+            body["provider_evidence"]["block_rows"] = int(
+                db.scalar(text("SELECT count(*) FROM provider_evidence_blocks")) or 0
+            )
             heartbeat = db.scalar(
                 select(SubscriberHeartbeatRecord)
                 .where(SubscriberHeartbeatRecord.subscriber_name == "gmail_pubsub")
                 .limit(1)
             )
+            sync_cursors = db.scalars(
+                select(SyncCursorRecord).order_by(
+                    SyncCursorRecord.provider.asc(),
+                    SyncCursorRecord.resource_type.asc(),
+                    SyncCursorRecord.resource_id.asc(),
+                )
+            ).all()
+
+        body["google_sync"] = {
+            "cursors": [
+                {
+                    "provider": cursor.provider,
+                    "resource_type": cursor.resource_type,
+                    "resource_id": cursor.resource_id,
+                    "status": cursor.status,
+                    "last_successful_sync_at": to_rfc3339(cursor.last_successful_sync_at)
+                    if cursor.last_successful_sync_at is not None
+                    else None,
+                    "last_error_code": cursor.last_error_code,
+                    "last_error_at": to_rfc3339(cursor.last_error_at)
+                    if cursor.last_error_at is not None
+                    else None,
+                }
+                for cursor in sync_cursors
+            ],
+        }
+        if settings.google_pubsub_subscription is None:
+            body["subscribers"] = {}
+            return body
+
         staleness_threshold_seconds = (
             settings.subscriber_heartbeat_interval_seconds
             * settings.subscriber_heartbeat_staleness_factor
         )
-        now = utcnow()
         is_fresh = heartbeat is not None and (
             (now - heartbeat.last_seen_at).total_seconds() <= staleness_threshold_seconds
         )
@@ -1779,7 +1922,8 @@ def create_app(
                 "errors_in_window": heartbeat.errors_in_window if heartbeat else 0,
             }
         }
-        body = {"ok": is_fresh, "subscribers": subscriber_block}
+        body["ok"] = is_fresh
+        body["subscribers"] = subscriber_block
         if is_fresh:
             return body
         return JSONResponse(status_code=503, content=body)

@@ -24,6 +24,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 
 from ariel.clock import utcnow
 from ariel.ids import new_id
+from ariel.provider_evidence_surface import provider_capability_output_for_public_transport
 from ariel.redaction import redact_json_value, redact_text
 
 
@@ -1870,7 +1871,7 @@ def serialize_action_attempt(
         "approval": serialize_approval_request(approval) if approval is not None else None,
         "execution": {
             "status": _execution_view_status(action_attempt),
-            "output": _redact_provider_write_output(
+            "output": _redact_provider_output(
                 capability_id=action_attempt.capability_id,
                 payload=action_attempt.execution_output,
             ),
@@ -1914,19 +1915,26 @@ def _redact_provider_write_input(*, capability_id: str, payload: Any) -> Any:
     return redact_json_value(redacted)
 
 
-def _redact_provider_write_output(*, capability_id: str, payload: Any) -> Any:
+def _redact_provider_output(*, capability_id: str, payload: Any) -> Any:
     if not isinstance(payload, dict):
         return redact_json_value(payload)
-    redacted = dict(payload)
-    if capability_id in {"cap.email.draft", "cap.email.send"}:
-        for container in (redacted, redacted.get("draft"), redacted.get("message")):
-            if isinstance(container, dict) and isinstance(container.get("body"), str):
-                container["body"] = _provider_text_marker(container["body"])
-    if capability_id in {"cap.calendar.create_event", "cap.calendar.update_event"}:
-        for container in (redacted, redacted.get("event")):
-            if isinstance(container, dict) and isinstance(container.get("description"), str):
-                container["description"] = _provider_text_marker(container["description"])
-    return redact_json_value(redacted)
+    if capability_id in {
+        "cap.email.read",
+        "cap.provider_evidence.read",
+        "cap.calendar.list",
+        "cap.calendar.create_event",
+        "cap.calendar.update_event",
+        "cap.calendar.respond_to_event",
+        "cap.email.draft",
+        "cap.email.send",
+    }:
+        return redact_json_value(
+            provider_capability_output_for_public_transport(
+                capability_id=capability_id,
+                output_payload=payload,
+            )
+        )
+    return redact_json_value(payload)
 
 
 def serialize_artifact(artifact: ArtifactRecord) -> dict[str, Any]:
@@ -2007,7 +2015,7 @@ def _serialize_surface_action_lifecycle(
             execution_status = (
                 execution_status_raw if isinstance(execution_status_raw, str) else "not_executed"
             )
-            execution_output = _redact_provider_write_output(
+            execution_output = _redact_provider_output(
                 capability_id=capability_id
                 if isinstance(capability_id, str)
                 else "unknown.capability",

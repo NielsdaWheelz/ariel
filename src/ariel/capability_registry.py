@@ -68,6 +68,7 @@ MEMORY_CAPABILITY_IDS: frozenset[str] = frozenset(
         "cap.memory.note.delete",
     }
 )
+PROVIDER_EVIDENCE_CAPABILITY_IDS: frozenset[str] = frozenset({"cap.provider_evidence.read"})
 PROACTIVE_CAPABILITY_IDS = {"cap.proactive.schedule"}
 MAPS_CAPABILITY_IDS = {"cap.maps.directions", "cap.maps.search_places"}
 RESEARCH_CAPABILITY_IDS = {"cap.research.investigate"}
@@ -79,6 +80,7 @@ RESEARCH_PERSONAL_CAPABILITY_IDS: frozenset[str] = frozenset(
         "cap.drive.search",
         "cap.drive.read",
         "cap.calendar.list",
+        "cap.provider_evidence.read",
     }
 )
 RESEARCH_MEMORIES_CAPABILITY_IDS: frozenset[str] = frozenset(
@@ -452,6 +454,36 @@ def _validate_email_read_input(
         "message_id": message_id,
         "thread_id": thread_id,
         "mode": mode,
+    }, None
+
+
+def _validate_provider_evidence_read_input(
+    raw_input: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not set(raw_input.keys()).issubset({"provider_evidence_id", "block_ids", "max_blocks"}):
+        return None, "schema_invalid"
+    provider_evidence_id = _normalize_optional_text(
+        raw_input.get("provider_evidence_id"), max_length=64
+    )
+    if provider_evidence_id is None:
+        return None, "schema_invalid"
+
+    block_ids = _normalize_optional_string_list(
+        raw_input.get("block_ids"), max_items=12, max_length=64
+    )
+    if block_ids is None:
+        return None, "schema_invalid"
+
+    max_blocks_raw = raw_input.get("max_blocks", 12)
+    if not isinstance(max_blocks_raw, int) or isinstance(max_blocks_raw, bool):
+        return None, "schema_invalid"
+    if max_blocks_raw < 1 or max_blocks_raw > 12:
+        return None, "schema_invalid"
+
+    return {
+        "provider_evidence_id": provider_evidence_id,
+        "block_ids": block_ids,
+        "max_blocks": max_blocks_raw,
     }, None
 
 
@@ -3270,6 +3302,20 @@ _CAPABILITY_REGISTRY: dict[str, CapabilityDefinition] = {
         execute=None,
         declare_egress_intent=_declare_google_email_read_egress_intent,
     ),
+    "cap.provider_evidence.read": CapabilityDefinition(
+        capability_id="cap.provider_evidence.read",
+        version="1.0",
+        impact_level="read",
+        policy_decision="allow_inline",
+        contract_metadata={
+            "input_schema": "provider_evidence_read_v1",
+            "output_schema": "provider_evidence_blocks_v1",
+            "idempotency": "deterministic_read",
+        },
+        allowed_egress_destinations=(),
+        validate_input=_validate_provider_evidence_read_input,
+        execute=None,
+    ),
     "cap.drive.search": CapabilityDefinition(
         capability_id="cap.drive.search",
         version="1.0",
@@ -3843,6 +3889,9 @@ def eligible_internal_callable_capability_ids(
         if capability_id in PROACTIVE_CAPABILITY_IDS:
             capability_ids.append(capability_id)
             continue
+        if capability_id in PROVIDER_EVIDENCE_CAPABILITY_IDS:
+            capability_ids.append(capability_id)
+            continue
         if capability_id in RESEARCH_CAPABILITY_IDS:
             capability_ids.append(capability_id)
             continue
@@ -3940,6 +3989,7 @@ _RUN_CALLABLE_ALIASES = {
     "memory.recall": "cap.memory.recall",
     "memory.remember": "cap.memory.remember",
     "memory.search": "cap.memory.search",
+    "provider_evidence.read": "cap.provider_evidence.read",
     "proactive.schedule": "cap.proactive.schedule",
     "research.investigate": "cap.research.investigate",
     "search.web": "cap.search.web",
@@ -4038,6 +4088,7 @@ RUN_CALLABLE_SIGNATURES: dict[str, str] = {
     # both as None. ``mode`` defaults to ``"message"`` when ``message_id`` is
     # given, else ``"thread"``.
     "email.read": "(message_id: str | None = None, thread_id: str | None = None, mode: Literal['message', 'thread', 'thread_context'] | None = None)  # at least one id must be non-null, from prior email.search or provider-sync context -> {'schema_version': 'google.gmail.message_evidence.v1', 'mode': Literal['message', 'thread', 'thread_context'], 'message': {'subject', 'sender', 'recipients', 'internal_date', ...} | None, 'thread': {'thread_id', 'message_count', ...} | None, 'messages': list[dict] | None, 'evidence': {'blocks': list[{'kind', 'text', ...}], 'source_kind': str, ...}, 'read_outcome': {'status': Literal['ok', 'body_too_large', 'decode_failed', 'no_body'], ...}, 'retrieved_at': str, 'status': 'succeeded'}",
+    "provider_evidence.read": "(provider_evidence_id: str, block_ids: list[str] = [], max_blocks: int = 12) -> {'schema_version': 'provider.evidence_blocks.v1', 'read_outcome': {'status': Literal['ok', 'unavailable'], 'reason_code': str | None, 'recovery': str | None}, 'provider_evidence': dict, 'blocks': list[{'block_id', 'block_index', 'kind', 'text', 'digest', 'truncated', 'source_offsets'}], 'status': 'succeeded'}",
     # drive (read)
     "drive.search": "(query: str) -> {'schema_version': 'google.drive.search_results.v1', 'query': str, 'provider_account_id': str, 'results': list[{'title', 'source', 'snippet', 'published_at'}], 'retrieved_at': str, 'status': 'succeeded'}",
     "drive.read": "(file_id: str) -> {'schema_version': 'google.drive.read_result.v1', 'file_id': str, 'provider_account_id': str, 'title': str, 'source': str, 'published_at': str | None, 'content_excerpt': str, 'truncated': bool, 'read_outcome': {'status': Literal['ok', 'unsupported', 'too_large', 'unavailable'], 'reason_code': str | None, 'recovery': str | None}, 'retrieved_at': str, 'status': 'succeeded'}",

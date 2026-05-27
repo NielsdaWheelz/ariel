@@ -110,6 +110,7 @@ def test_action_proposed_accepts_research_finding_evidence() -> None:
             "provider_event_id": None,
             "item_count": None,
             "observation_count": None,
+            "grounding_items": None,
         }
     ]
 
@@ -168,6 +169,7 @@ def test_action_proposed_accepts_provider_sync_review_evidence() -> None:
             "provider_event_id": "pev_provider_sync_review",
             "item_count": 1,
             "observation_count": 1,
+            "grounding_items": None,
         }
     ]
 
@@ -203,6 +205,19 @@ def test_research_terminal_events_round_trip() -> None:
         assert _project_surface_event(_raw_event(event_type, {"mode": "web"}))["payload"] == {
             "mode": "web"
         }
+
+
+def test_turn_failed_accepts_operational_error_code() -> None:
+    assert _project_surface_event_payload(
+        "evt.turn.failed",
+        {
+            "failure_reason": "background task replay found an interrupted in-progress turn",
+            "error_code": "E_BACKGROUND_TURN_INTERRUPTED",
+        },
+    ) == {
+        "failure_reason": "background task replay found an interrupted in-progress turn",
+        "error_code": "E_BACKGROUND_TURN_INTERRUPTED",
+    }
 
 
 @pytest.mark.parametrize(
@@ -283,3 +298,38 @@ def test_action_proposed_rejects_unknown_evidence_kind() -> None:
             },
         )
     assert excinfo.value.contract == "surface_event_payload.evt.action.proposed"
+
+
+def test_action_execution_succeeded_uses_audit_execution_shape() -> None:
+    projected = _project_surface_event_payload(
+        "evt.action.execution.succeeded",
+        {
+            "action_attempt_id": "aat_1",
+            "capability_id": "cap.provider_evidence.read",
+            "status": "succeeded",
+            "execution_output": {
+                "schema_version": "provider.evidence_blocks.v1",
+                "blocks": [{"block_id": "peb_1", "text_redacted": True}],
+            },
+        },
+    )
+
+    assert projected == {
+        "action_attempt_id": "aat_1",
+        "capability_id": "cap.provider_evidence.read",
+        "status": "succeeded",
+        "execution_output": {
+            "schema_version": "provider.evidence_blocks.v1",
+            "blocks": [{"block_id": "peb_1", "text_redacted": True}],
+        },
+        "provider_write_receipt_id": None,
+        "replayed_provider_write_receipt_id": None,
+        "reconciled": None,
+    }
+
+    with pytest.raises(ResponseContractViolation) as excinfo:
+        _project_surface_event_payload(
+            "evt.action.execution.succeeded",
+            {"action_attempt_id": "aat_1", "output": {"raw": "legacy"}},
+        )
+    assert excinfo.value.contract == "surface_event_payload.evt.action.execution.succeeded"
