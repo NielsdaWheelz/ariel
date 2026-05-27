@@ -474,7 +474,7 @@ def test_schema_readiness_reports_stale_capture_ingress_schema(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260526_0070" in schema_issues
+        assert "missing_alembic_head:20260527_0071" in schema_issues
         assert "unexpected_column:captures.original_payload" in schema_issues
         assert "unexpected_column:captures.terminal_state" in schema_issues
         assert "unexpected_constraint:captures.ck_capture_terminal_state" in schema_issues
@@ -564,7 +564,7 @@ def test_schema_readiness_reports_undispatched_background_task_types(
     engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
     try:
         schema_issues = schema_readiness_issues(engine)
-        assert "missing_alembic_head:20260526_0070" in schema_issues
+        assert "missing_alembic_head:20260527_0071" in schema_issues
         assert (
             "forbidden_constraint_fragment:background_tasks.ck_background_task_type"
             in schema_issues
@@ -629,6 +629,69 @@ def test_background_task_schema_migration_removes_undispatched_task_types(
                 )
 
         assert _integrity_constraint_name(exc_info.value) == "ck_background_task_type"
+        assert schema_readiness_issues(engine) == []
+    finally:
+        engine.dispose()
+
+
+def test_action_success_event_payload_migration_cuts_over_legacy_output(
+    unmigrated_postgres_url: str,
+) -> None:
+    run_migrations(unmigrated_postgres_url, revision="20260526_0070")
+    engine = create_engine(unmigrated_postgres_url, future=True, pool_pre_ping=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO turns "
+                    "(id, user_message, assistant_message, status, created_at, updated_at) "
+                    "VALUES ('trn_legacy_success', 'legacy', NULL, 'completed', now(), now())"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO action_attempts "
+                    "(id, turn_id, proposal_index, capability_id, capability_version, "
+                    "capability_contract_hash, impact_level, proposed_input, payload_hash, "
+                    "policy_decision, policy_reason, status, approval_required, "
+                    "execution_output, execution_error, created_at, updated_at) "
+                    "VALUES ('aat_legacy_success', 'trn_legacy_success', 1, "
+                    "'cap.email.read', '1.0', :contract_hash, 'read', '{}'::jsonb, "
+                    ":payload_hash, 'allow_inline', NULL, 'succeeded', false, "
+                    "'{}'::jsonb, NULL, now(), now())"
+                ),
+                {"contract_hash": "c" * 64, "payload_hash": "p" * 64},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO events "
+                    "(id, turn_id, sequence, event_type, payload, created_at) "
+                    "VALUES ('evt_legacy_success', 'trn_legacy_success', 1, "
+                    "'evt.action.execution.succeeded', CAST(:payload AS jsonb), now())"
+                ),
+                {
+                    "payload": (
+                        '{"action_attempt_id":"aat_legacy_success",'
+                        '"output":{"read_outcome":{"status":"ok"}},'
+                        '"provider_write_receipt_id":"pwr_legacy"}'
+                    )
+                },
+            )
+
+        run_migrations(unmigrated_postgres_url)
+
+        with engine.connect() as connection:
+            payload = connection.execute(
+                text("SELECT payload FROM events WHERE id = 'evt_legacy_success'")
+            ).scalar_one()
+
+        assert payload == {
+            "action_attempt_id": "aat_legacy_success",
+            "capability_id": "cap.email.read",
+            "status": "succeeded",
+            "execution_output": {"read_outcome": {"status": "ok"}},
+            "provider_write_receipt_id": "pwr_legacy",
+        }
         assert schema_readiness_issues(engine) == []
     finally:
         engine.dispose()
