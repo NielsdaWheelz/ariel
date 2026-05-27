@@ -142,7 +142,7 @@ class AppSettings(BaseSettings):
     memory_dream_interval_seconds: float = 86400.0
     agent_loop_max_model_calls: int = 50
     agent_loop_live_rounds: int = 8
-    recent_events_token_budget: int = 100_000
+    recent_events_token_budget: int = 20_000
     recent_events_max_rows: int = 5_000
     recent_event_payload_byte_cap: int = 4_096
     approval_ttl_seconds: int = 900

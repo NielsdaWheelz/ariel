@@ -347,6 +347,13 @@ def test_turn_budget_env_overrides_are_loaded(monkeypatch: pytest.MonkeyPatch) -
     assert settings.approval_actor_id == "user.integration"
 
 
+def test_recent_events_token_budget_default_is_20k() -> None:
+    """Default budget is 20k. The prior 100k value caused per-call input to
+    bloat to ~165K tokens after any capability touched memory_log; see
+    ``docs/openrouter-cost-cutover.md`` §6.3."""
+    assert AppSettings().recent_events_token_budget == 20_000
+
+
 def test_memory_runtime_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ARIEL_MEMORY_EMBEDDING_DIMENSIONS", str(MEMORY_EMBEDDING_DIMENSIONS))
     monkeypatch.setenv("ARIEL_MEMORY_RECALL_BUDGET_SECONDS", "30.0")
