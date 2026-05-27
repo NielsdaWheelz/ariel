@@ -286,6 +286,7 @@ class SurfaceEventAgentProviderSyncGroundingRejectedPayloadContract(BaseModel):
     model_call_count: int
     rejected_message_chars: int
     provider_response_id: str | None = None
+    exhausted: bool = False
 
 
 class SurfaceEventAgentWrapUpNudgedPayloadContract(BaseModel):

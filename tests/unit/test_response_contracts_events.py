@@ -61,6 +61,7 @@ def test_run_protocol_events_are_surfaceable() -> None:
         "model_call_count": 2,
         "rejected_message_chars": 180,
         "provider_response_id": None,
+        "exhausted": False,
     }
 
 

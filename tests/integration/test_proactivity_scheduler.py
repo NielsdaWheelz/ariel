@@ -771,6 +771,195 @@ def test_provider_sync_wake_requires_provider_evidence_read_before_message(
     assert [attempt.capability_id for attempt in attempts] == ["cap.provider_evidence.read"]
 
 
+class _ProviderSyncNeverGroundsAdapter(FakeModelAdapter):
+    """Always emits an ungrounded message (never reads evidence). The rail
+    must cap the loop at two rejections and force ``finish_silent``."""
+
+    provider = "provider.never-grounds"
+    model = "model.never-grounds-v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.main_call_count = 0
+
+    def _respond(self, request: ModelCall) -> ModelResponse:
+        if is_memory_subsystem_call(request.messages):
+            return empty_recall_response(
+                provider=self.provider, model=self.model, messages=request.messages
+            )
+        self.main_call_count += 1
+        return run_response(
+            source=f"agent.emit_message(text='Preview-only summary {self.main_call_count}')\n",
+            provider=self.provider,
+            model=self.model,
+            provider_response_id=f"resp_never_grounds_{self.main_call_count}",
+        )
+
+
+def test_provider_sync_wake_grounding_rejection_loop_caps_at_two(
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the model never grounds, the rail rejects twice then forces
+    ``finish_silent(reason='grounding_unrecoverable')`` on the third
+    attempt — bounding what would otherwise be an unbounded re-run of the
+    full ~165K-token prefix."""
+
+    _stub_memory_retriever(monkeypatch)
+    now = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("ariel.worker.utcnow", lambda: now)
+    adapter = _ProviderSyncNeverGroundsAdapter()
+    app = create_test_app(
+        database_url=postgres_url,
+        model_adapter=adapter,
+        sandbox=FakeSandboxRuntime(),
+    )
+    with TestClient(app) as client:
+        runtime = client.app.state.runtime  # type: ignore[attr-defined]
+        session_factory = runtime.session_factory
+        with session_factory() as db:
+            with db.begin():
+                db.add(
+                    GoogleProviderObjectRecord(
+                        id="gpo_never_grounds",
+                        provider_account_id="acct_1",
+                        object_type="gmail_message",
+                        external_id="msg_never_grounds",
+                        thread_external_id="thr_never_grounds",
+                        calendar_id=None,
+                        ical_uid=None,
+                        status="active",
+                        source_timestamp=now,
+                        observed_at=now,
+                        provider_url=None,
+                        metadata_json={},
+                        content_digest="c" * 64,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.add(
+                    ProviderEvidenceRecord(
+                        id="pev_never_grounds",
+                        provider_object_id="gpo_never_grounds",
+                        provider="google",
+                        provider_account_id="acct_1",
+                        source_kind="gmail_message",
+                        external_id="msg_never_grounds",
+                        thread_external_id="thr_never_grounds",
+                        calendar_id=None,
+                        source_uri=None,
+                        source_timestamp=now,
+                        content_digest="c" * 64,
+                        metadata_json={},
+                        taint="provider_untrusted",
+                        sensitivity="private",
+                        retention_policy="provider_source",
+                        extraction_status="pending",
+                        lifecycle_state="available",
+                        observed_at=now,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                db.flush()
+                db.add(
+                    ProviderEvidenceBlockRecord(
+                        id="peb_never_grounds",
+                        evidence_id="pev_never_grounds",
+                        block_index=0,
+                        block_kind="body",
+                        text="Body text the model refuses to read.",
+                        digest="d" * 64,
+                        source_offsets={"block_id": "gmail:msg_never_grounds:body:0"},
+                        metadata_json={"truncated": False},
+                        created_at=now,
+                    )
+                )
+                db.add(
+                    BackgroundTaskRecord(
+                        id="tsk_never_grounds",
+                        task_type="agent_wake",
+                        idempotency_key=None,
+                        provider_write_receipt_id=None,
+                        payload={
+                            "kind": "provider_sync_review",
+                            "provider": "google",
+                            "resource_type": "gmail",
+                            "resource_id": "primary",
+                            "sync_run_id": "syn_never_grounds",
+                            "provider_event_id": "pev_never_grounds_pe",
+                            "item_count": 1,
+                            "observation_count": 1,
+                            "items": [
+                                {
+                                    "change": "messagesAdded",
+                                    "message_id": "msg_never_grounds",
+                                    "thread_id": "thr_never_grounds",
+                                    "subject": "Body the model refuses to read",
+                                    "preview_kind": "provider_sync_preview",
+                                    "preview_truncated": True,
+                                    "requires_read_for_body_claims": True,
+                                    "provider_evidence_refs": [
+                                        {
+                                            "provider_evidence_id": "pev_never_grounds",
+                                            "citation_refs": [
+                                                {
+                                                    "kind": "provider_evidence_block",
+                                                    "block_id": "peb_never_grounds",
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                    "evidence_blocks": [
+                                        {
+                                            "kind": "body",
+                                            "text": "Body text the model refuses to read.",
+                                            "preview_truncated": True,
+                                        }
+                                    ],
+                                }
+                            ],
+                            "omitted_item_count": 0,
+                            "note": "A Google Gmail sync found 1 new inbound message.",
+                        },
+                        attempts=0,
+                        recurrence_seconds=None,
+                        run_after=now - timedelta(minutes=1),
+                        created_at=now - timedelta(minutes=5),
+                        updated_at=now - timedelta(minutes=5),
+                    )
+                )
+
+        assert process_one_task(
+            session_factory=session_factory,
+            settings=runtime.settings,
+            runtime=runtime,
+        )
+
+    assert adapter.main_call_count == 3
+    with session_factory() as db:
+        turn = db.scalar(
+            select(TurnRecord).where(TurnRecord.source_background_task_id == "tsk_never_grounds")
+        )
+        assert turn is not None
+        events = db.scalars(
+            select(EventRecord)
+            .where(EventRecord.turn_id == turn.id)
+            .order_by(EventRecord.sequence.asc())
+        ).all()
+
+    assert turn.assistant_message == ""
+    rejection_events = [
+        e for e in events if e.event_type == "evt.agent.provider_sync_grounding_rejected"
+    ]
+    assert len(rejection_events) == 3
+    assert [e.payload["exhausted"] for e in rejection_events] == [False, False, True]
+    finished_silent = [e for e in events if e.event_type == "evt.agent.finished_silent"]
+    assert len(finished_silent) == 1
+    assert finished_silent[0].payload == {"reason": "grounding_unrecoverable"}
+
+
 def test_provider_sync_wake_budget_exhaustion_stays_silent(
     postgres_url: str,
     monkeypatch: pytest.MonkeyPatch,

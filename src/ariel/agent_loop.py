@@ -35,7 +35,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, assert_never
+from typing import Any, Final, Literal, assert_never
 
 from fastapi.encoders import jsonable_encoder
 from pydantic_ai.messages import (
@@ -317,6 +317,7 @@ def run_agent_loop(
     prev_run_source: str | None = None
     last_program_errors: list[str] | None = None
     model_call_count = 0
+    provider_sync_grounding_rejection_count = 0
     # Start past any earlier loop's attempts on this turn (e.g. retriever
     # before main loop) — the (turn_id, proposal_index) unique index is the rail.
     existing_attempt_count = int(
@@ -766,15 +767,33 @@ def run_agent_loop(
                     ],
                 },
             )
+        provider_sync_grounding_exhausted = False
         if provider_sync_grounding_rejected:
+            provider_sync_grounding_rejection_count += 1
+            provider_sync_grounding_exhausted = (
+                provider_sync_grounding_rejection_count > _PROVIDER_SYNC_GROUNDING_REJECTION_LIMIT
+            )
             add_event(
                 "evt.agent.provider_sync_grounding_rejected",
                 {
                     "model_call_count": model_call_count,
                     "provider_response_id": candidate_response.provider_response_id,
                     "rejected_message_chars": len(run_program_result.emitted_message),
+                    "exhausted": provider_sync_grounding_exhausted,
                 },
             )
+            if provider_sync_grounding_exhausted:
+                return LoopResult(
+                    outcome="silent",
+                    emitted_message=None,
+                    emitted_finding=None,
+                    emitted_operations=None,
+                    model_call_count=model_call_count,
+                    created_action_attempt_count=created_action_attempt_count,
+                    awaiting_approval=None,
+                    runtime_provenance=final_runtime_provenance,
+                    silent_reason="grounding_unrecoverable",
+                )
 
         # --- Terminal branches (exhaustive over output_mode) ---
 
@@ -1084,6 +1103,13 @@ _PROVIDER_SYNC_GROUNDING_NUDGE = (
     "read the specific message with email.read or read the provider evidence ref "
     "with provider_evidence.read. If the item is routine, finish silently."
 )
+
+
+# Cap on grounding rejections per turn. Two rejections means the model has
+# had three attempts to ground its message — if it still hasn't, the wake
+# isn't worth interrupting for. Forces ``finish_silent`` to stop burning
+# ~165K-token re-runs on a turn the user was never going to see.
+_PROVIDER_SYNC_GROUNDING_REJECTION_LIMIT: Final[int] = 2
 
 
 _WRAP_UP_NUDGE_TEXT = (

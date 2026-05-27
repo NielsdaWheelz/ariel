@@ -869,6 +869,29 @@ def _provider_sync_review_context(task_payload: dict[str, Any]) -> tuple[str, di
             lines.extend(_render_provider_sync_item(index, item))
     if omitted_item_count > 0:
         lines.append(f"- {omitted_item_count} additional changed items omitted by the host budget.")
+    grounding_items = _provider_sync_grounding_items(items)
+    if grounding_items:
+        lines.extend(["", "Grounding requirement:"])
+        for grounding_item in grounding_items:
+            message_id = grounding_item["message_id"]
+            evidence_ids = grounding_item["provider_evidence_ids"]
+            if message_id is not None:
+                evidence_clause = (
+                    f' or provider_evidence.read(provider_evidence_id="{evidence_ids[0]}")'
+                    if evidence_ids
+                    else ""
+                )
+                lines.append(
+                    f"- To make any body-level claim about message {message_id}, call "
+                    f'email.read(message_id="{message_id}"){evidence_clause} first. '
+                    "Previews are not sufficient evidence. If routine, call agent.finish_silent."
+                )
+            elif evidence_ids:
+                lines.append(
+                    f"- To make any body-level claim from provider evidence {evidence_ids[0]}, "
+                    f'call provider_evidence.read(provider_evidence_id="{evidence_ids[0]}") first. '
+                    "Previews are not sufficient evidence. If routine, call agent.finish_silent."
+                )
     return "\n".join(lines), {
         "kind": "provider_sync_review",
         "provider": provider,
@@ -878,7 +901,7 @@ def _provider_sync_review_context(task_payload: dict[str, Any]) -> tuple[str, di
         "provider_event_id": provider_event_id,
         "item_count": item_count,
         "observation_count": observation_count,
-        "grounding_items": _provider_sync_grounding_items(items),
+        "grounding_items": grounding_items,
     }
 
 
