@@ -98,6 +98,7 @@ class TokenUsage(BaseModel):
     output_tokens: int
     reasoning_tokens: int = 0
     cached_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 class ToolCall(BaseModel):
@@ -245,11 +246,13 @@ class ModelAdapter:
         model_settings: ModelSettings = {"tool_choice": request.tool_choice}
         if request.max_output_tokens is not None:
             model_settings["max_tokens"] = request.max_output_tokens
-        if request.reasoning is not None and request.reasoning.effort is not None:
-            if ref.provider == "openrouter":
-                model_settings["extra_body"] = {"reasoning": {"effort": request.reasoning.effort}}
-            else:
-                model_settings["thinking"] = request.reasoning.effort
+        if ref.provider == "openrouter":
+            extra_body: dict[str, Any] = {"cache_control": {"type": "ephemeral"}}
+            if request.reasoning is not None and request.reasoning.effort is not None:
+                extra_body["reasoning"] = {"effort": request.reasoning.effort}
+            model_settings["extra_body"] = extra_body
+        elif request.reasoning is not None and request.reasoning.effort is not None:
+            model_settings["thinking"] = request.reasoning.effort
 
         started_at = time.perf_counter()
         raw = await asyncio.wait_for(
@@ -324,6 +327,7 @@ class ModelAdapter:
                 output_tokens=usage.output_tokens,
                 reasoning_tokens=usage.details.get("reasoning_tokens", 0),
                 cached_tokens=usage.cache_read_tokens,
+                cache_creation_tokens=usage.cache_write_tokens,
             ),
             provider=request.model.provider,
             model=request.model.model,

@@ -409,6 +409,7 @@ def run_agent_loop(
                         "total_tokens": usage.input_tokens + usage.output_tokens,
                         "reasoning_tokens": usage.reasoning_tokens,
                         "cached_tokens": usage.cached_tokens,
+                        "cache_creation_tokens": usage.cache_creation_tokens,
                     },
                     "provider_response_id": candidate_response.provider_response_id,
                     "model_call_count": model_call_count,

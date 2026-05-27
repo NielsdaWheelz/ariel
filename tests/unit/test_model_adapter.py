@@ -266,7 +266,45 @@ def test_call_passes_openrouter_reasoning_effort_as_extra_body() -> None:
     )
 
     assert substrate.seen_settings == [
-        {"tool_choice": "auto", "extra_body": {"reasoning": {"effort": "xhigh"}}}
+        {
+            "tool_choice": "auto",
+            "extra_body": {
+                "cache_control": {"type": "ephemeral"},
+                "reasoning": {"effort": "xhigh"},
+            },
+        }
+    ]
+
+
+def test_call_passes_openrouter_cache_control_unconditionally() -> None:
+    class CapturingModel(Model):
+        def __init__(self) -> None:
+            self.seen_settings: list[ModelSettings | None] = []
+
+        @property
+        def system(self) -> str:
+            return "test"
+
+        @property
+        def model_name(self) -> str:
+            return "capturing-model"
+
+        async def request(
+            self,
+            messages: list[ModelMessage],
+            model_settings: ModelSettings | None,
+            model_request_parameters: ModelRequestParameters,
+        ) -> PydAIModelResponse:
+            del messages, model_request_parameters
+            self.seen_settings.append(model_settings)
+            return PydAIModelResponse(parts=[TextPart(content="answer")])
+
+    substrate = CapturingModel()
+    adapter = _adapter_with(substrate)
+    asyncio.run(adapter.call(ModelCall(model=MAIN, messages=_msgs())))
+
+    assert substrate.seen_settings == [
+        {"tool_choice": "auto", "extra_body": {"cache_control": {"type": "ephemeral"}}}
     ]
 
 
@@ -278,6 +316,7 @@ def test_call_lifts_provider_response_id_and_usage_details() -> None:
                 input_tokens=12,
                 output_tokens=3,
                 cache_read_tokens=4,
+                cache_write_tokens=5,
                 details={"reasoning_tokens": 7},
             ),
             provider_response_id="resp_abc",
@@ -291,6 +330,7 @@ def test_call_lifts_provider_response_id_and_usage_details() -> None:
     assert response.usage.output_tokens == 3
     assert response.usage.cached_tokens == 4
     assert response.usage.reasoning_tokens == 7
+    assert response.usage.cache_creation_tokens == 5
 
 
 def test_call_uses_configured_timeout() -> None:

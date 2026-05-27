@@ -82,6 +82,7 @@ class SurfaceModelUsageContract(BaseModel):
     total_tokens: int | None = None
     reasoning_tokens: int | None = None
     cached_tokens: int | None = None
+    cache_creation_tokens: int | None = None
 
 
 class SurfaceTaintEvidenceContract(BaseModel):
