@@ -446,7 +446,7 @@ memory uses two layers: append-only `memory_log` events and editable
 
 search capability runtime config:
 
-Search execution delegates to `web-search-tool`'s Brave provider. Ariel still owns capability
+Search execution delegates to `llm-tools`' Brave provider. Ariel still owns capability
 policy, egress preflight, and the `search_results_v1` output mapping.
 
 - `ARIEL_SEARCH_WEB_API_KEY` (required for live Brave-backed web search)

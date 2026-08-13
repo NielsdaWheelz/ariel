@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 
 import ariel.capability_registry as registry
-from web_search_tool.types import WebSearchRequest, WebSearchResponse, WebSearchResultItem
+from llm_tools import WebSearchRequest, WebSearchResponse, WebSearchResultItem
 
 
 class _FakeProvider:
@@ -88,6 +89,7 @@ def test_search_web_maps_provider_results_to_search_results_v1(
         provider="brave",
         provider_request_id="req_test",
         retrieved_at="2026-04-27T12:00:00Z",
+        attempts=1,
         results=(
             _result(
                 title=" Example ",
@@ -125,6 +127,65 @@ def test_search_web_maps_provider_results_to_search_results_v1(
     assert _FakeProvider.last_request.query == "example query"
     assert _FakeProvider.last_request.result_type == registry.WebSearchResultType.WEB
     assert _FakeProvider.last_request.limit == 5
+
+
+def test_search_web_uses_llm_tools_public_brave_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+    async_client_cls = httpx.AsyncClient
+    mock_transport_cls = httpx.MockTransport
+
+    def brave_response(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["headers"] = request.headers
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "req_public_boundary"},
+            json={
+                "web": {
+                    "results": [
+                        {
+                            "title": "Public provider result",
+                            "url": "https://example.test/public-result",
+                            "description": "Returned by the llm-tools public provider.",
+                        }
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_API_KEY", "test-key")
+    monkeypatch.setenv("ARIEL_SEARCH_BRAVE_BASE_URL", "https://search.example.test/res/v1")
+    monkeypatch.setenv("ARIEL_SEARCH_WEB_TIMEOUT_SECONDS", "3.5")
+    monkeypatch.setattr(
+        registry.httpx,
+        "AsyncClient",
+        lambda: async_client_cls(transport=mock_transport_cls(brave_response)),
+    )
+
+    capability = registry.get_capability("cap.search.web")
+    assert capability is not None
+    assert capability.execute is not None
+    output = capability.execute({"query": "public provider query"})
+
+    assert output["query"] == "public provider query"
+    assert output["status"] == "succeeded"
+    assert output["results"] == [
+        {
+            "title": "Public provider result",
+            "source": "https://example.test/public-result",
+            "snippet": "Returned by the llm-tools public provider.",
+            "published_at": None,
+        }
+    ]
+    assert seen["url"] == (
+        "https://search.example.test/res/v1/web/search?"
+        "q=public+provider+query&count=5&country=us&search_lang=en&"
+        "safesearch=moderate&spellcheck=1&extra_snippets=true&result_filter=web"
+    )
+    assert seen["headers"]["x-subscription-token"] == "test-key"
+    assert seen["headers"]["accept"] == "application/json"
 
 
 def test_search_provider_errors_map_to_execution_errors(
