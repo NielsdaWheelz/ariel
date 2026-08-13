@@ -12,11 +12,8 @@ from typing import Any, Literal, Protocol
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 import httpx
-from .clock import utcnow
-from .config import AppSettings
-from .research_modes import RESEARCH_MODE_VALUES
-from web_search_tool.brave import BraveSearchProvider
-from web_search_tool.types import (
+from llm_tools import (
+    BraveSearchProvider,
     WebSearchError,
     WebSearchErrorCode,
     WebSearchRequest,
@@ -24,6 +21,10 @@ from web_search_tool.types import (
     WebSearchResultItem,
     WebSearchResultType,
 )
+
+from .clock import utcnow
+from .config import AppSettings
+from .research_modes import RESEARCH_MODE_VALUES
 
 PolicyDecision = Literal["allow_inline", "requires_approval", "deny"]
 

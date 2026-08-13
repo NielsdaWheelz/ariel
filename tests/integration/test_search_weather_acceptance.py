@@ -8,7 +8,7 @@ from typing import Any, cast
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select
-from web_search_tool.types import WebSearchRequest, WebSearchResponse, WebSearchResultItem
+from llm_tools import WebSearchRequest, WebSearchResponse, WebSearchResultItem
 
 import ariel.action_runtime as action_runtime_module
 import ariel.capability_registry as capability_registry_module
@@ -209,6 +209,7 @@ def test_search_web_executes_against_brave_provider_with_citations(
                 provider="brave",
                 provider_request_id="req_web_smoke",
                 retrieved_at="2026-03-03T12:00:00Z",
+                attempts=1,
                 results=(
                     WebSearchResultItem(
                         result_ref="fixture:https://example.com/product-launch",
